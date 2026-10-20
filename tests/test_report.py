@@ -1,0 +1,35 @@
+"""report: renders with partial data (nothing run yet) and with full generation-side data."""
+
+from __future__ import annotations
+
+from tests.genproj import build
+from vndub.config import ProjectYaml, save_project_yaml
+from vndub.stages import report, score, synth
+
+
+def test_report_partial(make_ctx, tmp_path):
+    ctx = make_ctx(tmp_path / "game")
+    (tmp_path / "game").mkdir()
+    save_project_yaml(ctx.paths.project_yaml, ProjectYaml(game_dir=str(tmp_path / "game"), engine="renpy"))
+    s = report.run(ctx)
+    html = (ctx.paths.report_dir / "index.html").read_text(encoding="utf-8")
+    md = (ctx.paths.report_dir / "report.md").read_text(encoding="utf-8")
+    assert "not available" in html and "<html" in html and "renpy" in html
+    assert "# vndub report" in md
+    assert s["finals"] == 0
+
+
+def test_report_full(make_ctx, tmp_path):
+    ctx = make_ctx(tmp_path / "game")
+    build(ctx, n_per=2)
+    synth.run(ctx)
+    score.run(ctx)
+    s = report.run(ctx)
+    html = (ctx.paths.report_dir / "index.html").read_text(encoding="utf-8")
+    assert "mock_tts/A" in html and "sakura" in html and "<audio" in html
+    assert "Routes A / B / C" in html
+    md = (ctx.paths.report_dir / "report.md").read_text(encoding="utf-8")
+    assert "mock_tts/A" in md
+    assert s["lines"] > 0
+    # self-contained: no external assets
+    assert "http://" not in html.replace("http://www.w3.org", "") and "https://" not in html

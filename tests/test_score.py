@@ -1,0 +1,187 @@
+"""score: composite terms, gates, selection logic, overrides, calibration, prosody metrics, stage run + reweight."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pytest
+
+from tests.genproj import build
+from vndub.backends.score import prosody as pros
+from vndub.backends.score.speaker_sim import calibrate_eer
+from vndub.config import load_config
+from vndub.manifest.io import CandidateScore, OverrideRecord, SelectionRecord, SynthSidecar, TranslationRecord, read_jsonl
+from vndub.stages import score, synth
+from vndub.stages.score import apply_scores, composite, cer_reference, evaluate_gates, select, terms, translation_problem
+
+CFG = load_config("configs/pipeline.yaml")
+W = CFG.score.weights
+
+
+def _c(wav: str, route: str = "A", backend: str = "x", **m) -> CandidateScore:
+    return CandidateScore(line_id="l1", wav=wav, backend=backend, route=route, metrics=m)
+
+
+def test_terms_normalization():
+    t = terms({"utmos": 5.0, "pq": 10, "spk_sim": 1.2, "emo_sim": 0.8, "adv_delta": 0.0, "cer": 0.0, "dur_ratio": 1.0, "prosody": 0.5})
+    assert t["utmos"] == 1.0 and t["pq"] == 1.0 and t["spk_sim"] == 1.0 and t["cer"] == 1.0 and t["dur"] == 1.0
+    assert t["emo_sim"] == pytest.approx(0.75 * 0.8 + 0.25)
+    assert terms({"dur_ratio": 2.0})["dur"] == pytest.approx(0.0)
+    assert terms({"dur_ratio": 1.25})["dur"] == pytest.approx(1 - math.log(1.25) / math.log(2))
+    assert terms({"utmos": 1.0})["utmos"] == 0.0
+
+
+def test_composite_renormalizes_missing():
+    full, missing = composite({"utmos": 5, "pq": 10, "spk_sim": 1, "emo_sim": 1, "cer": 0, "dur_ratio": 1, "prosody": 1}, W)
+    assert full == pytest.approx(1.0) and missing == []
+    part, missing = composite({"utmos": 3.0, "cer": 0.0}, W)
+    # only utmos (0.5) and cer (1.0) available: (0.25*0.5 + 0.15*1) / 0.40
+    assert part == pytest.approx((0.25 * 0.5 + 0.15) / 0.40, abs=1e-4)
+    assert set(missing) == {"pq", "spk_sim", "emo_sim", "dur", "prosody"}
+    assert composite({}, W)[0] is None
+
+
+def test_gates():
+    g = CFG.score.gates
+    ok = evaluate_gates({"utmos": 3.5, "cer": 0.05, "dur_ratio": 1.0, "spk_sim": 0.5}, g, 0.3)
+    assert ok == {"utmos": True, "cer": True, "dur": True, "spk_sim": True}
+    bad = evaluate_gates({"utmos": 2.0, "cer": 0.3, "dur_ratio": 1.4, "spk_sim": 0.1}, g, 0.3)
+    assert not any(bad.values())
+    # missing metrics are not evaluated
+    assert evaluate_gates({"utmos": 3.5}, g, 0.3) == {"utmos": True}
+    # original audio is exempt from CER/duration gates
+    orig = evaluate_gates({"utmos": 3.5, "cer": 1.0, "dur_ratio": 3.0}, g, 0.3, route="orig")
+    assert orig["cer"] and orig["dur"]
+    # interjection CER gate
+    assert evaluate_gates({"cer": 0.3}, g, 0.3, cer_max=0.5)["cer"]
+
+
+def _sel(cands, overrides=(), rounds=0, regen_rounds=2, created="2026-01-01T00:00:00"):
+    sides = {c.wav: SynthSidecar(line_id="l1", backend=c.backend, route=c.route, k=0, round=rounds, created=created) for c in cands}
+    return select("l1", cands, sides, list(overrides), regen_rounds)
+
+
+def test_selection_auto_regen_review():
+    good = apply_scores(_c("a.wav", utmos=4.0, cer=0.02, dur_ratio=1.0, spk_sim=0.6), CFG, 0.3, False)
+    better = apply_scores(_c("b.wav", utmos=4.5, cer=0.0, dur_ratio=1.02, spk_sim=0.7), CFG, 0.3, False)
+    bad = apply_scores(_c("c.wav", utmos=4.9, cer=0.5, dur_ratio=1.0, spk_sim=0.9), CFG, 0.3, False)
+    s = _sel([good, better, bad])
+    assert s.status == "auto" and s.winner == "b.wav" and s.scores["composite"] == better.composite
+    long = apply_scores(_c("d.wav", utmos=4.0, cer=0.02, dur_ratio=1.6, spk_sim=0.6), CFG, 0.3, False)
+    s = _sel([bad, long], rounds=0)
+    assert s.status == "regen" and "cer" in s.reason
+    s = _sel([long], rounds=2)
+    assert s.status == "review" and "text_tgt_short" in s.reason and s.winner == "d.wav"
+    s = _sel([])
+    assert s.status == "review" and s.winner is None
+
+
+def test_overrides():
+    a = apply_scores(_c("a.wav", utmos=4.0, cer=0.0, dur_ratio=1.0, spk_sim=0.6), CFG, 0.3, False)
+    b = apply_scores(_c("b.wav", utmos=3.2, cer=0.05, dur_ratio=1.0, spk_sim=0.5), CFG, 0.3, False)
+    o = apply_scores(_c("o.wav", route="orig", backend="orig", utmos=4.5, spk_sim=1.0), CFG, 0.3, True)
+    ts_old, ts_new = "2025-12-31T00:00:00", "2026-02-01T00:00:00"
+    acc = OverrideRecord(line_id="l1", action="accept", payload={"candidate": "b.wav"}, ts=ts_old)
+    assert _sel([a, b], [acc]).winner == "b.wav" and _sel([a, b], [acc]).status == "override"
+    rej = OverrideRecord(line_id="l1", action="reject", payload={"candidate": "a.wav"}, ts=ts_old)
+    assert _sel([a, b], [rej]).winner == "b.wav"
+    keep = OverrideRecord(line_id="l1", action="keep_original", payload={}, ts=ts_old)
+    s = _sel([a, o], [keep])
+    assert s.winner == "o.wav" and s.route == "orig" and s.status == "override"
+    regen_new = OverrideRecord(line_id="l1", action="regen", payload={}, ts=ts_new)
+    assert _sel([a], [regen_new]).status == "regen"
+    regen_old = OverrideRecord(line_id="l1", action="regen", payload={}, ts=ts_old)
+    assert _sel([a], [regen_old]).status == "auto"  # already consumed by a later synth
+
+
+def test_translation_problem_and_cer_reference():
+    assert translation_problem(None) == "translation missing"
+    assert translation_problem(TranslationRecord(line_id="x", text_tgt="", flags=["translate_missing"])) == "translation missing"
+    assert translation_problem(TranslationRecord(line_id="x", text_tgt="本当", text_tts="", flags=["translate_failed"])) == "translation failed"
+    head = TranslationRecord(line_id="h", text_tgt="Ага, давай.", text_tts="Ага, дав+ай.", text_plain="Ага, давай.", text_plain_short="Ага.")
+    cont = TranslationRecord(line_id="c", text_tgt="Пойдёт дождь.", text_tts="Пойдёт дождь.", text_plain="Пойдёт дождь.")
+    assert cer_reference(None, head, [cont]) == "Ага, давай. Пойдёт дождь."
+    side = SynthSidecar(line_id="h", backend="x", route="A", k=0, text_variant="short")
+    assert cer_reference(side, head, []) == "Ага."
+
+
+def test_calibrate_eer():
+    same = [0.7, 0.75, 0.8, 0.85, 0.9]
+    diff = [0.1, 0.2, 0.25, 0.3, 0.35]
+    thr, eer = calibrate_eer(same, diff)
+    assert 0.35 < thr <= 0.7 and eer == 0.0
+    thr2, eer2 = calibrate_eer([0.5, 0.6, 0.4], [0.45, 0.3, 0.55])
+    assert 0.0 < eer2 < 1.0
+
+
+def test_prosody_metrics():
+    t = np.linspace(0, 1, 200)
+    f0 = 200 + 40 * np.sin(2 * np.pi * 2 * t)
+    assert pros.f0_corr(f0, f0 * 1.5) == pytest.approx(1.0, abs=1e-6)  # shape, not level
+    rise, fall = np.linspace(150, 250, 120), np.linspace(250, 150, 120)
+    assert pros.f0_corr(rise, fall) < 0  # DTW cannot undo an inverted contour
+    f0u = f0.copy()
+    f0u[50:70] = 0  # unvoiced frames are ignored
+    assert pros.f0_corr(f0u, f0) > 0.9
+    assert pros.pause_match([], 2.0, [], 3.0) == 1.0
+    assert pros.pause_match([{"t": 1.0, "d": 0.2}], 2.0, [{"t": 1.5, "d": 0.3}], 3.0) == 1.0
+    assert pros.pause_match([{"t": 0.2, "d": 0.2}], 2.0, [{"t": 2.5, "d": 0.2}], 3.0) == 0.0
+    assert pros.prosody_score(1.0, -1.0, 0.5) == pytest.approx(0.5)
+    assert pros.prosody_score(None, None, None) is None
+
+
+@pytest.fixture
+def scored(make_ctx, tmp_path):
+    ctx = make_ctx(tmp_path / "game")
+    build(ctx, n_per=2)
+    synth.run(ctx)
+    summary = score.run(ctx)
+    return ctx, summary
+
+
+def test_score_stage_with_mocks(scored):
+    ctx, summary = scored
+    sel = read_jsonl(ctx.paths.selection, SelectionRecord)
+    assert len(sel) == len(ctx.voiced_lines())
+    assert all(s.winner for s in sel)
+    assert summary["candidates"] > 0 and sum(summary["status"].values()) == len(sel)
+    lid = sel[0].line_id
+    rows = read_jsonl(ctx.paths.scores(lid), CandidateScore)
+    m = rows[0].metrics
+    for k in ("utmos", "spk_sim", "emo_sim", "adv_delta", "cer", "dur_ratio"):
+        assert m.get(k) is not None, k
+    assert m["cer"] == 0.0  # mock ASR returns the synthesized text
+    assert rows[0].composite is not None and rows[0].gates
+
+
+def test_reweight_recomputes_without_models(scored):
+    ctx, _ = scored
+    lid = ctx.voiced_lines()[0].line_id
+    before = read_jsonl(ctx.paths.scores(lid), CandidateScore)
+    ctx.cfg.score.weights = {"utmos": 1.0}
+    ctx.extra["reweight"] = True
+    events_before = len(ctx.models.events)
+    score.run(ctx)
+    after = read_jsonl(ctx.paths.scores(lid), CandidateScore)
+    assert len(ctx.models.events) == events_before  # no model loaded
+    for b, a in zip(before, after):
+        assert a.metrics == b.metrics
+        assert a.composite == pytest.approx(round((a.metrics["utmos"] - 1) / 4, 4))
+
+
+def test_translation_failed_line_goes_to_review(make_ctx, tmp_path):
+    ctx = make_ctx(tmp_path / "game")
+    data = build(ctx, n_per=2, interjection=False)
+    trs = data["translations"]
+    trs[0].flags = ["translate_failed"]
+    trs[0].text_tts = ""
+    trs[0].text_tgt = "テストです0。"
+    from vndub.manifest.io import write_jsonl
+
+    write_jsonl(ctx.paths.translation("ru"), trs)
+    s = synth.run(ctx)
+    assert s["no_translation"] == 1
+    score.run(ctx)
+    sel = {r.line_id: r for r in read_jsonl(ctx.paths.selection, SelectionRecord)}
+    assert sel[trs[0].line_id].status == "review" and sel[trs[0].line_id].reason == "translation failed"

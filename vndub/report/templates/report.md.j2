@@ -1,0 +1,109 @@
+# vndub report
+
+Generated {{ generated }} · profile **{{ profile }}**{% if project %} · engine **{{ project.engine }}** · {{ project.src_lang }} -> {{ project.tgt_lang }} · game `{{ project.game_dir }}`{% endif %}
+
+
+## Overview
+
+| key | value |
+|---|---|
+{% for k, v in overview.items() %}
+| {{ k }} | {{ v if v is not none else "–" }} |
+{% endfor %}
+
+## Mapping coverage
+
+{% if link %}
+ok {{ link.ok_pct }}% of {{ link.total }} · {% for k, v in link.counts.items() %}{{ k }} {{ v }}{% if not loop.last %} · {% endif %}{% endfor %} · relinked {{ link.relinked }} · median match {{ link.match.median | fmt }}
+{% else %}
+not available
+{% endif %}
+
+## Characters
+
+{% if characters %}
+| id | name | gender | lines | min | F0 Hz | LUFS | refs | performer | RVC | route | top emotions |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+{% for c in characters %}
+| {{ c.id }} | {{ c.name }} | {{ c.gender }} | {{ c.n_lines }} | {{ c.total_min }} | {{ c.f0 | fmt(1) }} | {{ c.lufs | fmt(1) }} | {{ c.refs }} | {{ c.performer }} | {{ c.rvc }} | {{ c.route }} | {% for h in c.hist[:4] %}{{ h.label }} {{ h.pct }}%{% if not loop.last %}, {% endif %}{% endfor %} |
+{% endfor %}
+{% else %}
+not available
+{% endif %}
+
+## Scores per backend / route
+
+{% if scores %}
+| backend/route | n | pass % | wins | composite med | UTMOS med | spk_sim med | emo_sim med | CER med | dur med |
+|---|---|---|---|---|---|---|---|---|---|
+{% for r in scores %}
+| {{ r.group }} | {{ r.n }} | {{ r.pass_pct }} | {{ r.wins }} | {{ r.metrics.composite.median | fmt }} | {{ r.metrics.utmos.median | fmt(2) }} | {{ r.metrics.spk_sim.median | fmt }} | {{ r.metrics.emo_sim.median | fmt }} | {{ r.metrics.cer.median | fmt }} | {{ r.metrics.dur_ratio.median | fmt(2) }} |
+{% endfor %}
+{% else %}
+not available
+{% endif %}
+
+## Routes
+
+{% if routes %}
+| route | candidates | composite | UTMOS | spk_sim | emo_sim | CER | dur | pass % | wins |
+|---|---|---|---|---|---|---|---|---|---|
+{% for r in routes %}
+| {{ r.route }} | {{ r.n }} | {{ r.composite | fmt }} | {{ r.utmos | fmt(2) }} | {{ r.spk_sim | fmt }} | {{ r.emo_sim | fmt }} | {{ r.cer | fmt }} | {{ r.dur_ratio | fmt(2) }} | {{ r.pass_pct }} | {{ r.wins }} |
+{% endfor %}
+{% else %}
+not available
+{% endif %}
+
+## Selection
+
+{% if selection %}{% for k, v in selection.items() %}{{ k }}: {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}{% else %}not available{% endif %}
+
+
+## Review queue ({{ queue_total }})
+
+{% if queue %}
+| line | speaker | from | status | reason |
+|---|---|---|---|---|
+{% for q in queue %}
+| {{ q.line_id }} | {{ q.speaker }} | {{ q.source }} | {{ q.status }} | {{ q.reason | replace("|", "/") }} |
+{% endfor %}
+{% else %}
+empty
+{% endif %}
+
+## Backend substitutions
+
+{% if substitutions %}
+| requested | used | loads |
+|---|---|---|
+{% for s in substitutions %}
+| {{ s.requested }} | {{ s.used }} | {{ s.loads }} |
+{% endfor %}
+{% else %}
+none recorded
+{% endif %}
+
+## Stage timings
+
+{% if stages %}
+| stage | elapsed s | error |
+|---|---|---|
+{% for s in stages %}
+| {{ s.stage }} | {{ s.elapsed_s | fmt(1) }} | {{ s.error or "" }} |
+{% endfor %}
+{% else %}
+not available
+{% endif %}
+
+## Models
+
+{% if vram %}
+| model | role | device | loads | load s | estimate GB | peak VRAM GB |
+|---|---|---|---|---|---|---|
+{% for v in vram %}
+| {{ v.model }} | {{ v.role }} | {{ v.device }} | {{ v.loads }} | {{ v.load_s | fmt(1) }} | {{ v.estimate | fmt(1) }} | {{ v.peak_vram_gb | fmt(2) }} |
+{% endfor %}
+{% else %}
+not available
+{% endif %}

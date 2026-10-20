@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vndub report</title>
+<style>
+:root { --bg:#fbfbfa; --fg:#1d1f21; --muted:#6b6f76; --line:#e3e3e0; --card:#ffffff; --accent:#3b6ea8; --ok:#2e7d4f; --warn:#a46b00; --bad:#b03a2e; --bar:#7aa6d6; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#16181b; --fg:#e6e6e3; --muted:#9aa0a6; --line:#2c3035; --card:#1d2024; --accent:#8db4e2; --ok:#6cc48f; --warn:#e0b050; --bad:#ec7a6e; --bar:#4f7fb3; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 1180px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 32px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.sub { color: var(--muted); font-size: 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+.tile { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.tile .v { font-size: 20px; font-variant-numeric: tabular-nums; }
+.tile .k { color: var(--muted); font-size: 12px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; background: var(--card); border: 1px solid var(--line); border-radius: 8px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; white-space: nowrap; }
+td.num, th.num { text-align: right; }
+.na { color: var(--muted); font-style: italic; }
+.bar { display: flex; align-items: center; gap: 6px; font-size: 12px; margin: 1px 0; }
+.bar span.l { width: 82px; color: var(--muted); }
+.bar span.b { display: inline-block; height: 8px; background: var(--bar); border-radius: 2px; }
+.st-auto, .st-ok, .st-override { color: var(--ok); }
+.st-review, .st-unmatched { color: var(--bad); }
+.st-regen, .st-provisional { color: var(--warn); }
+audio { height: 30px; max-width: 220px; }
+code { font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+<h1>vndub report</h1>
+<div class="sub">generated {{ generated }} · profile <b>{{ profile }}</b>{% if project %} · engine <b>{{ project.engine }}</b> · {{ project.src_lang }} → {{ project.tgt_lang }} · game <code>{{ project.game_dir }}</code>{% endif %}</div>
+
+<h2>Overview</h2>
+<div class="grid">
+{% for k, v in overview.items() %}
+  <div class="tile"><div class="v">{{ v if v is not none else "–" }}</div><div class="k">{{ k }}</div></div>
+{% endfor %}
+</div>
+
+<h2>Mapping coverage (link)</h2>
+{% if link %}
+<div class="grid">
+  <div class="tile"><div class="v">{{ link.ok_pct }}%</div><div class="k">ok</div></div>
+  {% for k, v in link.counts.items() %}<div class="tile"><div class="v st-{{ k }}">{{ v }}</div><div class="k">{{ k }}</div></div>{% endfor %}
+  <div class="tile"><div class="v">{{ link.relinked }}</div><div class="k">relinked</div></div>
+  <div class="tile"><div class="v">{{ link.match.median | fmt }}</div><div class="k">median match</div></div>
+  <div class="tile"><div class="v">{{ link.consistency.median | fmt }}</div><div class="k">median spk consistency</div></div>
+</div>
+{% else %}<p class="na">not available (run <code>vndub link</code>)</p>{% endif %}
+
+<h2>Characters</h2>
+{% if characters %}
+<div class="scroll"><table>
+<tr><th>id</th><th>name</th><th>g</th><th class="num">lines</th><th class="num">min</th><th class="num">F0 Hz</th><th class="num">LUFS</th><th class="num">refs</th><th>performer</th><th>RVC</th><th>LoRA</th><th>route</th><th>emotions</th></tr>
+{% for c in characters %}
+<tr><td><code>{{ c.id }}</code></td><td>{{ c.name }}{% if c.tgt %} / {{ c.tgt }}{% endif %}</td><td>{{ c.gender }}</td><td class="num">{{ c.n_lines }}</td><td class="num">{{ c.total_min }}</td><td class="num">{{ c.f0 | fmt(1) }}</td><td class="num">{{ c.lufs | fmt(1) }}</td><td class="num">{{ c.refs }}</td><td>{{ c.performer }}</td><td>{{ c.rvc }}</td><td>{{ c.lora }}</td><td>{{ c.route }}</td>
+<td>{% for h in c.hist %}<div class="bar"><span class="l">{{ h.label }}</span><span class="b" style="width: {{ (h.pct * 1.2) | round(1) }}px"></span>{{ h.pct }}%</div>{% else %}<span class="na">–</span>{% endfor %}</td></tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="na">not available (run <code>vndub parse</code> / <code>vndub analyze</code>)</p>{% endif %}
+
+<h2>Scores per backend / route</h2>
+{% if scores %}
+<div class="scroll"><table>
+<tr><th>backend/route</th><th class="num">n</th><th class="num">pass %</th><th class="num">wins</th>{% for m in metrics %}<th class="num">{{ m }}<br><span class="sub">min / med / max</span></th>{% endfor %}<th>gate pass %</th></tr>
+{% for r in scores %}
+<tr><td><code>{{ r.group }}</code></td><td class="num">{{ r.n }}</td><td class="num">{{ r.pass_pct }}</td><td class="num">{{ r.wins }}</td>
+{% for m in metrics %}{% set s = r.metrics[m] %}<td class="num">{% if s.n %}{{ s.min | fmt(2) }} / {{ s.median | fmt(2) }} / {{ s.max | fmt(2) }}{% else %}<span class="na">–</span>{% endif %}</td>{% endfor %}
+<td>{% for g, v in r.gates.items() %}{{ g }} {{ v }}%{% if not loop.last %}, {% endif %}{% endfor %}</td></tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="na">not available (run <code>vndub synth</code> + <code>vndub score</code>)</p>{% endif %}
+
+<h2>Routes A / B / C</h2>
+{% if routes %}
+<div class="scroll"><table>
+<tr><th>route</th><th class="num">candidates</th><th class="num">mean composite</th><th class="num">UTMOS</th><th class="num">spk sim</th><th class="num">emo sim</th><th class="num">CER</th><th class="num">dur ratio</th><th class="num">pass %</th><th class="num">wins</th></tr>
+{% for r in routes %}
+<tr><td><b>{{ r.route }}</b></td><td class="num">{{ r.n }}</td><td class="num">{{ r.composite | fmt }}</td><td class="num">{{ r.utmos | fmt(2) }}</td><td class="num">{{ r.spk_sim | fmt }}</td><td class="num">{{ r.emo_sim | fmt }}</td><td class="num">{{ r.cer | fmt }}</td><td class="num">{{ r.dur_ratio | fmt(2) }}</td><td class="num">{{ r.pass_pct }}</td><td class="num">{{ r.wins }}</td></tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="na">not available</p>{% endif %}
+
+<h2>Selection</h2>
+{% if selection %}
+<div class="grid">{% for k, v in selection.items() %}<div class="tile"><div class="v st-{{ k }}">{{ v }}</div><div class="k">{{ k }}</div></div>{% endfor %}</div>
+{% else %}<p class="na">not available (run <code>vndub score</code>)</p>{% endif %}
+
+<h2>Review queue ({{ queue_total }})</h2>
+{% if queue %}
+<div class="scroll"><table>
+<tr><th>line</th><th>speaker</th><th>from</th><th>status</th><th>text</th><th>reason</th></tr>
+{% for q in queue %}<tr><td><code>{{ q.line_id }}</code></td><td>{{ q.speaker }}</td><td>{{ q.source }}</td><td class="st-{{ q.status }}">{{ q.status }}</td><td>{{ q.text }}</td><td>{{ q.reason }}</td></tr>{% endfor %}
+</table></div>
+{% if queue_total > queue|length %}<p class="sub">showing {{ queue|length }} of {{ queue_total }}</p>{% endif %}
+{% else %}<p class="na">empty</p>{% endif %}
+
+<h2>Samples</h2>
+{% if samples %}
+<div class="scroll"><table>
+<tr><th>line</th><th>speaker</th><th>original</th><th>dub</th><th>text</th><th>status</th><th class="num">composite</th><th>backend/route</th></tr>
+{% for s in samples %}
+<tr><td><code>{{ s.line_id }}</code></td><td>{{ s.speaker }}</td>
+<td>{% if s.orig %}<audio controls preload="none" src="{{ s.orig }}"></audio>{% else %}<span class="na">–</span>{% endif %}</td>
+<td>{% if s.winner %}<audio controls preload="none" src="{{ s.winner }}"></audio>{% else %}<span class="na">–</span>{% endif %}</td>
+<td>{{ s.text_src }}<br><span class="sub">{{ s.text_tgt }}</span></td><td class="st-{{ s.status }}">{{ s.status }}</td><td class="num">{{ s.composite | fmt }}</td><td><code>{{ s.backend }}</code></td></tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="na">not available</p>{% endif %}
+
+<h2>Backend substitutions</h2>
+{% if substitutions %}
+<table><tr><th>requested</th><th>used</th><th class="num">loads</th></tr>
+{% for s in substitutions %}<tr><td><code>{{ s.requested }}</code></td><td><code>{{ s.used }}</code></td><td class="num">{{ s.loads }}</td></tr>{% endfor %}
+</table>
+{% else %}<p class="na">none recorded</p>{% endif %}
+{% if analysis_missing %}
+<p class="sub">analysis parts missing:</p>
+<table><tr><th>part: reason</th><th class="num">lines</th></tr>{% for k, n in analysis_missing %}<tr><td>{{ k }}</td><td class="num">{{ n }}</td></tr>{% endfor %}</table>
+{% endif %}
+{% if analysis_backends %}
+<p class="sub">analysis backends used: {% for k, n in analysis_backends %}<code>{{ k }}</code> ×{{ n }}{% if not loop.last %}, {% endif %}{% endfor %}</p>
+{% endif %}
+
+<h2>Stage timings</h2>
+{% if stages %}
+<table><tr><th>stage</th><th class="num">elapsed s</th><th>finished</th><th>error</th></tr>
+{% for s in stages %}<tr><td>{{ s.stage }}</td><td class="num">{{ s.elapsed_s | fmt(1) }}</td><td>{{ s.finished or "–" }}</td><td class="st-review">{{ s.error or "" }}</td></tr>{% endfor %}
+</table>
+{% else %}<p class="na">not available</p>{% endif %}
+
+<h2>Models: load time and peak VRAM</h2>
+{% if vram %}
+<table><tr><th>model</th><th>role</th><th>device</th><th class="num">loads</th><th class="num">load s</th><th class="num">estimate GB</th><th class="num">peak VRAM GB</th></tr>
+{% for v in vram %}<tr><td><code>{{ v.model }}</code></td><td>{{ v.role }}</td><td>{{ v.device }}</td><td class="num">{{ v.loads }}</td><td class="num">{{ v.load_s | fmt(1) }}</td><td class="num">{{ v.estimate | fmt(1) }}</td><td class="num">{{ v.peak_vram_gb | fmt(2) }}</td></tr>{% endfor %}
+</table>
+{% else %}<p class="na">not available</p>{% endif %}
+</main>
+</body>
+</html>
