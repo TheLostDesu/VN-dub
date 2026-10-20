@@ -1,0 +1,13 @@
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.ogg binary
+*.wav binary
+*.opus binary
+*.xp3 binary
+*.nsa binary
+*.sar binary
+*.dat binary
+*.rpa binary
+*.npy binary
+*.png binary
