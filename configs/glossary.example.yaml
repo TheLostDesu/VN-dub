@@ -1,0 +1,51 @@
+# Translation glossary (copy to configs/glossary.yaml, or run `vndub translate --seed-glossary`).
+# Sent to the LLM in the system prompt; character entries and terms are injected only
+# when they occur in the batch (GalTransl-style "GPT dictionary").
+
+target_lang: ru
+
+# How Japanese honorifics are rendered: drop | transliterate | map
+honorifics: drop
+honorific_map:
+  さん: ""
+  ちゃん: ""
+  くん: ""
+  様: ""
+  先輩: "семпай"
+  先生: "сэнсэй"
+
+# ты / вы between characters: speaker -> listener -> form ("default" for anyone else)
+address_matrix:
+  sakura: {default: ты}
+  haruto: {default: ты}
+  yui: {default: ты, teacher: вы}
+
+characters:
+  sakura:
+    src: さくら
+    tgt: Сакура
+    gender: f              # drives past-tense / adjective agreement in Russian
+    age_hint: teen
+    notes: "energetic, cheerful classmate"
+  haruto:
+    src: 陽翔
+    tgt: Харуто
+    gender: m
+    age_hint: teen
+    notes: "calm, a little dry"
+  yui:
+    src: ゆい
+    tgt: Юи
+    gender: f
+    age_hint: teen
+    notes: "shy, quiet"
+
+terms:
+  - {src: 放課後, tgt: после уроков}
+  - {src: 校門, tgt: школьные ворота}
+
+style_rules:
+  - "Keep the register and the emotional tone of the original line."
+  - "Interjections must sound natural in Russian (えっ -> «а?», うん -> «угу»), not literal."
+  - "Do not add explanations or notes into the translated text."
+  - "Keep names exactly as listed in the glossary."

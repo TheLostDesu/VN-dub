@@ -1,0 +1,234 @@
+# vndub pipeline configuration (default profile: one NVIDIA GPU with 8 GB VRAM, Windows, offline).
+#
+# Every backend name below is a key of the backend registry: `uv run vndub models list`.
+# Relative paths are resolved against the repository root (the parent of configs/).
+# Any key can be overridden from the command line: --set synth.n_candidates=6
+# A config may `extends: other.yaml`; the child is deep-merged over the base.
+
+profile: default
+fallback_to_mock: false          # only the test profile may substitute mocks for missing backends
+
+project:
+  game_dir: ""                   # usually taken from --project / work/project.yaml
+  work_dir: "work"               # manifests, caches, audio, candidates (relative to the current dir)
+  out_dir: "out"                 # packed patches: out/<engine>/...
+  models_dir: "models"           # downloaded weights (env var VNDUB_MODELS_DIR overrides)
+  src_lang: ja
+  tgt_lang: ru
+
+# research   -> every backend allowed (non-commercial weights included)
+# commercial -> backends whose license forbids commercial use are filtered out
+license_policy: research
+
+gpu:
+  vram_budget_gb: 7.5            # never load a model whose estimate exceeds budget - margin
+  safety_margin_gb: 0.5
+  device: "cuda:0"
+  allow_cpu_fallback: false      # true = run CPU-capable heavy models on CPU when CUDA is absent (slow)
+
+tools_file: "configs/tools.yaml" # external CLI paths (ffmpeg, vgmstream, Xp3Pack, llama-server ...)
+tools: {}                        # inline overrides of tools.yaml
+
+extract:
+  keep_stereo_copy: true         # stereo originals: keep a stereo copy, analysis uses the mono downmix
+  analysis_sr: 16000             # work/audio/src16 sample rate
+  workers: 4                     # parallel ffmpeg decodes
+  voice_exts: [".ogg", ".wav", ".opus", ".mp3", ".flac", ".m4a", ".weba"]
+  vgmstream_exts: [".hca", ".adx", ".at3", ".at9", ".fsb", ".bank", ".nwa", ".nwk", ".ovk", ".wem", ".bnk", ".acb", ".awb", ".xwb", ".ahx", ".kvs", ".ktss"]
+  voice_dirs: ["voice", "vo", "koe", "sound/voice", "data/voice"]
+
+parse:
+  engine: auto                   # auto = engine from project.yaml (written by detect)
+  engine_opts:
+    kag:
+      macro_files: ["macro.ks", "first.ks"]
+      name_attr: auto            # attribute that carries the speaker name (auto = learn from macros)
+      voice_attr: auto           # attribute that carries the voice storage
+      macro_names: ["nm", "cn", "name", "ns"]
+      scenario_glob: "**/*.ks"
+      encoding: auto             # auto = BOM / utf-8 / cp932 sniffing
+    nscripter:
+      speaker_regex: "^【(?P<name>[^】]+)】"
+      encoding: cp932
+    renpy:
+      dialogue_tab: ""           # dialogue.tab exported by the Ren'Py launcher (Extract Dialogue)
+      auto_voice: ""             # override config.auto_voice, e.g. "voice/{id}.ogg"
+    tyrano:
+      scenario_dir: "data/scenario"
+    generic:
+      prefix_regex: "^(?P<prefix>[A-Za-z]+?)_?(?P<index>\\d+)$"
+      prefix_map: {}             # speaker_id -> voice prefix when it cannot be inferred
+  import_vntextpatch: ""         # VNTextPatch extractlocal JSON dir (text + names), generic engines
+  narrator_names: ["", "narrator", "ナレーション", "地の文"]
+
+link:
+  asr: anime_whisper             # litagin/anime-whisper via faster-whisper (no initial prompt)
+  asr_fallback: whisper_large_v3_turbo
+  asr_compute: int8
+  accept_score: 0.80             # RapidFuzz normalized similarity: >= accept -> ok
+  review_score: 0.60             # [review, accept) -> review; below -> global search
+  neighbour_window: 5            # compare against +-N lines in script order
+  global_topk: 3
+  auto_repair: true              # rebind a voice file when a global match clearly beats the bound line
+  speaker_embedder: ecapa
+  cluster_distance: 0.35         # agglomerative clustering cut (cosine distance)
+  outlier_consistency: 0.50      # cosine to the speaker centroid below this -> review
+
+analyze:
+  e2v: emotion2vec_plus_large    # 9 classes + 768-d embedding (also used by score.emotion)
+  anime_ser: anime_ser           # galgame-domain 10-class SER ("" disables)
+  adv: audeering_adv             # arousal/dominance/valence (CC-BY-NC-SA: research only)
+  events: sensevoice             # laughter / cry / breath / bgm tags
+  aligner: qwen3_aligner         # char timestamps -> mora rate, pauses
+  aligner_fallback: whisperx_ja
+  f0: rmvpe                      # rmvpe | torchcrepe | librosa_f0
+  vad: silero                    # silero | energy_vad
+  caption: false                 # Qwen2-Audio-7B NF4 captions; disabled + logged automatically on OOM
+  caption_backend: qwen2_audio
+  ref_candidates_per_emotion: 2
+  e2v_weight: 0.6                # emotion vote weights (style prompt)
+  anime_weight: 0.4
+
+translate:
+  import: ""                     # VNTextPatch JSON/XLSX dir or a JSONL/CSV map line_id -> text; skips the LLM
+  llm:
+    backend: gemma4_12b          # GGUF via llama.cpp llama-server (tools.llama_server)
+    fallbacks: [qwen35_9b, hy_mt15_7b]
+    ctx: 16384
+    n_gpu_layers: -1
+    temperature: 0.3
+    port: 8089
+    max_retries: 2
+  batch_lines: 20                # lines per request (per scene)
+  context_window_lines: 15       # previously translated lines shown to the model
+  glossary: "configs/glossary.yaml"   # create with: vndub translate --seed-glossary
+  short_variant_min_words: 8     # lines longer than this also get a >=20% shorter variant
+  stress:
+    tool: ruaccent               # ruaccent | none
+    model: turbo
+    yo: true
+    format: auto                 # auto = per backend ('+' marks for f5_ru, plain otherwise)
+  interjections: "configs/interjections.yaml"
+  mock_dictionary: ""
+
+voicebank:
+  refs:
+    min_snr_db: 25
+    min_sec: 3.0
+    max_sec: 10.0
+    per_emotion: 2
+    max_total: 10
+    min_refs: 5
+  performer:
+    kind: voice_design           # voice_design | reference (native clips in reference_dir/<speaker_id>/)
+    backend: qwen3_tts_voicedesign
+    n_designs: 4                 # candidate designs per character
+    test_sentences: 5
+    max_f0_delta_semitones: 3
+    reference_dir: ""
+  rvc:
+    enabled: true
+    backend: rvc
+    min_minutes: 10              # train only with >= 10 min of clean audio
+    max_minutes: 40
+    f0_method: rmvpe
+    sample_rate: 40000
+    batch_size: 6
+    epochs: 300
+    overfit_patience: 30
+  route_c:
+    enabled: false               # LoRA on route-B winners (run synth+score first)
+    backend: voxcpm2
+    min_minutes: 5
+    max_minutes: 30
+    composite_threshold: 0.75
+  calibrate_spk: true            # EER threshold for the speaker-similarity gate
+  min_minutes_for_voicebank: 3.0
+
+synth:
+  n_candidates: 4
+  n_candidates_short: 6          # interjections, short lines, high arousal
+  routes: {A: true, B: true, C: false}
+  backends:
+    qwen3_tts:
+      enabled: true
+      x_vector_only_mode: true
+      max_new_tokens_margin: 1.3
+    cosyvoice3:
+      enabled: true
+      mode: cross_lingual_instruct
+    chatterbox_ml:
+      enabled: true
+      exaggeration_range: [0.3, 1.2]
+      cfg_weight_cross_lingual: 0.0
+    voxcpm2:
+      enabled: false             # ~8 GB official: enable after `vndub models selftest voxcpm2`
+    fish_s2:
+      enabled: false             # research license, audio.cpp GGUF
+    f5_ru:
+      enabled: false             # research license; fix_duration + '+' stress marks
+    moss_tts:
+      enabled: false
+    zonos2:
+      enabled: false
+    higgs_tts3:
+      enabled: false
+  vc:
+    primary: rvc                 # trained per character in voicebank
+    fallback: seedvc             # zero-shot when no RVC model exists
+    rvc: {index_rate: 0.5, protect: 0.33, f0_method: rmvpe}
+    seedvc: {convert_style: false, diffusion_steps: 30}
+  keep_original_for_interjections: true
+  use_short_text_if_ratio_above: 1.25
+  interjection_max_syllables: 2
+  high_arousal: 0.75
+  seed_base: 1234
+
+score:
+  weights: {utmos: 0.25, pq: 0.10, spk_sim: 0.20, emo_sim: 0.20, cer: 0.15, dur: 0.05, prosody: 0.05}
+  gates:
+    utmos_min: 3.0
+    cer_max: 0.10
+    dur_ratio: [0.8, 1.25]
+    spk_sim_min: calibrated      # EER threshold from voicebank/spk_calibration.json, or a number
+    spk_sim_default: 0.25        # used when calibration is unavailable
+  mos: utmosv2
+  mos_fallback: utmos22
+  aesthetics: audiobox           # Audiobox Aesthetics PQ ("" disables)
+  speaker: ecapa
+  speaker_extra: ""              # e.g. wavlm_sv
+  cer_asr: gigaam_v3
+  cer_asr_fallback: whisper_ru
+  emotion: emotion2vec_plus_large  # must match analyze.e2v
+  adv: audeering_adv
+  regen_rounds: 2
+  interjection_cer_max: 0.5
+
+master:
+  stretch:
+    enabled: true
+    target_window: [0.9, 1.1]    # stretch only outside this duration ratio
+    max_stretch: 0.15            # ... and only if the change is <= 15 %
+    engine: rubberband           # rubberband (tools.rubberband) | atempo (ffmpeg)
+  loudness:
+    target: character_median     # or a LUFS number
+    true_peak_dbtp: -1.0
+    default_lufs: -20.0
+  match_silence_profile: true
+  include_review_lines: skip     # skip | provisional (use the best candidate of review lines)
+
+pack:
+  kirikiri: {mode: patch_xp3, patch_name: "", subdir: ""}   # patch_xp3 | unencrypted_dir
+  renpy: {mode: loose}
+  nscripter: {mode: loose}
+  unity: {mode: unitypy_script}
+  other: {}
+
+review:
+  host: 127.0.0.1
+  port: 7861
+  batch_accept_threshold: 0.75
+
+report:
+  compare_routes: true
+  markdown: true

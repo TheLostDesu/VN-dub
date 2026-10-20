@@ -1,0 +1,93 @@
+# Test profile: small, CPU-capable, no big downloads.
+#
+#   uv run vndub run --config configs/pipeline.test.yaml --project tests/fixtures/renpy_mini
+#
+# Real CPU models are used when their env + weights exist (scripts/make_envs.ps1 -Env asr,score;
+# vndub models pull --profile test): whisper tiny (link + CER), ECAPA, UTMOS22, emotion2vec+ seed.
+# Anything missing is replaced by its deterministic mock (fallback_to_mock), and every
+# substitution is logged and listed in the report. TTS = MockTTS (+ Windows SAPI voices on
+# Windows), VC = MockVC (pitch shift only), translation = MockTranslator (dictionary).
+
+extends: pipeline.yaml
+profile: test
+fallback_to_mock: true
+
+gpu:
+  allow_cpu_fallback: true
+
+link:
+  asr: whisper_tiny
+  asr_fallback: ""
+  speaker_embedder: ecapa
+  cluster_distance: 0.45
+
+analyze:
+  e2v: emotion2vec_plus_seed
+  anime_ser: mock_anime_ser
+  adv: mock_adv
+  events: mock_events
+  aligner: mock_aligner
+  aligner_fallback: ""
+  f0: librosa_f0
+  vad: energy_vad
+  caption: false
+
+translate:
+  llm:
+    backend: mock_translator     # `vndub translate --real` switches to llm.real_backend below
+    fallbacks: []
+  mock_dictionary: "tests/fixtures/mock_dictionary.yaml"
+
+voicebank:
+  refs:
+    min_snr_db: 10
+    min_sec: 0.8
+    max_sec: 12.0
+    min_refs: 1
+  performer:
+    kind: voice_design
+    backend: sapi_tts            # Windows SAPI ru-RU voice as the native performer (mock elsewhere)
+    n_designs: 2
+    test_sentences: 2
+    max_f0_delta_semitones: 12
+  rvc:
+    enabled: true
+    backend: mock_vc
+    min_minutes: 0.05
+  min_minutes_for_voicebank: 0.0
+
+synth:
+  n_candidates: 2
+  n_candidates_short: 3
+  routes: {A: true, B: true, C: false}
+  backends:
+    qwen3_tts: {enabled: false}
+    cosyvoice3: {enabled: false}
+    chatterbox_ml: {enabled: false}
+    mock_tts: {enabled: true}
+    sapi_tts: {enabled: true}
+  vc:
+    primary: mock_vc
+    fallback: ""
+
+score:
+  gates:
+    utmos_min: 1.0
+    cer_max: 1.0
+    dur_ratio: [0.4, 2.5]
+    spk_sim_min: -1.0
+  mos: utmos22
+  mos_fallback: ""
+  aesthetics: ""
+  speaker: ecapa
+  cer_asr: whisper_tiny
+  cer_asr_fallback: ""
+  emotion: emotion2vec_plus_seed
+  adv: mock_adv
+  regen_rounds: 1
+  interjection_cer_max: 1.0
+
+master:
+  stretch:
+    engine: atempo
+  include_review_lines: provisional

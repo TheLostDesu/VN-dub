@@ -1,0 +1,39 @@
+# External CLI tools (never vendored). Empty value = look up the default executable on PATH.
+# Per-machine overrides can go into configs/tools.local.yaml (git-ignored).
+# Check with: uv run vndub tools check [--engine kirikiri]
+# Download URLs for every tool are printed by `tools check` and listed in docs/ENGINES.md.
+
+# audio (required)
+ffmpeg: ""                  # e.g. C:/tools/ffmpeg/bin/ffmpeg.exe   (winget install Gyan.FFmpeg)
+ffprobe: ""
+vgmstream_cli: ""           # e.g. C:/tools/vgmstream/vgmstream-cli.exe
+rubberband: ""              # e.g. C:/tools/rubberband/rubberband.exe (fallback: ffmpeg atempo)
+
+# Ren'Py
+unrpa: ""                   # pip install unrpa (or uv sync --extra extract)
+unrpyc: ""                  # unrpyc v2.x: path to unrpyc.py or a wrapper script
+
+# KiriKiri
+xp3pack: ""                 # KirikiriTools Xp3Pack.exe (otherwise the built-in XP3 writer is used)
+krkrdump: ""                # KrkrDumpLoader.exe (encrypted KiriKiri Z: dump at runtime)
+freemote_psbdecompile: ""   # FreeMote PsbDecompile.exe (.scn -> JSON)
+
+# other engines
+siglus_ssu: ""              # SiglusSceneScriptUtility
+bgi_extractor: ""
+catsystem2_cli: ""
+exkifint: ""
+pfs_unpacker: ""            # pfs-rs (Artemis)
+yrt: ""                     # YU-RIS-TOOLS
+majiro_tools: ""
+assetripper: ""             # AssetRipper (Unity, --headless)
+garbro_console: ""          # GARbro console "gameres" (fallback extractor)
+arc_unpacker: ""
+vntextpatch: ""             # VNTextPatch.exe (text + names for 22 engines)
+
+# models
+llama_server: ""            # llama.cpp llama-server.exe (CUDA 12 build) for translate
+applio_dir: ""              # Applio checkout if not in .venvs/rvc/src/Applio
+audiocpp: ""                # Fish S2 Pro GGUF runner
+zonos2_cli: ""
+moss_tts_cli: ""

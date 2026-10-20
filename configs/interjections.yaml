@@ -1,0 +1,38 @@
+# Japanese interjections -> natural Russian equivalents (used for lines of <= 2 syllables
+# or lines consisting only of an interjection). Keys are matched after NFKC + punctuation
+# stripping; a trailing "?" in the value is kept as the intonation hint for TTS.
+うん: угу
+うんうん: угу-угу
+ええ: да
+え: э?
+えっ: а?
+え？: э?
+えー: э-э
+ん: м
+ん？: м?
+んー: м-м
+うーん: хм
+はい: да
+いいえ: нет
+いや: нет
+ああ: а-а
+あっ: ах
+あ: а
+おお: о-о
+おっ: о
+へえ: ого
+ほう: хо
+ふん: хмф
+ふふ: хи-хи
+ふふっ: хи-хи
+えへへ: хе-хе
+あはは: ахаха
+はぁ: ха-а
+はあ: эх
+ひっ: ай
+きゃっ: ай!
+わあ: ух ты
+うわ: уф
+うわぁ: ох
+よし: так
+ちっ: тц

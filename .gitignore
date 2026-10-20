@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venvs/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# pipeline outputs and downloaded weights
+/work/
+/out/
+/models/
+tests/_tmp/
+
+# per-user tool paths
+configs/tools.local.yaml
