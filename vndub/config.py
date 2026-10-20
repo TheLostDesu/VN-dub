@@ -83,6 +83,8 @@ class KagOpts(_Section):
     macro_names: list[str] = Field(default_factory=lambda: ["nm", "cn", "name", "ns"])
     scenario_glob: str = "**/*.ks"
     encoding: str = "auto"
+    # [r] ends a dialogue line (default: [r] is a line break inside the message)
+    break_on_r: bool = False
 
 
 class NScripterOpts(_Section):
@@ -94,6 +96,9 @@ class RenpyOpts(_Section):
     dialogue_tab: str = ""
     # Overrides config.auto_voice detected in the scripts, e.g. "voice/{id}.ogg".
     auto_voice: str = ""
+    # Ren'Py >= 8.5.1 config.tlid_only_considers_say (default True in 8.6): voice
+    # statements do not enter the dialogue identifier
+    tlid_only_considers_say: bool = False
 
 
 class TyranoOpts(_Section):

@@ -1,0 +1,22 @@
+{
+ "messages": [
+  {
+   "speaker": "",
+   "text": "朝の駅は静かだった。"
+  },
+  {
+   "speaker": "ユキ",
+   "text": "おはよう！",
+   "voice": "yuki_000001"
+  },
+  {
+   "name": "ソウタ",
+   "message": "早いな",
+   "voice_id": "sota_000001"
+  },
+  {
+   "speaker": "ユキ",
+   "text": "(yuki_000002)今日は特別な日だから"
+  }
+ ]
+}

@@ -1,0 +1,7 @@
+{"line_id":"s01_000001","scene":"s01","speaker_raw":"","speaker_id":"narrator","text_src":"夕暮れの屋上。風が少し冷たい。","voice_file":null,"has_voice":false,"flags":[],"choices":null}
+{"line_id":"s01_000002","scene":"s01","speaker_raw":"寧々","speaker_id":"u_4e1329","text_src":"「……本当に？」","voice_file":"voice/nen_0001.ogg","has_voice":true,"flags":[],"choices":null}
+{"line_id":"s01_000003","scene":"s01","speaker_raw":"ハルキ","speaker_id":"u_b96e4e","text_src":"「ああ、本当だよ。嘘はつかない」","voice_file":"voice/har_0001.ogg","has_voice":true,"flags":[],"choices":null}
+{"line_id":"s01_000004","scene":"s01","speaker_raw":"寧々","speaker_id":"u_4e1329","text_src":"「じゃあ、信じる」","voice_file":"voice/nen_0002.ogg","has_voice":true,"flags":[],"choices":null}
+{"line_id":"s01_000005","scene":"s01","speaker_raw":"","speaker_id":"narrator","text_src":"風の音が響いた。","voice_file":null,"has_voice":false,"flags":[],"choices":null}
+{"line_id":"s01_000006","scene":"s01","speaker_raw":"ハルキ","speaker_id":"u_b96e4e","text_src":"「帰ろうか」","voice_file":"voice/har_0002.ogg","has_voice":true,"flags":[],"choices":null}
+{"line_id":"s01_000007","scene":"s01","speaker_raw":"寧々","speaker_id":"u_4e1329","text_src":"「うん！」","voice_file":"voice/nen_0003.ogg","has_voice":true,"flags":[],"choices":null}

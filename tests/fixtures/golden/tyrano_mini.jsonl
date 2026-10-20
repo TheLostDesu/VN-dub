@@ -1,0 +1,6 @@
+{"line_id":"scene1_000001","scene":"scene1","speaker_raw":"","speaker_id":"narrator","text_src":"放課後の教室。","voice_file":null,"has_voice":false,"flags":[],"choices":null}
+{"line_id":"scene1_000002","scene":"scene1","speaker_raw":"あかね","speaker_id":"akane","text_src":"ねえ、ちょっといい？","voice_file":"sound/akane_1.ogg","has_voice":true,"flags":["voconfig"],"choices":null}
+{"line_id":"scene1_000003","scene":"scene1","speaker_raw":"やまと","speaker_id":"yamato","text_src":"なに？","voice_file":"sound/yamato_1.ogg","has_voice":true,"flags":["voconfig"],"choices":null}
+{"line_id":"scene1_000004","scene":"scene1","speaker_raw":"あかね","speaker_id":"akane","text_src":"これ、あげる！","voice_file":"sound/akane_2.ogg","has_voice":true,"flags":["voconfig"],"choices":null}
+{"line_id":"scene1_000005","scene":"scene1","speaker_raw":"あかね","speaker_id":"akane","text_src":"（独り言は録音されていない）","voice_file":null,"has_voice":false,"flags":[],"choices":null}
+{"line_id":"scene1_000006","scene":"scene1","speaker_raw":"やまと","speaker_id":"yamato","text_src":"……ありがとう。","voice_file":"sound/yamato_2.ogg","has_voice":true,"flags":["voconfig"],"choices":null}

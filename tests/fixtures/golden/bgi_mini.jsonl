@@ -1,0 +1,4 @@
+{"line_id":"01_morning_000001","scene":"01_morning","speaker_raw":"","speaker_id":"narrator","text_src":"朝の駅は静かだった。","voice_file":null,"has_voice":false,"flags":[],"choices":null}
+{"line_id":"01_morning_000002","scene":"01_morning","speaker_raw":"ユキ","speaker_id":"u_506f98","text_src":"おはよう！","voice_file":"voice/yuki_000001.ogg","has_voice":true,"flags":[],"choices":null}
+{"line_id":"01_morning_000003","scene":"01_morning","speaker_raw":"ソウタ","speaker_id":"u_c9ab33","text_src":"早いな","voice_file":"voice/sota_000001.ogg","has_voice":true,"flags":[],"choices":null}
+{"line_id":"01_morning_000004","scene":"01_morning","speaker_raw":"ユキ","speaker_id":"u_506f98","text_src":"今日は特別な日だから","voice_file":"voice/yuki_000002.ogg","has_voice":true,"flags":[],"choices":null}

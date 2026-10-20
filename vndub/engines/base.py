@@ -40,6 +40,8 @@ class DetectResult:
     archives: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     voice_codec: dict[str, Any] | None = None
+    # a loose voice file that can be probed for the codec (None when voices are archived)
+    voice_sample: Path | None = None
 
 
 @dataclass
@@ -49,6 +51,22 @@ class ExtractResult:
     voice_files: list[Path]
     notes: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
+    # additional roots voice files may live under (archive extraction dirs);
+    # relpath = path relative to the first root (voice_root first) containing the file
+    voice_roots: list[Path] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def all_roots(self) -> list[Path]:
+        roots = [self.voice_root] + [r for r in self.voice_roots if r != self.voice_root]
+        return roots
+
+    def relpath(self, f: Path) -> str:
+        for root in self.all_roots():
+            try:
+                return f.resolve().relative_to(root.resolve()).as_posix()
+            except ValueError:
+                continue
+        return f.name
 
     def save(self, path: Path) -> None:
         write_json(
@@ -56,8 +74,10 @@ class ExtractResult:
             {
                 "script_files": [p.as_posix() for p in self.script_files],
                 "voice_root": self.voice_root.as_posix(),
+                "voice_roots": [p.as_posix() for p in self.voice_roots],
                 "voice_files": [p.as_posix() for p in self.voice_files],
                 "notes": self.notes,
+                "warnings": self.warnings,
                 "extra": self.extra,
             },
         )
@@ -73,6 +93,8 @@ class ExtractResult:
             voice_files=[Path(p) for p in d.get("voice_files", [])],
             notes=d.get("notes", []),
             extra=d.get("extra", {}),
+            voice_roots=[Path(p) for p in d.get("voice_roots", [])],
+            warnings=d.get("warnings", []),
         )
 
 
@@ -260,3 +282,100 @@ def write_install(out: Path, engine: str, steps: list[str], extra: str = "") -> 
     p = out / "INSTALL.md"
     p.write_text("\n".join(body) + "\n", encoding="utf-8")
     return p
+
+
+# ----------------------------------------------------------------------------
+# shared parsing helpers (additive)
+# ----------------------------------------------------------------------------
+
+NON_VOICE_DIRS = {"bgm", "music", "se", "sfx", "sound", "sounds", "ambient", "system", "sysse", "jingle", "movie", "image", "images", "fgimage", "bgimage"}
+
+
+def pick_voice_files(root: Path, voice_dirs: Iterable[str] = (), exts: Iterable[str] = AUDIO_EXTS) -> list[Path]:
+    """Audio under configured voice dirs if any exist, else all audio outside obvious non-voice dirs."""
+    if not root.exists():
+        return []
+    hits: list[Path] = []
+    for vd in voice_dirs:
+        d = root / vd
+        if d.is_dir():
+            hits.extend(find_audio(d, exts))
+    if hits:
+        return sorted(set(hits))
+    out = []
+    for p in find_audio(root, exts):
+        rel = [x.lower() for x in p.relative_to(root).parts[:-1]]
+        if any(x in NON_VOICE_DIRS for x in rel):
+            continue
+        out.append(p)
+    return out
+
+
+def read_text_any(path: Path, encoding: str = "auto") -> str:
+    """Decode a script file: BOM sniffing, then utf-8, then cp932 (or a forced encoding)."""
+    data = path.read_bytes()
+    if encoding and encoding != "auto":
+        return data.decode(encoding, errors="replace")
+    if data[:3] == b"\xef\xbb\xbf":
+        return data[3:].decode("utf-8", errors="replace")
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode("cp932")
+    except UnicodeDecodeError:
+        return data.decode("cp932", errors="replace")
+
+
+class LineBuilder:
+    """Sequential line ids per scene (``<scene>_<order:06d>``) and context_prev bookkeeping."""
+
+    def __init__(self, narrator_names: Iterable[str] = ("", "narrator")) -> None:
+        self.lines: list[LineRecord] = []
+        self.narrator_names = list(narrator_names)
+        self._order: dict[str, int] = {}
+        self._prev: dict[str, list[str]] = {}
+
+    def add(
+        self,
+        scene: str,
+        text: str,
+        speaker_raw: str = "",
+        speaker_id: str | None = None,
+        **fields: Any,
+    ) -> LineRecord:
+        scene = scene_slug(scene)
+        n = self._order.get(scene, 0) + 1
+        self._order[scene] = n
+        sid = speaker_id or speaker_id_for(speaker_raw, self.narrator_names)
+        lid = f"{scene}_{n:06d}"
+        rec = LineRecord(
+            line_id=lid,
+            scene=scene,
+            order=len(self.lines) + 1,
+            speaker_raw=speaker_raw or "",
+            speaker_id=sid,
+            text_src=text,
+            context_prev=list(self._prev.get(scene, [])[-2:]),
+            **fields,
+        )
+        self._prev.setdefault(scene, []).append(lid)
+        self.lines.append(rec)
+        return rec
+
+
+_SCENE_RE = re.compile(r"[^0-9A-Za-z_\-]+")
+
+
+def scene_slug(name: str) -> str:
+    s = _SCENE_RE.sub("_", unicodedata.normalize("NFKC", name or "")).strip("_")
+    if not s:
+        return slugify(name or "scene", fallback="scene")
+    return s
+
+
+def strip_tags(text: str, pattern: str = r"\{[^{}]*\}") -> str:
+    return re.sub(pattern, "", text)
