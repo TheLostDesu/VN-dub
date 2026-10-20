@@ -160,13 +160,7 @@ def _stage(name: str, helptext: str) -> None:
     app.command(name, help=helptext)(cmd)
 
 
-_stage("extract", "Extract archives/scripts/voices; decode voices to work/audio/{src,src16}.")
-_stage("link", "Verify line<->voice mapping: ASR + fuzzy match + speaker clustering.")
-_stage("analyze", "Expression passport per voiced line (emotion, A/D/V, events, prosody, SNR).")
-_stage("voicebank", "Per character: reference clips, performer voice, RVC model, LoRA (route C).")
-_stage("master", "Trim, stretch, loudness-normalize and encode winners to the source codec.")
-_stage("pack", "Pack final voice files into the engine's patch format + INSTALL.md.")
-_stage("report", "HTML + Markdown report: coverage, emotions, scores, routes, review queue, VRAM.")
+# Commands are registered in pipeline order (typer lists them in registration order).
 
 
 @app.command("detect", help="Identify the engine and write work/project.yaml.")
@@ -181,6 +175,9 @@ def detect_cmd(
 ) -> None:
     ctx = make_ctx(project, config, force=force, work_dir=work_dir, out_dir=out_dir, sets=set_, extra={"engine": engine, "rebind_project": force})
     _run(["detect"], ctx)
+
+
+_stage("extract", "Extract archives/scripts/voices; decode voices to work/audio/{src,src16}.")
 
 
 @app.command("parse", help="Scripts -> manifest/lines.jsonl + manifest/characters.yaml.")
@@ -199,6 +196,10 @@ def parse_cmd(
     _run(["parse"], ctx)
 
 
+_stage("link", "Verify line<->voice mapping: ASR + fuzzy match + speaker clustering.")
+_stage("analyze", "Expression passport per voiced line (emotion, A/D/V, events, prosody, SNR).")
+
+
 @app.command("translate", help="Import a translation or translate with the local LLM; stress + normalization.")
 def translate_cmd(
     project: Path = ProjectOpt,
@@ -214,6 +215,9 @@ def translate_cmd(
 ) -> None:
     ctx = make_ctx(project, config, force=force, only=only, limit=limit, work_dir=work_dir, out_dir=out_dir, sets=set_, extra={"seed_glossary": seed_glossary, "real": real})
     _run(["translate"], ctx)
+
+
+_stage("voicebank", "Per character: reference clips, performer voice, RVC model, LoRA (route C).")
 
 
 @app.command("synth", help="N candidates per voiced line per enabled backend and route.")
@@ -246,6 +250,11 @@ def score_cmd(
 ) -> None:
     ctx = make_ctx(project, config, force=force, only=only, limit=limit, work_dir=work_dir, out_dir=out_dir, sets=set_, extra={"reweight": reweight})
     _run(["score"], ctx)
+
+
+_stage("master", "Trim, stretch, loudness-normalize and encode winners to the source codec.")
+_stage("pack", "Pack final voice files into the engine's patch format + INSTALL.md.")
+_stage("report", "HTML + Markdown report: coverage, emotions, scores, routes, review queue, VRAM.")
 
 
 @app.command("run", help="Run all stages in order (score -> synth regen loop included).")
@@ -323,14 +332,26 @@ def review_cmd(
 
 
 @models_app.command("list", help="All registered backends with role, env, license and VRAM estimate.")
-def models_list(role: Optional[str] = typer.Option(None, "--role")) -> None:
+def models_list(
+    role: Optional[str] = typer.Option(None, "--role"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Also show license and description."),
+) -> None:
     from vndub.backends import registry
 
-    t = Table("name", "role", "env", "license", "commercial", "VRAM GB", "profiles", "description")
+    t = Table()
+    t.add_column("name", no_wrap=True)
+    for c in ("role", "env", "VRAM GB", "commercial", "profiles"):
+        t.add_column(c, no_wrap=True)
+    if verbose:
+        t.add_column("license", overflow="fold")
+        t.add_column("description", overflow="fold")
     for s in sorted(registry.all_specs().values(), key=lambda s: (s.role, s.name)):
         if role and s.role != role:
             continue
-        t.add_row(s.name, s.role, s.env or "core", s.license, "yes" if s.commercial_ok else "no", f"{s.vram_estimate_gb:.1f}", ",".join(s.profiles), s.description)
+        row = [s.name, s.role, s.env or "core", f"{s.vram_estimate_gb:.1f}", "yes" if s.commercial_ok else "no", ",".join(s.profiles)]
+        if verbose:
+            row += [s.license, s.description]
+        t.add_row(*row)
     console.print(t)
 
 

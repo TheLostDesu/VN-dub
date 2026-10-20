@@ -7,7 +7,9 @@ Results are flagged ``"mock": true`` and stages record the substitution.
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import re
 import zlib
 from pathlib import Path
@@ -69,6 +71,17 @@ def _seed_of(*parts: Any) -> int:
 
 
 def _feat(path: str) -> dict[str, float]:
+    """Feature pass shared by all mocks; cached per file version (mocks call it per op)."""
+    st = os.stat(path)
+    return dict(_feat_cached(str(Path(path).resolve()), st.st_size, st.st_mtime_ns))
+
+
+@functools.lru_cache(maxsize=4096)
+def _feat_cached(path: str, size: int, mtime_ns: int) -> tuple[tuple[str, float], ...]:
+    return tuple(_feat_compute(path).items())
+
+
+def _feat_compute(path: str) -> dict[str, float]:
     y, sr = features.load(path, sr=16000)
     e = features.rms_db(y, sr)
     segs = vad.energy_vad(y, sr)
@@ -179,9 +192,7 @@ class MockEmbedder(LocalBackend):
         if y.size < 2048:
             y = np.pad(y, (0, 2048 - y.size))
         mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
-        f0 = features.f0_pyin(y, sr) if y.size < 16000 * 15 else np.zeros(1)
-        st = features.f0_stats(f0)
-        logf0 = np.log((st["f0_median_hz"] or 150.0) / 150.0)
+        logf0 = np.log((_feat(item["wav"])["f0_med"] or 150.0) / 150.0)
         vec = np.concatenate([mfcc.mean(axis=1) / 50, mfcc.std(axis=1) / 50, [logf0 * 3]]).astype(np.float32)
         out = Path(item["out"])
         out.parent.mkdir(parents=True, exist_ok=True)

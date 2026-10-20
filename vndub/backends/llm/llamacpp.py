@@ -171,6 +171,7 @@ class LlamaCppBackend(LocalBackend):
         json_mode: bool = True,
         seed: int | None = None,
         timeout_s: float = 600.0,
+        **_: Any,  # protocol extras (e.g. tgt=) used only by the mock translator
     ) -> str:
         if not self.loaded:
             self.load()

@@ -95,6 +95,37 @@ class StageContext:
     def characters(self) -> dict[str, Character]:
         return load_characters(self.paths.characters)
 
+    def voiced_lines(self, apply_only: bool = True) -> list[LineRecord]:
+        """Voiced lines with ``link.jsonl`` rebindings applied (the binding every stage after link uses).
+
+        link.jsonl holds one record per line it judged; its ``audio_id`` is the audio
+        that line now owns (``None`` = the voice was moved away / unmatched-and-dropped).
+        A file whose audio matches another line's text is rebound to that line, so the
+        dub of the file says what the original file said.
+        """
+        from vndub.manifest.io import AudioIndexRecord, LinkRecord, read_jsonl
+
+        lines = self.lines()
+        if self.paths.link.exists():
+            audio = {a.id: a for a in read_jsonl(self.paths.audio_index, AudioIndexRecord)}
+            links = {r.line_id: r for r in read_jsonl(self.paths.link, LinkRecord)}
+            for l in lines:
+                r = links.get(l.line_id)
+                if r is None or r.audio_id == l.audio_id:
+                    continue
+                if r.audio_id is None:
+                    l.has_voice = False
+                    l.flags = [*l.flags, "voice_moved"]
+                    continue
+                a = audio.get(r.audio_id)
+                if a is None:
+                    continue
+                l.audio_id, l.voice_file, l.has_voice = a.id, a.relpath, True
+                l.src_wav, l.src_wav16 = a.wav or None, a.wav16 or None
+                l.flags = [*l.flags, "relinked"]
+        out = [l for l in lines if l.has_voice and l.audio_id]
+        return self.select(out) if apply_only else out
+
     def select(self, lines: list[LineRecord], voiced_only: bool = True) -> list[LineRecord]:
         """Apply --only / --limit (and the voiced filter)."""
         out = [l for l in lines if (l.has_voice or not voiced_only)]

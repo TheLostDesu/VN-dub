@@ -43,8 +43,13 @@ def rms_db(y: np.ndarray, sr: int, hop_s: float = HOP_S, win_s: float = 0.025) -
     return 20.0 * np.log10(np.maximum(rms, 1e-6))
 
 
-def f0_pyin(y: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 1000.0, hop_s: float = HOP_S) -> np.ndarray:
-    """F0 in Hz per hop with 0 for unvoiced frames (librosa pYIN; slow but dependency-free)."""
+def f0_pyin(y: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 1000.0, hop_s: float = HOP_S, resolution: float = 0.25) -> np.ndarray:
+    """F0 in Hz per hop with 0 for unvoiced frames (librosa pYIN, dependency-free).
+
+    ``resolution`` is the pitch-bin width in semitones; 0.25 is ~4x faster than
+    librosa's 0.1 default and ample for contour statistics. The first call in a
+    process pays a one-time numba compilation (~20 s).
+    """
     import librosa
 
     target_sr = 16000
@@ -54,7 +59,7 @@ def f0_pyin(y: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 1000.0, ho
     hop = int(sr * hop_s)
     if y.size < 2048:
         y = np.pad(y, (0, 2048 - y.size))
-    f0, voiced, _ = librosa.pyin(y, fmin=fmin, fmax=fmax, sr=sr, frame_length=1024, hop_length=hop)
+    f0, voiced, _ = librosa.pyin(y, fmin=fmin, fmax=fmax, sr=sr, frame_length=1024, hop_length=hop, resolution=resolution)
     f0 = np.where(voiced & np.isfinite(f0), f0, 0.0)
     return f0.astype(np.float32)
 
