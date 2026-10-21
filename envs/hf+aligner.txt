@@ -1,0 +1,8 @@
+# Qwen3-ForcedAligner / Qwen3-ASR (qwen-asr). qwen-asr pins transformers==4.57.6 while qwen-tts
+# pins 4.57.3 (patch-level difference), so qwen-asr is installed with --no-deps on top of 4.57.3
+# and its remaining dependencies are listed here.
+nagisa==0.2.11
+soynlp==0.0.493
+qwen-omni-utils==0.0.8
+pytz
+# @nodeps qwen-asr==0.0.6

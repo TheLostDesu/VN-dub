@@ -1,0 +1,4 @@
+# gguf env: only drives native runners (audio.cpp, zonos2.cpp, MOSS-TTS) as subprocesses.
+numpy==2.2.6
+scipy==1.15.3
+soundfile==0.13.1

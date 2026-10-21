@@ -1,9 +1,14 @@
 """Adapter-side JSON-RPC server (runs inside ``.venvs/<env>``).
 
-Each env's ``adapters/<env>/main.py`` builds a ``{adapter_key: ModelImpl subclass}``
-table and calls :func:`serve`. The core process (``vndub.backends.runner``)
-then sends ``load`` / ``run`` / ``unload`` / ``selftest`` / ``peak_vram`` /
-``pull`` / ``shutdown`` requests, one JSON object per line.
+Each env keeps its dispatch table in a light module ``adapters/<env>/table.py``
+(``TABLE = {adapter_key: "module:Class"}``); ``adapters/<env>/main.py`` wraps
+it with :func:`lazy_table` and calls :func:`main`. Implementation modules are
+imported only when a model is loaded, so a missing package surfaces as a clear
+"backend unavailable" error for that model instead of breaking the whole env.
+
+The core process (``vndub.backends.runner``) sends ``load`` / ``run`` /
+``unload`` / ``selftest`` / ``peak_vram`` / ``pull`` / ``shutdown`` requests, one
+JSON object per line.
 
 Only the standard library is imported at module level so this file works in
 every env; torch is imported lazily for VRAM accounting.
@@ -16,6 +21,7 @@ C extensions) cannot corrupt the stream.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -46,6 +52,17 @@ class UnavailableError(RuntimeError):
 # helpers shared by adapters
 # ----------------------------------------------------------------------------
 
+LANG_NAMES = {
+    "ru": "Russian", "ja": "Japanese", "en": "English", "zh": "Chinese", "ko": "Korean",
+    "de": "German", "fr": "French", "es": "Spanish", "it": "Italian", "pt": "Portuguese",
+}
+
+
+def lang_name(code: str | None, default: str = "Auto") -> str:
+    if not code:
+        return default
+    return LANG_NAMES.get(code.lower().split("-")[0], code)
+
 
 def torch_device(requested: str) -> str:
     """'cuda:0' if requested and available, else 'cpu'."""
@@ -59,6 +76,28 @@ def torch_device(requested: str) -> str:
     except ImportError:
         pass
     return "cpu"
+
+
+def set_seed(seed: int | None) -> None:
+    if seed is None:
+        return
+    import random
+
+    random.seed(int(seed))
+    try:
+        import numpy as np
+
+        np.random.seed(int(seed) % (2**32))
+    except ImportError:
+        pass
+    try:
+        import torch
+
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+    except ImportError:
+        pass
 
 
 def reset_peak() -> None:
@@ -95,6 +134,10 @@ def free_cuda() -> None:
         pass
 
 
+def is_oom(exc: BaseException) -> bool:
+    return "out of memory" in str(exc).lower() or type(exc).__name__ == "OutOfMemoryError"
+
+
 def weight_dir(params: dict[str, Any], idx: int = 0, require: bool = True) -> Path:
     """Local dir of the idx-th weight; raises WeightsMissingError if not pulled."""
     ws = params.get("weights") or []
@@ -104,7 +147,10 @@ def weight_dir(params: dict[str, Any], idx: int = 0, require: bool = True) -> Pa
         return Path(".")
     w = ws[idx]
     d = Path(w.get("local_dir") or "")
-    if require and w.get("kind") != "builtin" and not w.get("present", d.joinpath(".vndub_complete").exists()):
+    present = w.get("present")
+    if present is None:
+        present = d.joinpath(".vndub_complete").exists()
+    if require and w.get("kind") != "builtin" and not present:
         raise WeightsMissingError(params.get("name", "?"), str(d))
     return d
 
@@ -112,7 +158,7 @@ def weight_dir(params: dict[str, Any], idx: int = 0, require: bool = True) -> Pa
 def find_weight(params: dict[str, Any], basename: str, require: bool = True) -> Path:
     """Local dir of the weight whose repo/subdir basename is ``basename``."""
     for i, w in enumerate(params.get("weights") or []):
-        name = (w.get("subdir") or (w.get("repo") or "").split("/")[-1])
+        name = w.get("subdir") or (w.get("repo") or "").split("/")[-1]
         if name == basename:
             return weight_dir(params, i, require)
     if require:
@@ -120,25 +166,33 @@ def find_weight(params: dict[str, Any], basename: str, require: bool = True) -> 
     return Path(".")
 
 
+def models_dir(params: dict[str, Any]) -> Path:
+    md = params.get("models_dir") or os.environ.get("VNDUB_MODELS_DIR")
+    if md:
+        return Path(md)
+    return Path(__file__).resolve().parents[2] / "models"
+
+
+def env_src_dir(env: str, name: str) -> Path:
+    """Source checkout cloned by scripts/make_envs (``.venvs/<env>/src/<name>``)."""
+    return Path(__file__).resolve().parents[2] / ".venvs" / env / "src" / name
+
+
 def load_audio(path: str, sr: int | None = 16000, mono: bool = True):
-    """(numpy float32 array, sr). Uses soundfile, resamples with scipy/librosa if needed."""
+    """(numpy float32 array, sr). soundfile + scipy polyphase resampling (librosa's soxr_hq
+    default measured ~150x slower on the build machine)."""
     import numpy as np
     import soundfile as sf
 
     y, file_sr = sf.read(path, dtype="float32", always_2d=True)
     y = y.mean(axis=1) if mono else y.T
     if sr and file_sr != sr:
-        try:
-            import librosa
+        from math import gcd
 
-            y = librosa.resample(y, orig_sr=file_sr, target_sr=sr)
-        except ImportError:
-            from math import gcd
+        from scipy.signal import resample_poly
 
-            from scipy.signal import resample_poly
-
-            g = gcd(int(sr), int(file_sr))
-            y = resample_poly(y, sr // g, file_sr // g).astype("float32")
+        g = gcd(int(sr), int(file_sr))
+        y = resample_poly(y, int(sr) // g, int(file_sr) // g, axis=-1, window=("kaiser", 8.0)).astype("float32")
         file_sr = sr
     return np.ascontiguousarray(y, dtype=np.float32), file_sr
 
@@ -149,13 +203,28 @@ def save_audio(path: str | Path, y, sr: int) -> None:
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     arr = np.asarray(y, dtype=np.float32)
+    arr = np.squeeze(arr)
     if arr.ndim == 2 and arr.shape[0] < arr.shape[1]:
         arr = arr.T
+    arr = np.clip(arr, -1.0, 1.0)
     sf.write(str(path), arr, int(sr), subtype="PCM_16")
 
 
+def to_numpy(wav: Any):
+    """torch tensor / list / ndarray -> 1-D float32 numpy array."""
+    import numpy as np
+
+    if hasattr(wav, "detach"):
+        wav = wav.detach().float().cpu().numpy()
+    arr = np.asarray(wav, dtype=np.float32)
+    arr = np.squeeze(arr)
+    if arr.ndim > 1:
+        arr = arr.mean(axis=0) if arr.shape[0] < arr.shape[-1] else arr.mean(axis=-1)
+    return arr
+
+
 def make_test_clip(path: str | Path, seconds: float = 2.0, sr: int = 16000, f0: float = 220.0) -> str:
-    """Speech-like 2 s clip (harmonics with syllable envelope + light noise)."""
+    """Speech-like clip (harmonics with syllable envelope + light noise)."""
     import numpy as np
 
     n = int(seconds * sr)
@@ -220,20 +289,22 @@ class ModelImpl:
             except (WeightsMissingError, UnavailableError):
                 raise
             except Exception as e:
+                if is_oom(e):
+                    free_cuda()
                 sys.stderr.write(f"[{self.name}] item {it.get('id')} failed: {e}\n{traceback.format_exc()}\n")
                 out.append({"id": it.get("id"), "error": f"{type(e).__name__}: {e}"})
         return out
 
     def selftest_items(self, tmp: Path) -> list[dict[str, Any]]:
         clip = make_test_clip(tmp / "selftest_in.wav")
-        return [{"id": "selftest", "wav": clip, "src": clip, "out": str(tmp / "selftest_out.wav"), "text": "テスト", "lang": "ja"}]
+        return [{"id": "selftest", "wav": clip, "src": clip, "out": str(tmp / "selftest_out.npy"), "text": "テスト", "lang": "ja"}]
 
     def selftest(self) -> dict[str, Any]:
         import tempfile
 
         t0 = time.perf_counter()
         reset_peak()
-        info = self.load()
+        info = self.load() or {}
         load_s = time.perf_counter() - t0
         with tempfile.TemporaryDirectory() as td:
             items = self.selftest_items(Path(td))
@@ -242,7 +313,8 @@ class ModelImpl:
             run_s = time.perf_counter() - t1
         peak = peak_vram_gb()
         self.unload()
-        errors = [r.get("error") for r in (res or []) if isinstance(r, dict) and r.get("error")]
+        rows = res if isinstance(res, list) else [res]
+        errors = [r.get("error") for r in rows if isinstance(r, dict) and r.get("error")]
         return {
             "ok": not errors,
             "op": self.selftest_op,
@@ -261,9 +333,85 @@ class ModelImpl:
         return {"ok": True, "detail": "nothing to pull"}
 
 
+class TTSImpl(ModelImpl):
+    """TTS base: ``generate(item) -> (wave, sr)``; this class handles seeds, timing and IO.
+
+    Item keys: id, text, lang, timbre_ref, timbre_ref_text, emotion_ref, instruct,
+    knobs, seed, target_duration, out.
+    """
+
+    selftest_op = "synthesize"
+    selftest_text = "Привет! Это короткая проверка синтеза речи."
+
+    def generate(self, item: dict[str, Any]):  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    def design_generate(self, item: dict[str, Any]):
+        """Voice design from ``item['description']`` (or ``instruct``); default: unsupported."""
+        raise UnavailableError(f"{self.name} does not support voice design")
+
+    def _finish(self, item: dict[str, Any], wav: Any, sr: int, t0: float) -> dict[str, Any]:
+        y = to_numpy(wav)
+        if y.size == 0:
+            raise RuntimeError("model returned empty audio")
+        save_audio(item["out"], y, sr)
+        return {"path": item["out"], "sr": int(sr), "duration": round(len(y) / sr, 3), "elapsed_s": round(time.perf_counter() - t0, 3)}
+
+    def op_synthesize(self, item: dict[str, Any], **_: Any) -> dict[str, Any]:
+        set_seed(item.get("seed"))
+        t0 = time.perf_counter()
+        wav, sr = self.generate(item)
+        return self._finish(item, wav, sr, t0)
+
+    def op_design(self, item: dict[str, Any], **_: Any) -> dict[str, Any]:
+        set_seed(item.get("seed"))
+        t0 = time.perf_counter()
+        wav, sr = self.design_generate(item)
+        return self._finish(item, wav, sr, t0)
+
+    def selftest_items(self, tmp: Path) -> list[dict[str, Any]]:
+        ref = make_test_clip(tmp / "ref.wav", seconds=3.0, sr=24000)
+        return [
+            {
+                "id": "selftest", "text": self.selftest_text, "lang": "ru", "timbre_ref": ref, "timbre_ref_text": "",
+                "emotion_ref": None, "instruct": None, "knobs": {}, "seed": 1234, "target_duration": 2.5,
+                "out": str(tmp / "tts_out.wav"), "description": "A young woman with a clear, bright voice.",
+            }
+        ]
+
+
 def _short(obj: Any, limit: int = 400) -> Any:
     s = json.dumps(obj, ensure_ascii=False, default=str)
     return obj if len(s) <= limit else s[:limit] + "..."
+
+
+# ----------------------------------------------------------------------------
+# lazy dispatch tables
+# ----------------------------------------------------------------------------
+
+
+class LazyImpl:
+    """Factory for ``module:Class`` imported on first use (keeps the env table light)."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._cls: type[ModelImpl] | None = None
+
+    def cls(self) -> type[ModelImpl]:
+        if self._cls is None:
+            mod, _, name = self.path.partition(":")
+            self._cls = getattr(importlib.import_module(mod), name)
+        return self._cls
+
+    def __call__(self, params: dict[str, Any]) -> ModelImpl:
+        return self.cls()(params)
+
+    def pull(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self.cls().pull(params)
+
+
+def lazy_table(table: dict[str, str]) -> dict[str, LazyImpl]:
+    return {k: LazyImpl(v) for k, v in table.items()}
 
 
 # ----------------------------------------------------------------------------
@@ -310,10 +458,12 @@ def serve(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> 
             if method == "load":
                 if current is not None:
                     current.unload()
-                current = impl_for(params)
+                    current = None
+                impl = impl_for(params)
                 reset_peak()
                 t0 = time.perf_counter()
-                info = current.load() or {}
+                info = impl.load() or {}
+                current = impl
                 info.update(load_s=round(time.perf_counter() - t0, 2), device=current.device, peak_vram_gb=peak_vram_gb())
                 send({"jsonrpc": "2.0", "id": rid, "result": info})
             elif method == "run":
@@ -336,8 +486,9 @@ def serve(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> 
                 key = params.get("model")
                 if key not in table:
                     raise UnavailableError(f"env '{env}' has no adapter '{key}'")
-                cls = table[key]
-                send({"jsonrpc": "2.0", "id": rid, "result": cls.pull(params)})  # type: ignore[attr-defined]
+                factory = table[key]
+                pull = getattr(factory, "pull", None)
+                send({"jsonrpc": "2.0", "id": rid, "result": pull(params) if pull else {"ok": True}})
             else:
                 send(_error(rid, ERR_GENERIC, f"unknown method {method!r}"))
         except WeightsMissingError as e:
@@ -350,7 +501,8 @@ def serve(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> 
             tb = traceback.format_exc()
             sys.stderr.write(tb)
             msg = str(e)
-            if "out of memory" in msg.lower():
+            if is_oom(e):
+                free_cuda()
                 msg = f"CUDA out of memory: {msg}"
             send(_error(rid, ERR_GENERIC, f"{type(e).__name__}: {msg}", {"traceback": tb[-2000:]}))
 
@@ -365,32 +517,44 @@ def main(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> N
     if args.selftest is None:
         serve(table, env)
         return
+    os.environ.setdefault("HF_HOME", str(Path(args.models_dir) / "hf_home"))
+    os.environ.setdefault("TORCH_HOME", str(Path(args.models_dir) / "torch_home"))
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
     keys = args.selftest or sorted(table)
     results = {}
     for key in keys:
         params = _cli_params(key, env, Path(args.models_dir), args.device)
+        adapter = params["model"]
+        if adapter not in table:
+            results[key] = {"ok": False, "error": f"env '{env}' has no adapter or backend '{key}'"}
+            continue
         try:
-            results[key] = table[key](params).selftest()
+            results[key] = table[adapter](params).selftest()
         except WeightsMissingError as e:
             results[key] = {"ok": False, "error": str(e)}
         except UnavailableError as e:
             results[key] = {"ok": False, "error": str(e), "hint": e.hint}
+        except ImportError as e:
+            results[key] = {"ok": False, "error": f"import failed in env '{env}': {e}"}
         except Exception as e:
             results[key] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     print(json.dumps(results, ensure_ascii=False, indent=2, default=str))
     sys.exit(0 if all(r.get("ok") for r in results.values()) else 1)
 
 
-def _cli_params(key: str, env: str, models_dir: Path, device: str) -> dict[str, Any]:
-    """Build load params for a CLI selftest using the core registry if importable."""
+def _cli_params(key: str, env: str, mdir: Path, device: str) -> dict[str, Any]:
+    """Load params for a CLI selftest. ``key`` is a backend name or an adapter key;
+    for an adapter key shared by several backends, one with weights present wins."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-        from vndub.backends import registry  # light imports only
-        from vndub.backends.weights import resolved
+        from vndub.backends import registry  # light imports only (numpy, soundfile)
+        from vndub.backends.weights import missing, resolved
 
-        for spec in registry.all_specs().values():
-            if spec.env == env and spec.adapter == key:
-                return {"name": spec.name, "model": key, "options": spec.options, "device": device, "models_dir": str(models_dir), "weights": resolved(models_dir, spec), "caps": spec.caps}
+        specs = [s for s in registry.all_specs().values() if s.env == env and (s.name == key or s.adapter == key)]
+        specs.sort(key=lambda s: (s.name != key, bool(missing(mdir, s))))
+        if specs:
+            spec = specs[0]
+            return {"name": spec.name, "model": spec.adapter, "options": spec.options, "device": device, "models_dir": str(mdir), "weights": resolved(mdir, spec), "caps": spec.caps}
     except Exception as e:  # registry needs core deps (numpy etc.) that may be absent in the env
         sys.stderr.write(f"registry unavailable ({e}); selftest without weight info\n")
-    return {"name": key, "model": key, "options": {}, "device": device, "models_dir": str(models_dir), "weights": []}
+    return {"name": key, "model": key, "options": {}, "device": device, "models_dir": str(mdir), "weights": []}

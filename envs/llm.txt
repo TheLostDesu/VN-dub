@@ -1,0 +1,3 @@
+# llm "env": nothing to install. Translation runs llama.cpp's llama-server binary
+# (tools.yaml: llama_server, a CUDA 12 Windows release from https://github.com/ggml-org/llama.cpp/releases)
+# and talks to it from the core package (vndub/backends/llm/llamacpp.py) over 127.0.0.1.

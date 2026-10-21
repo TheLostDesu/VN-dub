@@ -1,0 +1,22 @@
+# seedvc env: Seed-VC (GPL-3.0; upstream archived 2025-11) at its last commit, with its pins.
+# @torch torch==2.4.0 torchaudio==2.4.0
+# @cuda cu124
+# @git seed-vc https://github.com/Plachtaa/seed-vc 51383efd921027683c89e5348211d93ff12ac2a8
+numpy==1.26.4
+scipy==1.13.1
+soundfile==0.12.1
+librosa==0.10.2
+huggingface-hub==0.28.1
+munch==4.0.0
+einops==0.8.0
+descript-audio-codec==1.0.0
+pydub==0.25.1
+resemblyzer==0.1.4
+jiwer==3.0.3
+transformers==4.46.3
+modelscope==1.18.1
+funasr==1.1.5
+hydra-core==1.3.2
+pyyaml
+python-dotenv
+accelerate

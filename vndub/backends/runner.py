@@ -60,7 +60,9 @@ def env_python(env: str, root: Path | None = None) -> Path:
 
 
 def env_exists(env: str, root: Path | None = None) -> bool:
-    return env_python(env, root).exists()
+    """A usable env has its interpreter and ``pyvenv.cfg`` (an interrupted ``uv venv`` leaves only the exe)."""
+    py = env_python(env, root)
+    return py.exists() and (py.parent.parent / "pyvenv.cfg").exists()
 
 
 class AdapterProcess:

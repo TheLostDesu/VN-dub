@@ -1,0 +1,17 @@
+# hf env: Transformers models -- anime SER, audeering A/D/V, CTC aligner, Qwen3-TTS (Base/CustomVoice/VoiceDesign).
+# Extras: +aligner (Qwen3-ForcedAligner, Qwen3-ASR), +voxcpm (VoxCPM2 + LoRA scripts), +caption (Qwen2-Audio NF4).
+# qwen-tts pins transformers==4.57.3, which defines the transformers version of this env.
+# @torch torch==2.8.0 torchaudio==2.8.0
+# @cuda cu128
+numpy==2.2.6
+scipy==1.15.3
+soundfile==0.13.1
+librosa==0.11.0
+transformers==4.57.3
+accelerate==1.12.0
+safetensors>=0.4.5
+sentencepiece==0.2.1
+qwen-tts==0.1.1
+onnxruntime==1.22.1
+einops>=0.8
+pyyaml>=6.0

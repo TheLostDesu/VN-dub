@@ -180,9 +180,7 @@ def _master_line(ctx: Any, cache: Any, line: LineRecord, s: SelectionRecord, a: 
         else:
             ctx.log.info("%s: no stretch (%s)", line.line_id, plan.reason)
     if sr != sr_out:
-        import librosa
-
-        y = librosa.resample(y, orig_sr=sr, target_sr=sr_out).astype(np.float32)
+        y = features.resample(y, sr, sr_out)
         sr = sr_out
     y, info = loudness.normalize(y, sr, lufs_t, ctx.cfg.master.loudness.true_peak_dbtp)
     out = np.stack([y, y], axis=1) if ch_out == 2 else y

@@ -12,7 +12,7 @@ SPECS = [
         commercial_ok=True,
         vram_estimate_gb=1.2,
         cpu_ok=True,
-        weights=(WeightSpec("hf", repo="ai-sage/GigaAM-v3", revision="e2e_ctc", subdir="GigaAM-v3-e2e_ctc", size_gb=0.9),),
+        weights=(WeightSpec("hf", repo="ai-sage/GigaAM-v3", revision="e2e_ctc", subdir="GigaAM-v3-e2e_ctc", size_gb=0.45),),
         options={"revision": "e2e_ctc", "language": "ru", "max_sec": 25.0},
         fallback="whisper_ru",
         mock="mock_asr",

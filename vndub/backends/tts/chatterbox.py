@@ -17,7 +17,14 @@ SPECS = [
         commercial_ok=True,
         vram_estimate_gb=4.0,
         cpu_ok=True,
-        weights=(WeightSpec("hf", repo="ResembleAI/chatterbox", size_gb=3.2),),
+        weights=(
+            WeightSpec(
+                "hf",
+                repo="ResembleAI/chatterbox",
+                allow=("ve.pt", "s3gen.pt", "t3_mtl23ls_v3.safetensors", "t3_mtl23ls_v2.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json", "tokenizer.json"),
+                size_gb=3.0,
+            ),
+        ),
         options={"exaggeration_range": [0.3, 1.2], "cfg_weight": 0.5, "cfg_weight_cross_lingual": 0.0, "temperature": 0.8},
         caps={
             "instruct": "none",

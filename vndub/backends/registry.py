@@ -139,4 +139,28 @@ def instantiate(
         return inst  # type: ignore[return-value]
     from vndub.backends.runner import RemoteBackend
 
-    return RemoteBackend(spec, options, device=device, models_dir=models_dir, log_dir=log_dir, root=root)  # type: ignore[return-value]
+    opts = inject_tools(spec, dict(options or {}), (context or {}).get("tools"))
+    return RemoteBackend(spec, opts, device=device, models_dir=models_dir, log_dir=log_dir, root=root)  # type: ignore[return-value]
+
+
+def inject_tools(spec: BackendSpec, options: dict[str, Any], tools: Any) -> dict[str, Any]:
+    """Resolve external tool paths for adapters that drive binaries/checkouts.
+
+    ``options.tool`` (e.g. ``audiocpp``) -> ``options.binary``;
+    ``options.tool_dir`` (e.g. ``applio_dir``) -> ``options[<tool_dir>]``.
+    Adapters run in another env and cannot read tools.yaml themselves.
+    """
+    if tools is None:
+        return options
+    merged = {**spec.options, **options}
+    tool = merged.get("tool")
+    if tool and not merged.get("binary"):
+        p = tools.resolve(tool)
+        if p is not None:
+            options["binary"] = str(p)
+    key = merged.get("tool_dir")
+    if key and not merged.get(key):
+        configured = (getattr(tools, "paths", {}) or {}).get(key, "")
+        if configured and Path(configured).exists():
+            options[key] = str(Path(configured))
+    return options

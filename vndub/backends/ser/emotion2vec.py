@@ -38,9 +38,9 @@ SPECS = [
     BackendSpec(
         name="emotion2vec_plus_seed",
         vram_estimate_gb=0.8,
-        weights=(WeightSpec("hf", repo="emotion2vec/emotion2vec_plus_seed", size_gb=0.4),),
+        weights=(WeightSpec("hf", repo="emotion2vec/emotion2vec_plus_seed", size_gb=1.1),),
         profiles=("test",),
-        description="emotion2vec+ seed: small CPU-capable model for the test profile",
+        description="emotion2vec+ seed (201 h fine-tune): CPU-capable model for the test profile",
         **_COMMON,
     ),
 ]

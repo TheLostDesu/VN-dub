@@ -1,0 +1,6 @@
+# chatterbox env: Chatterbox Multilingual. Own env because chatterbox-tts pins torch 2.6.0,
+# numpy<2 and its own transformers/diffusers versions, which conflict with qwen-tts in hf.
+# @torch torch==2.6.0 torchaudio==2.6.0
+# @cuda cu124
+chatterbox-tts==0.1.7
+soundfile==0.13.1

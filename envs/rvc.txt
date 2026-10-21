@@ -1,0 +1,7 @@
+# rvc env: Applio 3.7.0 (RVC v2 training + inference, RMVPE). Installs the checkout's
+# requirements-engine.txt (no Gradio UI); torch follows Applio's pin.
+# @torch torch==2.11.0 torchaudio==2.11.0
+# @cuda cu128
+# @git Applio https://github.com/IAHispano/Applio 3.7.0
+# @req-from Applio requirements-engine.txt
+soundfile==0.14.0

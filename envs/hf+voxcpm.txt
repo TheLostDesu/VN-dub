@@ -1,0 +1,3 @@
+# VoxCPM2 inference (voxcpm package) + the repo checkout for the official LoRA script.
+# @git VoxCPM https://github.com/OpenBMB/VoxCPM main
+voxcpm==2.0.3

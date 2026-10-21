@@ -14,11 +14,22 @@ def load(path: str | Path, sr: int | None = None, mono: bool = True) -> tuple[np
     y, file_sr = sf.read(str(path), dtype="float32", always_2d=True)
     y = y.mean(axis=1) if mono else y.T
     if sr and sr != file_sr:
-        import librosa
-
-        y = librosa.resample(y, orig_sr=file_sr, target_sr=sr) if mono else np.stack([librosa.resample(c, orig_sr=file_sr, target_sr=sr) for c in y])
+        y = resample(y, file_sr, sr) if mono else np.stack([resample(c, file_sr, sr) for c in y])
         file_sr = sr
     return np.ascontiguousarray(y, dtype=np.float32), file_sr
+
+
+def resample(y: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    """Polyphase resampling (scipy). librosa's default soxr_hq measured ~150x slower on the
+    build machine (1.2 s vs 8 ms per 3 s clip) with no audible benefit for speech."""
+    if sr_in == sr_out:
+        return y.astype(np.float32, copy=False)
+    from math import gcd
+
+    from scipy.signal import resample_poly
+
+    g = gcd(int(sr_in), int(sr_out))
+    return resample_poly(y, int(sr_out) // g, int(sr_in) // g, window=("kaiser", 8.0)).astype(np.float32)
 
 
 def save(path: str | Path, y: np.ndarray, sr: int) -> None:
@@ -54,7 +65,7 @@ def f0_pyin(y: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 1000.0, ho
 
     target_sr = 16000
     if sr != target_sr:
-        y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+        y = resample(y, sr, target_sr)
         sr = target_sr
     hop = int(sr * hop_s)
     if y.size < 2048:

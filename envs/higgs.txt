@@ -1,0 +1,5 @@
+# higgs env: client for a local SGLang-Omni server running Higgs TTS 3 (the server itself is
+# Linux-only: run it in WSL2/Docker on the same machine). The client needs no torch.
+numpy==2.2.6
+scipy==1.15.3
+soundfile==0.13.1

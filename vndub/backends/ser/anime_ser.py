@@ -28,7 +28,7 @@ SPECS = [
         commercial_ok=True,
         vram_estimate_gb=0.8,
         cpu_ok=True,
-        weights=(WeightSpec("hf", repo="litagin/anime_speech_emotion_classification", size_gb=1.3),),
+        weights=(WeightSpec("hf", repo="litagin/anime_speech_emotion_classification", size_gb=0.66),),
         options={"trust_remote_code": True},
         mock="mock_anime_ser",
         description="Galgame-domain emotion classifier (incl. Embarrassed)",

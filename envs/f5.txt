@@ -1,0 +1,6 @@
+# f5 env: F5-TTS (+ F5-TTS_RUSSIAN checkpoint, research license).
+# @torch torch==2.8.0 torchaudio==2.8.0
+# @cuda cu128
+numpy==2.2.6
+soundfile==0.13.1
+f5-tts==1.1.9

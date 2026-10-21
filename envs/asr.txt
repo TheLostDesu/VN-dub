@@ -1,0 +1,15 @@
+# asr env: faster-whisper (anime-whisper / whisper-*), GigaAM-v3, silero VAD (bundled ONNX), ruaccent
+# @torch torch==2.8.0 torchaudio==2.8.0
+# @cuda cu128
+numpy==2.2.6
+scipy==1.15.3
+soundfile==0.13.1
+faster-whisper==1.2.1
+ctranslate2==4.8.3
+onnxruntime==1.22.1
+# GigaAM-v3 (trust_remote_code) recommends transformers 4.57.x
+transformers==4.57.1
+hydra-core==1.3.2
+omegaconf==2.3.0
+sentencepiece==0.2.1
+ruaccent==1.5.8.3

@@ -1,7 +1,9 @@
-"""Higgs TTS 3 4B (Boson AI, research & non-commercial, optional), own ``higgs`` env, 4-bit.
+"""Higgs TTS 3 4B (Boson AI, research & non-commercial, optional), own ``higgs`` env.
 
 Richest tag vocabulary (``<|emotion:anger|>``, ``<|style:whisper|>``,
-``<|sfx:laughter|>``). Fit on 8 GB in 4-bit is UNVERIFIED.
+``<|sfx:laughter|>``). Higgs v3 is distributed for SGLang-Omni (Linux), so the
+adapter is a client of a server on 127.0.0.1 (WSL2/Docker on the same machine).
+Fit on 8 GB (4-bit) is UNVERIFIED.
 """
 
 from vndub.backends.base import BackendSpec, WeightSpec
@@ -16,7 +18,8 @@ SPECS = [
         commercial_ok=False,
         vram_estimate_gb=6.0,
         weights=(WeightSpec("hf", repo="bosonai/higgs-audio-v3-tts-4b", size_gb=8.5),),
-        options={"quantization": "nf4", "temperature": 0.7},
+        # weights are served by a local SGLang-Omni server (WSL2/Docker); the env is a loopback client
+        options={"server_url": "http://127.0.0.1:8000", "temperature": 0.7, "max_new_tokens": 1024},
         caps={"instruct": "none", "tags": "higgs", "knobs": "none", "duration": False, "stress_format": "plain", "needs_ref_text": True, "sr": 24000, "langs": ["ru", "ja", "en", "zh"]},
         profiles=("optional",),
         mock="mock_tts",

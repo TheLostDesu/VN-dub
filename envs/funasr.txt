@@ -1,0 +1,15 @@
+# funasr env: emotion2vec+ and SenseVoice (FunASR); extra +cosyvoice adds Fun-CosyVoice3.
+# torch 2.3.1 / numpy 1.26 follow the CosyVoice repo pins so the same env serves CosyVoice3.
+# @torch torch==2.3.1 torchaudio==2.3.1
+# @cuda cu121
+numpy==1.26.4
+scipy==1.13.1
+soundfile==0.12.1
+librosa==0.10.2
+funasr==1.2.7
+modelscope==1.20.0
+huggingface-hub==0.30.2
+transformers==4.51.3
+omegaconf==2.3.0
+hydra-core==1.3.2
+sentencepiece==0.2.0

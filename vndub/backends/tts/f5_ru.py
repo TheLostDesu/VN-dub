@@ -16,8 +16,9 @@ SPECS = [
         commercial_ok=False,
         vram_estimate_gb=3.0,
         cpu_ok=True,
-        weights=(WeightSpec("hf", repo="Misha24-10/F5-TTS_RUSSIAN", size_gb=5.5),),
-        options={"ckpt_glob": "*v4*winter*/*.safetensors", "vocab_glob": "*vocab*.txt", "nfe_step": 32, "cfg_strength": 2.0},
+        # the repo holds many 5 GB training checkpoints: pull only the v4_winter inference weights + vocab
+        weights=(WeightSpec("hf", repo="Misha24-10/F5-TTS_RUSSIAN", allow=("F5TTS_v1_Base_v4_winter/model_212000.safetensors", "F5TTS_v1_Base/vocab.txt"), size_gb=1.35),),
+        options={"arch": "F5TTS_v1_Base", "ckpt_glob": "F5TTS_v1_Base_v4_winter/*.safetensors", "vocab_glob": "F5TTS_v1_Base/vocab.txt", "nfe_step": 32, "cfg_strength": 2.0},
         caps={"instruct": "none", "tags": "none", "knobs": "none", "duration": True, "stress_format": "plus", "needs_ref_text": True, "sr": 24000, "langs": ["ru", "en"]},
         profiles=("optional",),
         mock="mock_tts",
