@@ -90,8 +90,10 @@ class Character(Record):
     performer: dict[str, Any] = Field(default_factory=dict)
     rvc: dict[str, Any] = Field(default_factory=dict)
     lora: dict[str, Any] = Field(default_factory=dict)
-    route: Literal["A", "B", "C"] | None = None
+    # A clone the original, B performer + VC, C LoRA, P performer only (no original audio)
+    route: Literal["A", "B", "C", "P"] | None = None
     notes: str = ""
+    description: str = ""  # free-text voice description for voice design ("строгая учительница, низкий голос")
 
 
 class LinkRecord(Record):
@@ -209,7 +211,9 @@ class SelectionRecord(Record):
 
 class OverrideRecord(Record):
     line_id: str
-    action: Literal["accept", "reject", "regen", "set_text", "set_ref", "keep_original"]
+    # set_src_text: user-corrected source text (mode C lines recovered by ASR)
+    # tuning: per-line voice tuning override (payload = tuning dict, see style_prompt.apply_tuning)
+    action: Literal["accept", "reject", "regen", "set_text", "set_ref", "keep_original", "set_src_text", "tuning"]
     payload: dict[str, Any] = Field(default_factory=dict)
     ts: str = ""
 

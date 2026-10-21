@@ -21,7 +21,7 @@ from vndub.backends.runner import AdapterError, AdapterProcess, env_exists
 from vndub.backends.weights import MARKER, dir_size_gb, is_present, local_dir, resolved
 from vndub.config import PipelineConfig
 from vndub.gpu import resolve_models_dir
-from vndub.util import now_iso, repo_root
+from vndub.util import now_iso
 
 
 def _select(names: list[str], profile: str | None) -> list[BackendSpec]:
@@ -48,7 +48,7 @@ def _env_call(spec: BackendSpec, models_dir: Path, method: str, params: dict[str
     proc = AdapterProcess(
         spec.env,
         spec.name,
-        log_path=repo_root() / "models" / "pull.log",
+        log_path=models_dir / "pull.log",
         extra_env={"VNDUB_MODELS_DIR": str(models_dir), "HF_HOME": str(models_dir / "hf_home"), "TORCH_HOME": str(models_dir / "torch_home")},
     )
     proc.start()
@@ -58,7 +58,22 @@ def _env_call(spec: BackendSpec, models_dir: Path, method: str, params: dict[str
         proc.close()
 
 
-def _pull_one(spec: BackendSpec, w: WeightSpec, models_dir: Path, console: Any = None) -> dict[str, Any]:
+class PullHooks:
+    """Optional replacement for the two network steps of a pull (desktop app: progress, resume).
+
+    ``hf`` downloads a Hugging Face repo snapshot (honouring ``w.allow`` / ``w.revision``) into ``d``;
+    ``url`` downloads ``w.url`` to the file ``dst``. The CLI passes no hooks and keeps the plain
+    ``snapshot_download`` / ``urlretrieve`` calls.
+    """
+
+    def hf(self, w: WeightSpec, d: Path) -> None:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def url(self, w: WeightSpec, dst: Path) -> None:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+def _pull_one(spec: BackendSpec, w: WeightSpec, models_dir: Path, console: Any = None, hooks: PullHooks | None = None) -> dict[str, Any]:
     d = local_dir(models_dir, w, spec.name)
     row = {"name": spec.name, "weight": w.repo or w.url or w.subdir or w.kind, "status": "present", "size_gb": "", "detail": str(d)}
     if is_present(models_dir, w, spec.name):
@@ -66,11 +81,14 @@ def _pull_one(spec: BackendSpec, w: WeightSpec, models_dir: Path, console: Any =
         return row
     t0 = time.perf_counter()
     if w.kind in ("hf", "hf_file"):
-        from huggingface_hub import snapshot_download
-
         if console:
             console.print(f"[cyan]downloading[/cyan] {w.repo}{'@' + w.revision if w.revision else ''} -> {d}")
-        snapshot_download(repo_id=w.repo, revision=w.revision, local_dir=str(d), allow_patterns=list(w.allow) or None)
+        if hooks is not None:
+            hooks.hf(w, d)
+        else:
+            from huggingface_hub import snapshot_download
+
+            snapshot_download(repo_id=w.repo, revision=w.revision, local_dir=str(d), allow_patterns=list(w.allow) or None)
         if w.post:
             if console:
                 console.print(f"[cyan]post-processing[/cyan] {w.post} in env {spec.env}")
@@ -82,7 +100,10 @@ def _pull_one(spec: BackendSpec, w: WeightSpec, models_dir: Path, console: Any =
         dst = d / (w.filename or w.url.rsplit("/", 1)[-1])
         if console:
             console.print(f"[cyan]downloading[/cyan] {w.url}")
-        urllib.request.urlretrieve(w.url, dst)
+        if hooks is not None:
+            hooks.url(w, dst)
+        else:
+            urllib.request.urlretrieve(w.url, dst)
         _mark(d, w)
     elif w.kind == "env":
         if console:
@@ -96,6 +117,9 @@ def _pull_one(spec: BackendSpec, w: WeightSpec, models_dir: Path, console: Any =
         raise ValueError(f"unknown weight kind {w.kind}")
     row.update(status="pulled", size_gb=f"{dir_size_gb(d):.2f}", detail=f"{time.perf_counter() - t0:.0f}s -> {d}")
     return row
+
+
+pull_weight = _pull_one  # public name for the desktop app (vndub_app.models_api)
 
 
 def pull(cfg: PipelineConfig, names: list[str], profile: str | None, dry_run: bool = False, console: Any = None) -> list[dict[str, Any]]:
@@ -163,7 +187,7 @@ def selftest(cfg: PipelineConfig, name: str) -> dict[str, Any]:
 
     device = cfg.gpu.device if (spec.heavy and SystemCuda().available()) else "cpu"
     tools = Tools.load(cfg.resolve(cfg.tools_file), cfg.tools)
-    log_dir = repo_root() / "models"
+    log_dir = models_dir
     try:
         b = registry.instantiate(spec, device=device, models_dir=models_dir, log_dir=log_dir, context={"tools": tools})
         res = b.selftest() or {}

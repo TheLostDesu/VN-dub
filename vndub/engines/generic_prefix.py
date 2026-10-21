@@ -1,5 +1,9 @@
 """Generic fallback: text from a VNTextPatch import, voices by ``<prefix>_<index>`` names.
 
+Mode C (no script text at all): with ``link.recover_text`` on, ``parse`` does not stop when
+there is no script: :func:`textless_result` makes one voiced line with EMPTY text per voice file
+(speaker = file prefix, flag ``voice_only``) so that ``link`` can recover the text by ASR.
+
 Use when the script cannot be parsed for voice references but text + speaker
 names are available::
 
@@ -114,6 +118,8 @@ class GenericPrefixEngine(BaseEngine):
 
     def parse(self, ctx: "StageContext", extracted: ExtractResult, audio: list[AudioIndexRecord]) -> ParseResult:
         src = ctx.extra.get("import_vntextpatch") or ctx.cfg.parse.import_vntextpatch
+        if not src and ctx.cfg.link.recover_text and audio:
+            return textless_result(ctx, audio, "no script text available")
         if not src:
             from vndub.stages.common import StageError
 
@@ -122,6 +128,31 @@ class GenericPrefixEngine(BaseEngine):
                 "`VNTextPatch extractlocal <game> <json dir>` and run `vndub parse --import-vntextpatch <json dir>`"
             )
         return import_vntextpatch(ctx, Path(src), audio)
+
+
+def _natural_key(s: str) -> list[object]:
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def textless_result(ctx: "StageContext", audio: list[AudioIndexRecord], why: str = "") -> ParseResult:
+    """Mode C: one voiced line with empty text per voice file, in file-name order.
+
+    The speaker is the file's prefix (``engine_opts.generic.prefix_regex``; files that do not match
+    belong to the narrator), the scene is the parent folder (``voice`` for loose files). Lines carry
+    ``flags: ["voice_only"]``; ``link`` (``recover_text``) fills the text from the audio.
+    """
+    rx = re.compile(ctx.cfg.parse.engine_opts.generic.prefix_regex)
+    lb = LineBuilder(ctx.cfg.parse.narrator_names)
+    for a in sorted(audio, key=lambda r: _natural_key(r.relpath)):
+        pp = PurePosixPath(a.relpath)
+        m = rx.match(pp.stem)
+        prefix = m.group("prefix").lower() if m else ""
+        scene = pp.parent.name or "voice"
+        line = lb.add(scene, "", speaker_raw=prefix, flags=["voice_only"], source_file=a.relpath)
+        bind_line(line, a, a.relpath)
+    chars = build_characters(lb.lines)
+    note = f"voice-only lines (mode C): {len(lb.lines)} voice files without script text" + (f" ({why})" if why else "")
+    return ParseResult(lb.lines, chars, [note])
 
 
 def import_vntextpatch(ctx: "StageContext", src: Path, audio: list[AudioIndexRecord]) -> ParseResult:

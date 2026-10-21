@@ -149,6 +149,9 @@ def candidate_files(ctx: Any, line_id: str) -> list[tuple[Path, SynthSidecar | N
 
 
 def src_duration(ctx: Any, line: LineRecord, passport: dict[str, Any] | None = None, audio: AudioIndexRecord | None = None) -> float:
+    """Duration of the original audio; 0.0 for a line without any (a text passport's duration is an estimate)."""
+    if not line.has_voice or (passport and passport.get("source") == "text"):
+        return 0.0
     if passport and passport.get("duration_s"):
         return float(passport["duration_s"])
     if audio and audio.duration:
@@ -191,8 +194,11 @@ def acquire_first(ctx: Any, names: Iterable[str], options: dict[str, Any] | None
     return None, None, "; ".join(reasons) or "no backend configured"
 
 
-def run_batched(backend: Backend, op: str, items: list[dict[str, Any]], chunk: int = 16, **kw: Any) -> list[dict[str, Any]]:
-    """Call ``op`` in chunks; a failing chunk yields per-item errors instead of raising."""
+def run_batched(backend: Backend, op: str, items: list[dict[str, Any]], chunk: int = 16, on_chunk: Any = None, **kw: Any) -> list[dict[str, Any]]:
+    """Call ``op`` in chunks; a failing chunk yields per-item errors instead of raising.
+
+    ``on_chunk(part)`` (optional) runs after each chunk: progress reporting between chunks.
+    """
     out: list[dict[str, Any]] = []
     for i in range(0, len(items), chunk):
         part = items[i : i + chunk]
@@ -205,6 +211,8 @@ def run_batched(backend: Backend, op: str, items: list[dict[str, Any]], chunk: i
         by_id = {r.get("id"): r for r in res if isinstance(r, dict)}
         for it in part:
             out.append(by_id.get(it.get("id"), {"id": it.get("id"), "error": "no result"}))
+        if on_chunk is not None:
+            on_chunk(part)
     return out
 
 

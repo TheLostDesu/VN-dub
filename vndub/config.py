@@ -124,6 +124,10 @@ class ParseSection(_Section):
     engine_opts: EngineOpts = Field(default_factory=EngineOpts)
     import_vntextpatch: str = ""
     narrator_names: list[str] = Field(default_factory=lambda: ["", "narrator", "ナレーション", "地の文"])
+    # Voiced lines shown without a speaker name (narrator box, or a name like ？？？): auto = give them to the
+    # character their voice-file prefix names, else (narrator box) to the cast-and-dubbed "voice_over"
+    # speaker; off = keep the script's speaker (a voiced narrator then gets no performer, route A only).
+    hidden_speakers: Literal["auto", "off"] = "auto"
 
 
 # ----------------------------------------------------------------------------
@@ -143,6 +147,23 @@ class LinkSection(_Section):
     speaker_embedder: str = "ecapa"
     cluster_distance: float = 0.35
     outlier_consistency: float = 0.50
+    # asr: verify every clip by speech recognition (CLI default, unchanged behaviour).
+    # no_asr: "intonation-check only" -- cheap signals only (speaker-embedding consistency,
+    # duration vs text length, prefix/index order); no ASR backend is loaded (app default).
+    mode: Literal["asr", "no_asr"] = "asr"
+    # Mode C: voiced lines with no script text get their source text from ASR
+    # (flag text_from_asr). Runs even with mode no_asr; nothing else is transcribed.
+    recover_text: bool = False
+    recover_asr: str = "anime_whisper"
+    # no_asr duration check: speech slower than rate_min or faster than rate_max (mora/s) is
+    # implausible for the line's text; silence_tolerance_s is added to the slow bound
+    # (leading/trailing silence and pauses are part of the file).
+    rate_min: float = 3.0
+    rate_max: float = 13.0
+    silence_tolerance_s: float = 1.0
+    # no_asr: summary.suggest_asr_check is true when at least this share of the judged lines
+    # (and at least 5 lines) is flagged by a cheap signal
+    suggest_asr_share: float = 0.2
 
 
 class AnalyzeSection(_Section):
@@ -164,6 +185,18 @@ class AnalyzeSection(_Section):
 # ----------------------------------------------------------------------------
 # translate
 # ----------------------------------------------------------------------------
+
+
+class TextEmotionSection(_Section):
+    """Synthetic expression passports for lines without original audio (stage text_emotion)."""
+
+    enabled: bool = True
+    cues: str = "configs/delivery_cues.yaml"
+    narration_window: int = 3        # unvoiced narration lines scanned before/after a line
+    llm: Literal["auto", "on", "off"] = "auto"   # auto = on when translate's local LLM is available
+    llm_context_lines: int = 5
+    min_confidence: float = 0.6      # a later layer overrides an earlier one only at >= this
+    only_unvoiced: bool = True       # lines with original audio keep their audio passport
 
 
 class LlmOpts(_Section):
@@ -197,6 +230,10 @@ class TranslateSection(_Section):
     interjections: str = "configs/interjections.yaml"
     # MockTranslator dictionary (test profile): source text -> target text
     mock_dictionary: str = ""
+    # Also translate speaker lines that have no original audio (mode B; the unvoiced protagonist); narration never.
+    # auto (default) = on only when synth.voice_unvoiced is on (the app; the CLI keeps voiced lines only)
+    # | on = always translate speaker lines without audio too | off = voiced lines only.
+    include_unvoiced: Literal["auto", "on", "off"] = "auto"
 
 
 # ----------------------------------------------------------------------------
@@ -221,6 +258,12 @@ class PerformerOpts(_Section):
     max_f0_delta_semitones: float = 3.0
     # kind=reference: <reference_dir>/<speaker_id>/*.wav native target-language clips
     reference_dir: str = ""
+    # Casting screen: how many of a design's clips are the character's own translated lines
+    # (the clips the user auditions); the rest of ``test_sentences`` are generic test sentences.
+    sample_lines: int = 2
+    # Also render a "clone" design (route A, zero-shot from the original clips) in the voicebank
+    # stage. Off for the CLI; the app's propose_designs always offers it for characters with audio.
+    offer_clone: bool = False
 
 
 class RvcOpts(_Section):
@@ -279,6 +322,9 @@ class SynthSection(_Section):
     interjection_max_syllables: int = 2
     high_arousal: float = 0.75
     seed_base: int = 1234
+    # Dub speaker lines that have no original audio too (route P: performer voice only, no VC;
+    # narration is never dubbed). CLI default off; the desktop app turns it on.
+    voice_unvoiced: bool = False
 
 
 class Gates(_Section):
@@ -367,6 +413,7 @@ class PipelineConfig(_Section):
     link: LinkSection = Field(default_factory=LinkSection)
     analyze: AnalyzeSection = Field(default_factory=AnalyzeSection)
     translate: TranslateSection = Field(default_factory=TranslateSection)
+    text_emotion: TextEmotionSection = Field(default_factory=TextEmotionSection)
     voicebank: VoicebankSection = Field(default_factory=VoicebankSection)
     synth: SynthSection = Field(default_factory=SynthSection)
     score: ScoreSection = Field(default_factory=ScoreSection)
@@ -381,9 +428,9 @@ class PipelineConfig(_Section):
     @field_validator("synth")
     @classmethod
     def _routes_known(cls, v: SynthSection) -> SynthSection:
-        bad = set(v.routes) - {"A", "B", "C"}
+        bad = set(v.routes) - {"A", "B", "C", "P"}
         if bad:
-            raise ValueError(f"unknown synth routes: {sorted(bad)} (allowed: A, B, C)")
+            raise ValueError(f"unknown synth routes: {sorted(bad)} (allowed: A, B, C, P)")
         return v
 
     def section_hash(self, *names: str) -> str:

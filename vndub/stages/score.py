@@ -19,6 +19,12 @@ The composite is the weighted mean over the terms that are available (weights
 renormalized); missing terms are listed per candidate. Every raw metric is
 persisted in ``scores/<line_id>.jsonl`` so ``vndub score --reweight`` re-derives
 composites and the selection without touching any model.
+
+Lines without original audio (``synth.voice_unvoiced``, route P) have nothing to compare the
+delivery to: ``emo_sim``, ``adv_delta``, ``prosody`` and ``dur_ratio`` are not computed (their terms
+are missing, so the composite is renormalized over utmos / pq / spk_sim / cer) and no gate needs them.
+``spk_sim`` is then measured against the performer's reference clips (consistency with the chosen
+design) instead of the character's original clips -- the same threshold applies.
 """
 
 from __future__ import annotations
@@ -257,12 +263,50 @@ class Cand:
         self.emb_dir = ctx.paths.scores_dir / "emb" / line.line_id
         self.feat_dir = ctx.paths.scores_dir / "feat" / line.line_id
 
+    @property
+    def has_ref_audio(self) -> bool:
+        """Is there an original recording of the line to compare the delivery with?"""
+        return bool(self.line.src_wav or self.line.src_wav16) and self.passport.get("source") != "text"
+
     def needs(self, metric: str) -> bool:
+        if metric in REFERENCE_METRICS and not self.has_ref_audio:
+            return False
         return self.rec.metrics.get(metric) is None and metric not in self.na
 
     @property
     def na(self) -> list[str]:
         return list((self.rec.model_extra or {}).get("na") or [])
+
+
+# metrics that compare a candidate with the original recording of its line
+REFERENCE_METRICS = ("emo_sim", "adv_delta", "prosody")
+
+
+def native_speed(side: SynthSidecar | None) -> float:
+    """The speed multiplier the TTS backend itself applied (tuning), so the duration check expects it."""
+    plan = (((side.params or {}).get("tuning") or {}).get("plan") or {}) if side is not None else {}
+    return float(plan.get("speed") or 1.0) if plan.get("speed_native") else 1.0
+
+
+class _Progress:
+    """``ctx.progress`` over the metric computations (one unit per candidate per metric group)."""
+
+    def __init__(self, ctx: Any, total: int, n_items: int = 0) -> None:
+        self.ctx, self.total, self.done, self.n_items = ctx, max(0, int(total)), 0, n_items
+
+    def add(self, n: int, item: str | None = None) -> None:
+        if self.total:
+            self.done = min(self.total, self.done + n)
+            self.ctx.progress(self.done, self.total, item)
+
+    def chunk(self, part: list[dict[str, Any]]) -> None:
+        self.add(len(part), str(part[-1].get("id", "")).split("|")[0] if part else None)
+
+    def finish(self) -> None:
+        if self.total:
+            self.add(self.total - self.done)
+        elif self.n_items:  # everything was scored before: report the candidates as done
+            self.ctx.progress(self.n_items, self.n_items, None)
 
 
 def _metric_key(cfg: Any) -> str:
@@ -272,7 +316,7 @@ def _metric_key(cfg: Any) -> str:
 
 def run(ctx: Any) -> dict[str, Any]:
     cfg = ctx.cfg
-    lines = ctx.voiced_lines()
+    lines = ctx.dub_lines()
     if not lines:
         raise StageError("no voiced lines")
     trs = gu.load_translations(ctx)
@@ -381,6 +425,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
     cfg = ctx.cfg
     s = cfg.score
     tgt = cfg.project.tgt_lang
+    prog = _Progress(ctx, sum(1 for c in cands for m in ("utmos", "pq", "spk_sim", "emo_sim", "adv_delta", "cer", "prosody") if c.needs(m)), len(cands))
 
     # MOS
     todo = [c for c in cands if c.needs("utmos")]
@@ -388,7 +433,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
         b, _ = _acquire(ctx, [s.mos, s.mos_fallback], "mos", unavailable)
         if b is not None:
             by = {c.cid: c for c in todo}
-            for r in gu.run_batched(b, "mos", [{"id": c.cid, "wav": str(c.wav)} for c in todo]):
+            for r in gu.run_batched(b, "mos", [{"id": c.cid, "wav": str(c.wav)} for c in todo], on_chunk=prog.chunk):
                 v = r.get("mos", r.get("utmos", r.get("score")))
                 if v is not None and not r.get("error") and r.get("id") in by:
                     by[r["id"]].rec.metrics["utmos"] = round(float(v), 4)
@@ -399,7 +444,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
             b, _ = _acquire(ctx, [s.aesthetics], "aesthetics", unavailable)
             if b is not None:
                 by = {c.cid: c for c in todo}
-                for r in gu.run_batched(b, "aesthetics", [{"id": c.cid, "wav": str(c.wav)} for c in todo]):
+                for r in gu.run_batched(b, "aesthetics", [{"id": c.cid, "wav": str(c.wav)} for c in todo], on_chunk=prog.chunk):
                     if not r.get("error") and r.get("id") in by:
                         for k in ("pq", "ce", "cu", "pc"):
                             if r.get(k) is not None:
@@ -408,24 +453,41 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
         for c in cands:
             if "pq" not in c.na:
                 c.rec.na = [*c.na, "pq"]  # type: ignore[attr-defined]
-    # speaker similarity
+    # speaker similarity: vs the character's timbre refs; route P (and characters without refs) vs the
+    # performer's reference clips; last resort the original line
     todo = [c for c in cands if c.needs("spk_sim")]
     if todo:
         b, name = _acquire(ctx, [s.speaker], "speaker", unavailable)
         if b is not None:
             jobs = []
-            refs_for: dict[str, list[str]] = {}
+            refs_cache: dict[tuple[str, str], tuple[list[str], str]] = {}
+
+            def ref_keys(sid: str, route: str) -> tuple[list[str], str]:
+                """(embedding job keys of the reference clips, which kind they are: char | perf)."""
+                want = "perf" if route == "P" else "char"
+                if (sid, want) not in refs_cache:
+                    keys: list[str] = []
+                    kind = want
+                    if want == "char":
+                        refs = [r for r in gu.load_refs(ctx, sid) if r.usage in ("timbre", "both")] or gu.load_refs(ctx, sid)
+                        for r in refs:
+                            k = f"ref|{sid}|{r.path}"
+                            jobs.append((k, ctx.paths.abs(r.path), ctx.paths.vb(sid) / "emb" / f"ref_{Path(r.path).stem}.{name}.npy"))
+                            keys.append(k)
+                    if not keys:
+                        kind = "perf"
+                        for r in (gu.load_performer(ctx, sid) or {}).get("refs", []):
+                            p = ctx.paths.abs(r["path"])
+                            if p.exists():
+                                k = f"perf|{sid}|{r['path']}"
+                                jobs.append((k, p, ctx.paths.vb(sid) / "emb" / f"perf_{Path(r['path']).stem}.{name}.npy"))
+                                keys.append(k)
+                    refs_cache[(sid, want)] = (keys, kind)
+                return refs_cache[(sid, want)]
+
             for c in todo:
-                sid = c.line.speaker_id
-                if sid not in refs_for:
-                    refs = [r for r in gu.load_refs(ctx, sid) if r.usage in ("timbre", "both")] or gu.load_refs(ctx, sid)
-                    keys = []
-                    for r in refs:
-                        k = f"ref|{sid}|{r.path}"
-                        jobs.append((k, ctx.paths.abs(r.path), ctx.paths.vb(sid) / "emb" / f"ref_{Path(r.path).stem}.{name}.npy"))
-                        keys.append(k)
-                    refs_for[sid] = keys
-                if not refs_for[sid] and (c.line.src_wav16 or c.line.src_wav):
+                keys, _ = ref_keys(c.line.speaker_id, c.rec.route)
+                if not keys and (c.line.src_wav16 or c.line.src_wav):
                     k = f"orig|{c.line.line_id}"
                     jobs.append((k, ctx.paths.abs(c.line.src_wav16 or c.line.src_wav), c.emb_dir / f"orig.{name}.npy"))
                 jobs.append((f"cand|{c.cid}", c.wav, c.emb_dir / f"{c.wav.stem}.{name}.npy"))
@@ -434,12 +496,15 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
                 v = vecs.get(f"cand|{c.cid}")
                 if v is None:
                     continue
-                keys = refs_for.get(c.line.speaker_id) or [f"orig|{c.line.line_id}"]
-                refs = [vecs[k] for k in keys if k in vecs]
+                keys, kind = ref_keys(c.line.speaker_id, c.rec.route)
+                refs = [vecs[k] for k in (keys or [f"orig|{c.line.line_id}"]) if k in vecs]
                 if refs:
                     c.rec.metrics["spk_sim"] = round(max(cosine(v, r) for r in refs), 4)
-                    if not refs_for.get(c.line.speaker_id):
+                    if not keys:
                         c.rec.notes = [*c.rec.notes, "spk_sim vs the original line (no voicebank refs)"]
+                    elif kind == "perf":
+                        c.rec.notes = [*c.rec.notes, "spk_sim vs the performer's sample (consistency; no original voice)"]
+            prog.add(len(todo), todo[-1].line.line_id)
         if s.speaker_extra:
             b2, name2 = _acquire(ctx, [s.speaker_extra], "speaker_extra", unavailable)
             if b2 is not None:
@@ -474,7 +539,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
                 items.append({"id": c.cid, "wav": str(c.wav), "out": str(c.emb_dir / f"{c.wav.stem}.{name}.e2v.npy")})
             for it in items:
                 Path(it["out"]).parent.mkdir(parents=True, exist_ok=True)
-            res = {r["id"]: r for r in gu.run_batched(b, "emotion", items)}
+            res = {r["id"]: r for r in gu.run_batched(b, "emotion", items, on_chunk=prog.chunk)}
             for c in todo:
                 r = res.get(c.cid, {})
                 p = r.get("embedding_path") or (c.emb_dir / f"{c.wav.stem}.{name}.e2v.npy")
@@ -496,7 +561,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
             for c in todo:
                 if not (c.passport.get("emotion") or {}).get("adv") and (c.line.src_wav16 or c.line.src_wav):
                     orig_items[c.line.line_id] = {"id": f"orig|{c.line.line_id}", "wav": str(ctx.paths.abs(c.line.src_wav16 or c.line.src_wav))}
-            res = {r["id"]: r for r in gu.run_batched(b, "adv", [{"id": c.cid, "wav": str(c.wav)} for c in todo] + list(orig_items.values()))}
+            res = {r["id"]: r for r in gu.run_batched(b, "adv", [{"id": c.cid, "wav": str(c.wav)} for c in todo] + list(orig_items.values()), on_chunk=prog.chunk)}
             for c in todo:
                 r = res.get(c.cid, {})
                 o = (c.passport.get("emotion") or {}).get("adv") or res.get(f"orig|{c.line.line_id}", {})
@@ -508,7 +573,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
     if todo:
         b, _ = _acquire(ctx, [s.cer_asr, s.cer_asr_fallback], "cer", unavailable)
         if b is not None:
-            res = {r["id"]: r for r in gu.run_batched(b, "transcribe", [{"id": c.cid, "wav": str(c.wav), "lang": tgt} for c in todo], lang=tgt)}
+            res = {r["id"]: r for r in gu.run_batched(b, "transcribe", [{"id": c.cid, "wav": str(c.wav), "lang": tgt} for c in todo], on_chunk=prog.chunk, lang=tgt)}
             trs = gu.load_translations(ctx)
             for c in todo:
                 r = res.get(c.cid, {})
@@ -522,7 +587,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
     # duration + prosody (core DSP, F0 via the configured f0 backend)
     for c in cands:
         if c.rec.metrics.get("dur_ratio") is None:
-            src_d = gu.src_duration(ctx, c.line, c.passport)
+            src_d = gu.src_duration(ctx, c.line, c.passport) / native_speed(c.side)  # a speed the backend applied is expected
             if src_d > 0:
                 c.rec.metrics["dur_ratio"] = round(features.duration(c.wav) / src_d, 4)
                 c.rec.metrics["duration_s"] = round(features.duration(c.wav), 3)
@@ -557,6 +622,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
             src_pauses = p.get("pauses")
             src_dur = gu.src_duration(ctx, c.line, c.passport)
             pm = pros.pause_match(src_pauses, src_dur, prof["pauses"], len(y) / sr) if src_pauses is not None else None
+            prog.add(1, c.line.line_id)
             c.rec.metrics["f0_corr"] = None if fc is None else round(fc, 4)
             c.rec.metrics["energy_corr"] = None if ec is None else round(ec, 4)
             c.rec.metrics["pause_match"] = None if pm is None else round(pm, 4)
@@ -564,6 +630,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
             c.rec.metrics["prosody"] = None if ps is None else round(ps, 4)
             if ps is None:
                 c.rec.na = [*c.na, "prosody"]  # type: ignore[attr-defined]
+    prog.finish()
     for group, reason in unavailable.items():
         for c in cands:
             note = f"{group} unavailable: {reason[:120]}"

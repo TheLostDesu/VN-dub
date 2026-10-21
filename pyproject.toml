@@ -27,6 +27,13 @@ dependencies = [
     "num2words>=0.5.13",
     "huggingface-hub>=0.24",
     "openpyxl>=3.1",
+    # desktop app layer (vndub_app): API server, window shell
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "websockets>=12.0",  # uvicorn's WebSocket implementation (/api/progress)
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+    "pywebview>=5.0; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -35,16 +42,17 @@ extract = ["unrpa>=2.3", "UnityPy>=1.20"]
 
 [project.scripts]
 vndub = "vndub.cli:main"
+vndub-app = "vndub_app.shell:main"
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-timeout>=2.3"]
+dev = ["pytest>=8.0", "pytest-timeout>=2.3", "playwright>=1.45", "pyinstaller>=6.6"]
 
 [build-system]
 requires = ["hatchling>=1.24"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["vndub"]
+packages = ["vndub", "vndub_app"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -52,4 +60,6 @@ addopts = "-q"
 timeout = 300
 markers = [
     "slow: end-to-end or model-backed tests",
+    "e2e: Playwright walk of the desktop app wizard (needs the built SPA + Chromium)",
+    "network: talks to the real huggingface.co (small downloads); skipped unless VNDUB_NETWORK_TESTS=1",
 ]

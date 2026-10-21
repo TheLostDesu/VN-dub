@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import shutil
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Iterable
@@ -253,6 +254,92 @@ def build_characters(lines: list[LineRecord], existing: dict[str, Character] | N
         if not c.voice_prefix and prefixes.get(sid):
             c.voice_prefix = max(prefixes[sid].items(), key=lambda kv: kv[1])[0]
     return chars
+
+
+# ----------------------------------------------------------------------------
+# voiced lines without a visible speaker name
+# ----------------------------------------------------------------------------
+
+#: speaker of voiced lines that the script shows without a name (the narrator box) and whose voice file
+#: names nobody: an off-screen voice or a voiced narrator. Unlike ``narrator`` it is cast and dubbed.
+VOICE_OVER = "voice_over"
+#: target-language name of :data:`VOICE_OVER` written to ``characters.yaml`` (the user may rename it)
+VOICE_OVER_NAMES = {"ru": "Голос за кадром", "en": "Voice-over"}
+
+#: voice file stem ``<letters><sep?><digits>`` (``sak_0012``, ``har0003``); hashed / free-form names are skipped
+_VOICE_STEM = re.compile(r"^([A-Za-z]+)[_\-]?(\d+)$")
+
+
+def voice_name_parts(voice_file: str | None) -> tuple[str, int] | None:
+    """(lowercase prefix, index) of a voice file name of the form ``<prefix><sep><index>``, else None."""
+    if not voice_file:
+        return None
+    m = _VOICE_STEM.match(PurePosixPath(str(voice_file).replace("\\", "/")).stem)
+    return (m.group(1).lower(), int(m.group(2))) if m else None
+
+
+def hidden_name(name: str | None) -> bool:
+    """A speaker name that hides who speaks: punctuation and symbols only (``？？？``, ``…``, ``――``)."""
+    n = normalize_speaker(name or "")
+    return bool(n) and not any(ch.isalnum() for ch in n)
+
+
+def voice_prefix_owners(lines: list[LineRecord]) -> dict[str, str]:
+    """Voice-file prefix -> speaker_id, for the prefixes that name one speaker in this game.
+
+    Counted over the voiced lines whose script names the speaker. Empty when prefixes do not identify
+    speakers (fewer than 4 such lines with ``<prefix>_<index>`` files, a single prefix, or a purity below
+    0.8 -- the test of link's prefix check); a prefix needs >= 2 lines, >= 90 % of them by one speaker.
+    """
+    by_prefix: dict[str, Counter[str]] = {}
+    n = 0
+    for l in lines:
+        if not l.has_voice or l.speaker_id in ("narrator", VOICE_OVER) or hidden_name(l.speaker_raw):
+            continue
+        parts = voice_name_parts(l.voice_file)
+        if parts is None:
+            continue
+        by_prefix.setdefault(parts[0], Counter())[l.speaker_id] += 1
+        n += 1
+    if n < 4 or len(by_prefix) < 2 or sum(max(c.values()) for c in by_prefix.values()) / n < 0.8:
+        return {}
+    out: dict[str, str] = {}
+    for p, c in by_prefix.items():
+        sid, k = c.most_common(1)[0]
+        if k >= 2 and k / sum(c.values()) >= 0.9:
+            out[p] = sid
+    return out
+
+
+def resolve_hidden_speakers(lines: list[LineRecord]) -> dict[str, int]:
+    """Give voiced lines without a visible speaker name to whoever speaks them (in place).
+
+    A voiced line in the narrator box (an off-screen voice, a voiced narrator) or under a name that hides
+    the speaker (``？？？``) goes to the character its voice-file prefix identifies
+    (:func:`voice_prefix_owners`; flag ``speaker_from_voice``). Voiced narrator-box lines that no prefix
+    identifies go to :data:`VOICE_OVER` (flag ``offscreen_voice``); lines under a hiding name otherwise keep
+    their own speaker (a character of their own already). Unvoiced lines are never touched: narration
+    stays narration. Returns ``{"from_voice": n, "voice_over": m}``.
+    """
+    owners = voice_prefix_owners(lines)
+    n_voice = n_over = 0
+    for l in lines:
+        if not l.has_voice or "menu" in l.flags:
+            continue
+        narr = l.speaker_id == "narrator"
+        if not (narr or hidden_name(l.speaker_raw)):
+            continue
+        parts = voice_name_parts(l.voice_file)
+        owner = owners.get(parts[0]) if parts else None
+        if owner and owner != l.speaker_id:
+            l.speaker_id = owner
+            l.flags.append("speaker_from_voice")
+            n_voice += 1
+        elif narr:
+            l.speaker_id = VOICE_OVER
+            l.flags.append("offscreen_voice")
+            n_over += 1
+    return {"from_voice": n_voice, "voice_over": n_over}
 
 
 def copy_loose(ctx: "StageContext", finals: list[FinalIndexRecord], out_root: Path) -> int:

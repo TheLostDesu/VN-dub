@@ -317,13 +317,44 @@ class MockTranslator(LocalBackend):
 
             self.dictionary = {str(k): str(v) for k, v in (yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}).items()}
 
+    @staticmethod
+    def _scene_lines(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
+        """The ``scene_lines`` context list of a delivery request (neighbouring script lines), [] when absent."""
+        for m in messages:
+            c = m.get("content", "")
+            if m.get("role") == "user" and "scene_lines:" in c:
+                part = c.split("scene_lines:", 1)[1]
+                a, b = part.find("["), part.rfind("]")
+                if a >= 0 and b > a:
+                    try:
+                        return list(json.loads(part[a : b + 1]))
+                    except json.JSONDecodeError:
+                        return []
+        return []
+
     def op_chat(self, messages: list[dict[str, str]], tgt: str = "ru", **_: Any) -> str:
+        """Rows with ``want_delivery`` also get a deterministic ``delivery`` object (punctuation, narration cues in the
+        ``scene_lines`` context, a tiny keyword lexicon: ``vndub.text.delivery.mock_delivery``). A request whose last
+        message starts with "Describe how these lines are spoken" is the delivery-only protocol: no translations."""
+        from vndub.text.delivery import mock_delivery
+
         user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "{}")
         start = user.find("[")
         batch = json.loads(user[start : user.rfind("]") + 1]) if start >= 0 else []
+        delivery_only = user.startswith("Describe how these lines are spoken")
+        scene = self._scene_lines(messages)
+        pos = {r.get("id"): i for i, r in enumerate(scene)}
         out = []
         for row in batch:
             src = row.get("text", "")
+            delivery = None
+            if row.get("want_delivery"):
+                i = pos.get(row.get("id"))
+                near = [r["text"] for j, r in enumerate(scene) if i is not None and r.get("speaker") == "narrator" and 0 < abs(j - i) <= 2]
+                delivery = mock_delivery(src, near)
+            if delivery_only:
+                out.append({"id": row.get("id"), "delivery": delivery})
+                continue
             tr = self.dictionary.get(src)
             note = row.get("emotion") or ""
             if tr is None:
@@ -331,5 +362,8 @@ class MockTranslator(LocalBackend):
                 note = "passthrough"
             words = tr.split()
             short = " ".join(words[: max(1, int(len(words) * 0.75))]) if len(words) > 8 else tr
-            out.append({"id": row.get("id"), tgt: tr, f"{tgt}_short": short, "notes": note})
+            entry = {"id": row.get("id"), tgt: tr, f"{tgt}_short": short, "notes": note}
+            if delivery is not None:
+                entry["delivery"] = delivery
+            out.append(entry)
         return json.dumps({"lines": out}, ensure_ascii=False)

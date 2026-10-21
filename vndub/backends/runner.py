@@ -51,9 +51,23 @@ class AdapterCrashed(AdapterError):
     pass
 
 
+def envs_root(root: Path | None = None) -> Path:
+    """Directory that holds the backend virtual environments.
+
+    An explicit ``root`` always means ``<root>/.venvs`` (tests, other checkouts). Without it
+    ``$VNDUB_ENVS_DIR`` wins (the desktop app keeps its envs in ``<data>/envs``), else
+    ``<repo>/.venvs`` as before.
+    """
+    if root is None:
+        env = os.environ.get("VNDUB_ENVS_DIR")
+        if env:
+            return Path(env)
+        root = repo_root()
+    return root / ".venvs"
+
+
 def env_python(env: str, root: Path | None = None) -> Path:
-    root = root or repo_root()
-    base = root / ".venvs" / env
+    base = envs_root(root) / env
     if sys.platform.startswith("win"):
         return base / "Scripts" / "python.exe"
     return base / "bin" / "python"

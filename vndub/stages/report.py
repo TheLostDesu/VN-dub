@@ -32,6 +32,9 @@ NAME = "report"
 VERSION = "1"
 CONFIG_SECTIONS = ("report",)
 
+#: sections `collect` goes through (progress units besides the per-file ones)
+SECTIONS = 7
+
 TEMPLATES = Path(__file__).resolve().parent.parent / "report" / "templates"
 METRICS = ["composite", "utmos", "pq", "spk_sim", "emo_sim", "adv_delta", "cer", "dur_ratio", "prosody", "f0_corr", "energy_corr", "pause_match"]
 
@@ -58,8 +61,20 @@ def collect(ctx: Any) -> dict[str, Any]:
     proj = ctx.project
     data["project"] = proj.model_dump(mode="json") if proj else None
 
-    # lines / overview
-    lines = load_lines(p.lines) if p.lines.exists() else []
+    # progress: one tick per section and per score / passport file read (nothing is written until render)
+    score_files = sorted(p.scores_dir.glob("*.jsonl")) if p.scores_dir.exists() else []
+    passport_files = list(p.analysis.glob("*.json"))[:5000] if p.analysis.exists() else []
+    total = SECTIONS + len(score_files) + len(passport_files)
+    done = 0
+
+    def tick(item: str | None = None, section: bool = True) -> None:
+        nonlocal done
+        done += 1
+        if section or done % 25 == 0 or done >= total:  # per-file ticks are throttled
+            ctx.progress(min(done, total), total, item)
+
+    # lines / overview (source text with mode C recoveries and user edits applied)
+    lines = ctx.lines() if p.lines.exists() else []
     trs = gu.load_translations(ctx)
     sel = {s.line_id: s for s in read_jsonl(p.selection, SelectionRecord)} if p.selection.exists() else {}
     finals = read_jsonl(p.final_index, FinalIndexRecord) if p.final_index.exists() else []
@@ -80,6 +95,7 @@ def collect(ctx: Any) -> dict[str, Any]:
         "finals": len(finals),
         "packed": len(manifest_patch) if isinstance(manifest_patch, list) else (len(manifest_patch.get("files", [])) if isinstance(manifest_patch, dict) else None),
     }
+    tick("overview")
 
     # mapping coverage
     if p.link.exists():
@@ -97,6 +113,7 @@ def collect(ctx: Any) -> dict[str, Any]:
         }
     else:
         data["link"] = None
+    tick("link")
 
     # characters
     chars = load_characters(p.characters) if p.characters.exists() else {}
@@ -123,12 +140,13 @@ def collect(ctx: Any) -> dict[str, Any]:
             }
         )
     data["characters"] = rows
+    tick("characters")
 
     # scores per backend/route
     allscores: list[CandidateScore] = []
-    if p.scores_dir.exists():
-        for f in sorted(p.scores_dir.glob("*.jsonl")):
-            allscores += read_jsonl(f, CandidateScore)
+    for f in score_files:
+        allscores += read_jsonl(f, CandidateScore)
+        tick(f.stem, section=False)
     groups: dict[str, list[CandidateScore]] = {}
     for c in allscores:
         groups.setdefault(f"{c.backend}/{c.route}", []).append(c)
@@ -147,10 +165,11 @@ def collect(ctx: Any) -> dict[str, Any]:
         )
     data["scores"] = score_rows
     data["metrics"] = METRICS
+    tick("scores")
 
     # route comparison
     routes = []
-    for r in ("A", "B", "C", "orig"):
+    for r in ("A", "B", "C", "P", "orig"):
         cs = [c for c in allscores if c.route == r]
         if not cs:
             continue
@@ -169,6 +188,7 @@ def collect(ctx: Any) -> dict[str, Any]:
             }
         )
     data["routes"] = routes if ctx.cfg.report.compare_routes else []
+    tick("routes")
 
     # selection status + review queue
     st: dict[str, int] = {}
@@ -189,6 +209,7 @@ def collect(ctx: Any) -> dict[str, Any]:
         q["text"] = (l.text_src if l else "")[:60]
     data["queue"] = queue[:300]
     data["queue_total"] = len(queue)
+    tick("queue")
 
     # substitutions, timings, VRAM
     events = list(iter_jsonl(p.work / "gpu_events.jsonl")) if (p.work / "gpu_events.jsonl").exists() else []
@@ -198,14 +219,14 @@ def collect(ctx: Any) -> dict[str, Any]:
             subs[(e["substituted_for"], e["model"])] = subs.get((e["substituted_for"], e["model"]), 0) + 1
     missing: dict[str, int] = {}
     passport_backends: dict[str, int] = {}
-    if p.analysis.exists():
-        for f in list(p.analysis.glob("*.json"))[:5000]:
-            d = read_json(f) or {}
-            for part, reason in (d.get("missing") or {}).items():
-                key = f"{part}: {str(reason)[:80]}"
-                missing[key] = missing.get(key, 0) + 1
-            for part, b in (d.get("backends") or {}).items():
-                passport_backends[f"{part}={b}"] = passport_backends.get(f"{part}={b}", 0) + 1
+    for f in passport_files:
+        d = read_json(f) or {}
+        for part, reason in (d.get("missing") or {}).items():
+            key = f"{part}: {str(reason)[:80]}"
+            missing[key] = missing.get(key, 0) + 1
+        for part, b in (d.get("backends") or {}).items():
+            passport_backends[f"{part}={b}"] = passport_backends.get(f"{part}={b}", 0) + 1
+        tick(f.stem, section=False)
     data["substitutions"] = [{"requested": a, "used": b, "loads": n} for (a, b), n in sorted(subs.items())]
     data["analysis_missing"] = sorted(missing.items(), key=lambda kv: -kv[1])
     data["analysis_backends"] = sorted(passport_backends.items(), key=lambda kv: -kv[1])
@@ -251,6 +272,7 @@ def collect(ctx: Any) -> dict[str, Any]:
         )
     data["samples"] = samples
     data["n_audio"] = len(audio_idx)
+    tick("samples")
     return data
 
 

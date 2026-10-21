@@ -6,20 +6,22 @@
 #   scripts/make_envs.sh all
 #
 # Env vars: CPU=1 (CPU torch), SKIP_EXTRAS=1, STRICT=1 (extras failures are fatal),
-# RECREATE=1, PYTHON=3.11. Directive format: see envs/README.md.
+# RECREATE=1, PYTHON=3.11, ENVS_DIR=<dir> (where the venvs go; default $VNDUB_ENVS_DIR, else <repo>/.venvs).
+# Directive format: see envs/README.md.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENVS_DIR="$ROOT/envs"
+REQ_DIR="$ROOT/envs"
+VENVS_ROOT="${ENVS_DIR:-${VNDUB_ENVS_DIR:-$ROOT/.venvs}}"
 PYTHON="${PYTHON:-3.11}"
-BUILD_CONS="$ENVS_DIR/build.constraints.txt"  # build-time pins for sdist-only packages
+BUILD_CONS="$REQ_DIR/build.constraints.txt"  # build-time pins for sdist-only packages
 command -v uv >/dev/null || { echo "uv not found on PATH" >&2; exit 1; }
 
 envs=("$@")
 [ ${#envs[@]} -eq 0 ] && envs=(asr)
 if [ "${envs[0]}" = "all" ]; then
   envs=()
-  for f in "$ENVS_DIR"/*.txt; do b="$(basename "$f" .txt)"; [[ "$b" == *[+.]* ]] || envs+=("$b"); done
+  for f in "$REQ_DIR"/*.txt; do b="$(basename "$f" .txt)"; [[ "$b" == *[+.]* ]] || envs+=("$b"); done
 fi
 
 venv_python() { if [ -x "$1/Scripts/python.exe" ]; then echo "$1/Scripts/python.exe"; else echo "$1/bin/python"; fi; }
@@ -27,7 +29,7 @@ venv_python() { if [ -x "$1/Scripts/python.exe" ]; then echo "$1/Scripts/python.
 directive() { grep -E "^\s*#\s*@$2\s" "$1" | sed -E "s/^\s*#\s*@$2\s+//" || true; }
 
 install_file() {  # env py file constraints
-  local env="$1" py="$2" file="$3" cons="$4" src="$ROOT/.venvs/$1/src"
+  local env="$1" py="$2" file="$3" cons="$4" src="$VENVS_ROOT/$1/src"
   while read -r name url ref rec; do
     [ -z "${name:-}" ] && continue
     local dst="$src/$name"
@@ -55,10 +57,10 @@ install_file() {  # env py file constraints
 }
 
 for env in "${envs[@]}"; do
-  req="$ENVS_DIR/$env.txt"
+  req="$REQ_DIR/$env.txt"
   [ -f "$req" ] || { echo "no requirements file $req" >&2; exit 1; }
   if ! grep -qE '^\s*[^#[:space:]]|^\s*#\s*@' "$req"; then echo "$env: nothing to install"; continue; fi
-  venv="$ROOT/.venvs/$env"
+  venv="$VENVS_ROOT/$env"
   [ "${RECREATE:-0}" = "1" ] && rm -rf "$venv"
   echo "== env $env ($([ "${CPU:-0}" = "1" ] && echo CPU || echo CUDA))"
   if [ ! -f "$venv/pyvenv.cfg" ]; then rm -rf "$venv"; uv venv "$venv" --python "$PYTHON"; fi
@@ -75,7 +77,7 @@ for env in "${envs[@]}"; do
   install_file "$env" "$py" "$req" "$cons"
   failed=()
   if [ "${SKIP_EXTRAS:-0}" != "1" ]; then
-    for x in "$ENVS_DIR/$env+"*.txt; do
+    for x in "$REQ_DIR/$env+"*.txt; do
       [ -f "$x" ] || continue
       echo "   extra $(basename "$x")"
       if ! install_file "$env" "$py" "$x" "$cons"; then

@@ -6,8 +6,12 @@
   scripts\make_envs.ps1 -Env asr
   scripts\make_envs.ps1 -Env asr,score -Cpu
   scripts\make_envs.ps1 -Env all -SkipExtras
+  scripts\make_envs.ps1 -Env asr -EnvsDir "$env:LOCALAPPDATA\VNDub\envs"   # desktop app layout
 
 .NOTES
+  Envs are created under -EnvsDir (default: $env:VNDUB_ENVS_DIR, else <repo>\.venvs). The core finds
+  them through the same variable (vndub.backends.runner.envs_root); -Cpu installs CPU torch wheels,
+  without it the CUDA wheels of each env file (# @cuda) are used.
   Directives inside envs\<env>.txt (comments, see envs\README.md):
     # @torch torch==X torchaudio==Y     installed first from the PyTorch index
     # @cuda cu128                       CUDA tag of that index (ignored with -Cpu)
@@ -22,14 +26,18 @@ param(
     [switch]$SkipExtras,
     [switch]$Strict,
     [switch]$Recreate,
-    [string]$Python = "3.11"
+    [string]$Python = "3.11",
+    [string]$EnvsDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$EnvsDir = Join-Path $Root "envs"
+$ReqDir = Join-Path $Root "envs"
+if (-not $EnvsDir) { $EnvsDir = $env:VNDUB_ENVS_DIR }
+if (-not $EnvsDir) { $EnvsDir = Join-Path $Root ".venvs" }
+$VenvsRoot = $EnvsDir
 # build-time pins for sdist-only packages (see envs/build.constraints.txt)
-$BuildConstraints = Join-Path $EnvsDir "build.constraints.txt"
+$BuildConstraints = Join-Path $ReqDir "build.constraints.txt"
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     throw "uv not found on PATH (install: pip install uv, or https://docs.astral.sh/uv/)"
@@ -40,7 +48,7 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 
 $Env = @($Env | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 if ($Env -contains "all") {
-    $Env = Get-ChildItem $EnvsDir -Filter *.txt | Where-Object { $_.BaseName -notmatch "[+.]" } | ForEach-Object { $_.BaseName }
+    $Env = Get-ChildItem $ReqDir -Filter *.txt | Where-Object { $_.BaseName -notmatch "[+.]" } | ForEach-Object { $_.BaseName }
 }
 
 function Invoke-Checked([string]$What, [scriptblock]$Block) {
@@ -72,7 +80,7 @@ function Get-Directives([string]$File) {
 
 function Install-ReqFile([string]$EnvName, [string]$Py, [string]$File, [string]$Constraints) {
     $d = Get-Directives $File
-    $src = Join-Path $Root ".venvs\$EnvName\src"
+    $src = Join-Path $VenvsRoot "$EnvName\src"
     foreach ($g in $d.git) {
         $dst = Join-Path $src $g.name
         if (-not (Test-Path $dst)) {
@@ -104,13 +112,13 @@ function Install-ReqFile([string]$EnvName, [string]$Py, [string]$File, [string]$
 $summary = @()
 foreach ($e in $Env) {
     $t0 = Get-Date
-    $req = Join-Path $EnvsDir "$e.txt"
+    $req = Join-Path $ReqDir "$e.txt"
     if (-not (Test-Path $req)) { throw "no requirements file $req" }
     if (-not (Get-Content -Encoding UTF8 $req | Where-Object { $_ -match "^\s*[^#\s]" -or $_ -match "^\s*#\s*@" })) {
         $summary += "$e : nothing to install (see $req)"
         continue
     }
-    $venv = Join-Path $Root ".venvs\$e"
+    $venv = Join-Path $VenvsRoot $e
     if ($Recreate -and (Test-Path $venv)) { Remove-Item -Recurse -Force $venv }
     $py = Join-Path $venv "Scripts\python.exe"
     Write-Host "== env $e ($(if ($Cpu) { 'CPU' } else { 'CUDA' }))" -ForegroundColor Cyan
@@ -133,7 +141,7 @@ foreach ($e in $Env) {
 
     $extrasFailed = @()
     if (-not $SkipExtras) {
-        foreach ($x in Get-ChildItem $EnvsDir -Filter "$e+*.txt") {
+        foreach ($x in Get-ChildItem $ReqDir -Filter "$e+*.txt") {
             try {
                 Write-Host "   extra $($x.Name)" -ForegroundColor Cyan
                 Install-ReqFile $e $py $x.FullName $constraints
@@ -151,5 +159,5 @@ foreach ($e in $Env) {
 }
 Write-Host ""
 $summary | ForEach-Object { Write-Host $_ -ForegroundColor Green }
-Write-Host "selftest: .venvs\<env>\Scripts\python.exe -m adapters.<env>.main --selftest   (or: uv run vndub models selftest <backend>)"
+Write-Host "selftest: $VenvsRoot\<env>\Scripts\python.exe -m adapters.<env>.main --selftest   (or: uv run vndub models selftest <backend>)"
 exit 0

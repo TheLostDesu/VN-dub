@@ -5,7 +5,11 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 dist/
+# the built interface is kept (uv run vndub-app works without Node.js); tests/app/test_web_dist.py checks it is fresh
+!vndub_app/web/dist/
 build/
+installer/
+packaging/_staging/
 
 # pipeline outputs and downloaded weights
 /work/
@@ -15,3 +19,6 @@ tests/_tmp/
 
 # per-user tool paths
 configs/tools.local.yaml
+
+# Playwright failure screenshot
+tests/app/_e2e_failure.png

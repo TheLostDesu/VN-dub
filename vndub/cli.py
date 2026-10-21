@@ -1,6 +1,7 @@
 """``vndub`` command line.
 
-Stages: detect extract parse link analyze translate voicebank synth score master pack report
+Stages: detect extract parse link analyze translate text_emotion voicebank synth score master pack report
+        (`text-emotion` on the command line; delivery from text for lines without original audio)
 Other:  run (all stages), review (Gradio UI), models (pull/status/selftest/list), tools (check), index (rebuild)
 
 Every stage command takes ``--project DIR`` (the game dir, or a dir holding a
@@ -142,7 +143,9 @@ OutOpt = typer.Option(None, "--out-dir", help="Override project.out_dir.")
 SetOpt = typer.Option(None, "--set", help="Config override key=value (dotted keys), repeatable.")
 
 
-def _stage(name: str, helptext: str) -> None:
+def _stage(name: str, helptext: str, command: str | None = None) -> None:
+    """Register stage ``name`` as a command (``command`` when the CLI spelling differs, e.g. ``text-emotion``)."""
+
     def cmd(
         project: Path = ProjectOpt,
         config: Optional[Path] = ConfigOpt,
@@ -157,7 +160,7 @@ def _stage(name: str, helptext: str) -> None:
         _run([name], ctx)
 
     cmd.__doc__ = helptext
-    app.command(name, help=helptext)(cmd)
+    app.command(command or name, help=helptext)(cmd)
 
 
 # Commands are registered in pipeline order (typer lists them in registration order).
@@ -217,6 +220,11 @@ def translate_cmd(
     _run(["translate"], ctx)
 
 
+_stage(
+    "text_emotion",
+    "Delivery from text (stage text_emotion): synthetic expression passport for lines without original audio.",
+    command="text-emotion",
+)
 _stage("voicebank", "Per character: reference clips, performer voice, RVC model, LoRA (route C).")
 
 
@@ -276,6 +284,10 @@ def run_cmd(
     elif profile not in (None, "default"):
         raise typer.BadParameter("--profile must be 'default' or 'test'")
     ctx = make_ctx(project, config, force=force, only=only, limit=limit, work_dir=work_dir, out_dir=out_dir, sets=set_, extra={"rebind_project": False})
+    from_, to = (s.replace("-", "_") if s else s for s in (from_, to))  # `--from text-emotion` works too
+    for s in (from_, to):
+        if s and s not in STAGES:
+            raise typer.BadParameter(f"unknown stage {s!r}; stages: {', '.join(STAGES)}")
     i0 = STAGES.index(from_) if from_ else 0
     i1 = STAGES.index(to) if to else len(STAGES) - 1
     names = STAGES[i0 : i1 + 1]
@@ -318,11 +330,17 @@ def review_cmd(
     work_dir: Optional[Path] = WorkOpt,
     out_dir: Optional[Path] = OutOpt,
     no_browser: bool = typer.Option(True, "--no-browser/--browser"),
+    app_ui: bool = typer.Option(False, "--app", help="Open the desktop app's review screen instead of the Gradio tool."),
     set_: Optional[list[str]] = SetOpt,
 ) -> None:
+    ctx = make_ctx(project, config, work_dir=work_dir, out_dir=out_dir, sets=set_)
+    if app_ui:
+        from vndub_app.server import serve_review
+
+        serve_review(ctx, host=host or ctx.cfg.review.host, port=port or 0, open_browser=not no_browser)
+        return
     from vndub.review.app import launch
 
-    ctx = make_ctx(project, config, work_dir=work_dir, out_dir=out_dir, sets=set_)
     launch(ctx, host=host or ctx.cfg.review.host, port=port or ctx.cfg.review.port, open_browser=not no_browser)
 
 

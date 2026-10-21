@@ -15,6 +15,22 @@ uv run vndub --help
 uv run vndub run --config configs/pipeline.test.yaml --project tests/fixtures/renpy_mini
 ```
 
+## Desktop app
+
+`VNDub` is a one-click desktop application over the same pipeline for users who never open a
+terminal (Russian UI by default, English second): a wizard from diagnostics and the game folder
+through translation, voice casting, a quick preview, the full run and review to installing the patch
+into the game, plus an in-app installer for tools, backend environments and models. User manual (in
+Russian): [docs/APP.md](docs/APP.md). Every pipeline feature stays available from the CLI.
+
+```bash
+uv sync
+uv run vndub-app                                           # window (pywebview); --browser for a browser tab
+cd vndub_app/web && npm ci && npm run build && cd ../..   # only after editing the SPA (Node.js 20+); the build is in the repo
+VNDUB_APP_PROFILE=apptest uv run vndub-app                 # all-mock profile: UI work without models
+powershell -File packaging/build_app.ps1                   # dist/VNDub/VNDub.exe (+ installer when Inno Setup 6 is installed)
+```
+
 Documentation:
 
 | Doc | Contents |
@@ -26,6 +42,10 @@ Documentation:
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Decisions taken where the spec left room |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common failures and fixes |
 | [docs/BUILD_REPORT.md](docs/BUILD_REPORT.md) | What was built and verified on the build machine |
+| [docs/APP.md](docs/APP.md) | Desktop app user manual (Russian, with screenshots) |
+| [vndub_app/API.md](vndub_app/API.md) | Desktop app internals: REST/WebSocket API, jobs, i18n, pipeline hooks |
+| [docs/APP_BUILD_REPORT.md](docs/APP_BUILD_REPORT.md) | What was built and verified for the desktop app |
+| [docs/APP_ROUND2_REPORT.md](docs/APP_ROUND2_REPORT.md) | Round 2 (in Russian): off-screen voices in casting, committed SPA build, Hugging Face links, installer |
 
 ## Legal note
 

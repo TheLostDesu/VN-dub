@@ -17,6 +17,17 @@ scripts/make_envs.sh asr score          # CUDA
 CPU=1 scripts/make_envs.sh asr score    # CPU torch
 ```
 
+### Where the environments go
+
+By default `.venvs/<env>` in the checkout. The desktop app keeps them in its data folder (`%LOCALAPPDATA%\VNDub\envs`):
+both scripts take the target (`-EnvsDir <dir>` / `ENVS_DIR=<dir>`, default `$VNDUB_ENVS_DIR`, else `<repo>/.venvs`) and the
+pipeline finds them through the same variable `VNDUB_ENVS_DIR` (`vndub.backends.runner.envs_root`). `-Cpu` / `CPU=1` selects
+CPU torch wheels; the app's "Install environments" button runs these scripts with the choice the Doctor makes (`torch: auto`).
+
+```powershell
+$env:VNDUB_ENVS_DIR = "D:\vndub-envs"; scripts\make_envs.ps1 -Env asr   # creates D:\vndub-envs\asr; the pipeline uses it
+```
+
 ## File format
 
 `envs/<env>.txt` is a pip requirements file with directives in comments:

@@ -1,19 +1,27 @@
-"""voicebank: per-character reference clips, native performer voice, RVC model, LoRA.
+"""voicebank: per-character reference clips, voice designs, performer voice, RVC model, LoRA.
 
 Order of work (one model resident at a time):
 
 1. refs (no model): 5-10 clean clips covering the character's top emotions
    -> ``voicebank/<sid>/refs/*.wav`` + ``refs.json`` + ``characters.yaml refs``.
-2. performer designs (design backend, all characters): ``n_designs`` voices x
-   ``test_sentences`` native target-language sentences.
-3. speaker embedder (all characters): refs + clean clips (character centroid,
-   EER calibration) + performer designs (selection by similarity).
-4. F0 of designs (f0 backend / core pYIN): pick the design closest to the
-   character whose median F0 is within ``max_f0_delta_semitones``.
-5. performer emotion variants (design backend again, if it takes style
-   instructions or knobs) -> ``performer.yaml``.
-6. RVC training per character with enough clean audio (rvc backend).
+2. voice designs (design backend, all characters): ``n_designs`` voices x ``test_sentences`` clips
+   (the first ``performer.sample_lines`` are the character's own translated lines). Every design is
+   kept in ``voicebank/<sid>/designs.json`` (see :mod:`vndub.stages.designs`); optionally a ``clone``
+   design (route A) when ``performer.offer_clone``. Characters without original audio (mode B, only
+   with ``synth.voice_unvoiced``) get designs from the character sheet: gender, age, names,
+   ``Character.description`` and the tuning's character note.
+3. speaker embedder (all characters): refs + clean clips (character centroid, EER calibration)
+   + design clips (similarity).
+4. F0 of designs (f0 backend / core pYIN), ranking (:func:`vndub.stages.designs.rank_score`).
+5. the performer: the design the user chose (``characters.yaml performer.design_id``) or the
+   top-ranked one -> ``performer.yaml`` (+ emotion variants from the design backend if it takes style
+   instructions or knobs).
+6. RVC training per character with enough clean audio (rvc backend; not for routes A / P).
 7. route C (optional): LoRA on route-B winners that passed the gates.
+
+The casting screen drives the same code through the public functions at the end of this module
+(:func:`list_designs`, :func:`propose_designs`, :func:`add_reference_design`, :func:`import_design`,
+:func:`choose_design`, :func:`auto_cast`, :func:`sample_lines`, :func:`train_rvc`, :func:`set_tuning`).
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ from __future__ import annotations
 import math
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,33 +38,19 @@ import numpy as np
 from vndub.backends.base import BackendUnavailable
 from vndub.backends.score.speaker_sim import calibrate_eer, centroid, cosine
 from vndub.manifest.io import Character, LineRecord, RefClip, read_json, save_characters, write_json, write_yaml
+from vndub.stages import designs as dz
 from vndub.stages import genutil as gu
 from vndub.stages.common import StageError, counter
-from vndub.text.style_prompt import StyleSpec, render
+from vndub.stages.designs import TEST_SENTENCES  # noqa: F401  (re-exported: tests and docs refer to it here)
+from vndub.text.style_prompt import StyleSpec, design_words, normalize_tuning, render
 
 NAME = "voicebank"
 VERSION = "1"
 CONFIG_SECTIONS = ("voicebank", "score", "project")
 
-TEST_SENTENCES = {
-    "ru": [
-        "Привет! Сегодня отличный день, правда?",
-        "Я не знаю, что сказать... Давай подумаем вместе.",
-        "Подожди меня, пожалуйста, я сейчас вернусь.",
-        "Это просто невероятно! Как ты это сделал?",
-        "Ну и ладно. Мне всё равно.",
-    ],
-    "en": [
-        "Hi! It's a wonderful day today, isn't it?",
-        "I don't know what to say... Let's think it over together.",
-        "Please wait for me, I'll be right back.",
-        "That's simply incredible! How did you do that?",
-        "Fine, whatever. I don't care.",
-    ],
-}
-
 _SENTENCE_END = re.compile(r"[。！？!?…」』\.]\s*$")
 N_CLIPS_FOR_CENTROID = 10
+MAX_PROPOSE = 8
 
 
 # ----------------------------------------------------------------------------
@@ -182,6 +177,38 @@ def _write_refs(ctx: Any, sid: str, chosen: list[dict[str, Any]]) -> list[RefCli
     return refs
 
 
+def _ensure_refs(ctx: Any, cache: Any, sid: str, ls: list[LineRecord], passports: dict[str, dict[str, Any]], chars: dict[str, Character]) -> list[RefClip]:
+    """Reference clips of one character (cached by the clips, their SNR and the refs config)."""
+    vb = ctx.cfg.voicebank
+    # the effective source text is part of the key: refs.json carries it (timbre_ref_text), and a set_src_text
+    # override / ASR-recovered text changes it without touching any audio
+    key = cache.key("refs", [(l.line_id, l.src_wav) for l in ls], [passports.get(l.line_id, {}).get("snr_db") for l in ls], vb.refs.model_dump(), [l.text_src for l in ls])
+    if cache.fresh(f"refs:{sid}", key, [ctx.paths.vb_refs_json(sid)]):
+        refs = gu.load_refs(ctx, sid)
+    else:
+        chosen, relaxed = select_refs(
+            ls, passports,
+            min_snr_db=vb.refs.min_snr_db, min_sec=vb.refs.min_sec, max_sec=vb.refs.max_sec,
+            per_emotion=vb.refs.per_emotion, max_total=vb.refs.max_total, min_refs=vb.refs.min_refs,
+        )
+        if relaxed:
+            ctx.log.warning("%s: fewer than %d clips meet the ref criteria; relaxed SNR/duration filters", sid, vb.refs.min_refs)
+        refs = _write_refs(ctx, sid, chosen)
+        cache.put(f"refs:{sid}", key)
+    chars[sid].refs = [r.path for r in refs]
+    return refs
+
+
+def _char_f0(ctx: Any, chars: dict[str, Character], sid: str, refs: list[RefClip]) -> float | None:
+    """Character F0: analyze's stats, else core pYIN over the reference clips."""
+    f0 = chars[sid].stats.f0_median_hz
+    if not f0 and refs:
+        res = gu.f0_of(ctx, None, [(r.path, ctx.paths.abs(r.path), ctx.paths.vb(sid) / "feat" / f"{Path(r.path).stem}.f0.npy") for r in refs])
+        vals = [m for m in (gu.median_f0(v) for v in res.values()) if m]
+        f0 = float(np.median(vals)) if vals else None
+    return f0
+
+
 # ----------------------------------------------------------------------------
 # performer description
 # ----------------------------------------------------------------------------
@@ -220,6 +247,387 @@ def performer_description(char: Character, lang: str) -> str:
     return ", ".join(parts) + "."
 
 
+def design_prompt(char: Character, lang: str, description: str | None = None, index: int = 0) -> str:
+    """Voice-design prompt: the character sheet (gender, age, pitch, emotion profile), the free-text
+    description, the tuning's timbre preset / character note, and a small variation hint per design
+    index (the first design of a character has none)."""
+    parts = [performer_description(char, lang)]
+    extra = (char.description if description is None else description or "").strip()
+    if extra:
+        parts.append(f"Character: {extra.rstrip('.')}.")
+    words = design_words((char.performer or {}).get("tuning"))
+    if words:
+        parts.append(f"{words}.")
+    hint = dz.VARIANT_HINTS[index % len(dz.VARIANT_HINTS)]
+    if hint:
+        parts.append(f"Voice: {hint}.")
+    return " ".join(parts)
+
+
+# ----------------------------------------------------------------------------
+# progress
+# ----------------------------------------------------------------------------
+
+
+class _Ticker:
+    """Monotonic progress over the stage's work units (``ctx.progress(done, total, item)``)."""
+
+    def __init__(self, ctx: Any, total: int) -> None:
+        self.ctx, self.total, self.done = ctx, max(1, int(total)), 0
+
+    def __call__(self, item: str | None = None) -> None:
+        self.done = min(self.total, self.done + 1)
+        self.ctx.progress(self.done, self.total, item)
+
+
+# ----------------------------------------------------------------------------
+# rendering designs
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class _DesignJob:
+    sid: str
+    design_id: str
+    index: int
+    seed: int
+    prompt: str
+    description: str
+    audition: list[dict[str, str]]
+    extra: list[dict[str, str]]
+    knobs: dict[str, Any] | None = None
+    origin: str = "stage"
+
+
+def _f0_hint(char: Character, char_f0: float | None) -> float:
+    if char_f0:
+        return float(char_f0)
+    return {"f": 230.0, "m": 120.0}.get(char.gender, 200.0)
+
+
+def _plan_designs(
+    ctx: Any, sid: str, char: Character, existing: list[dict[str, Any]], n: int, char_f0: float | None,
+    description: str | None = None, line_ids: list[str] | None = None, origin: str = "stage",
+) -> list[_DesignJob]:
+    """Jobs for ``n`` new voice designs of one character (ids and seeds continue after ``existing``)."""
+    vb = ctx.cfg.voicebank.performer
+    lang = ctx.cfg.project.tgt_lang
+    total = max(1, vb.test_sentences)
+    n_aud = min(max(0, vb.sample_lines), total) or min(1, total)
+    audition = dz.sample_items(ctx, sid, n_aud, line_ids)
+    extra = dz.test_sentence_items(lang, total - len(audition), skip={a["text"] for a in audition})
+    prior = [d for d in existing if d.get("kind") == "voice_design" and d.get("design_index") is not None]
+    base = max([int(d["design_index"]) for d in prior], default=-1) + 1
+    jobs: list[_DesignJob] = []
+    taken = list(existing)
+    for j in range(n):
+        idx = base + j
+        if base == 0:
+            factor = 1.0 if n <= 1 else 0.85 + 0.3 * j / (n - 1)
+        else:  # later batches: low-discrepancy spread so local (mock / SAPI) voices differ too
+            factor = 0.85 + 0.3 * ((idx * 0.6180339887) % 1.0)
+        did = dz.next_design_id(ctx, sid, taken, "vd")
+        taken.append({"design_id": did})
+        jobs.append(
+            _DesignJob(
+                sid=sid, design_id=did, index=idx, seed=ctx.cfg.synth.seed_base + gu.stable_seed("performer", sid, idx),
+                prompt=design_prompt(char, lang, description, idx),
+                description=(char.description if description is None else description or "").strip(),
+                audition=audition, extra=extra, knobs={"f0_hz": _f0_hint(char, char_f0) * factor, "gender": char.gender}, origin=origin,
+            )
+        )
+    return jobs
+
+
+def _render_designs(ctx: Any, backend: Any, jobs: list[_DesignJob], tick: Any = None) -> list[dict[str, Any]]:
+    """Render the clips of each job (one design backend call per design); returns the new Design dicts."""
+    lang = ctx.cfg.project.tgt_lang
+    spec = backend.spec
+    out: list[dict[str, Any]] = []
+    for job in jobs:
+        ddir = dz.design_dir(ctx, job.sid, job.design_id)
+        shutil.rmtree(ddir, ignore_errors=True)
+        items, meta = [], {}
+        for tag, group in (("s", job.audition), ("r", job.extra)):
+            for t, row in enumerate(group):
+                iid = f"{job.sid}|{job.design_id}|{tag}{t}"
+                it = {"id": iid, "text": row["text"], "description": job.prompt, "instruct": job.prompt, "lang": lang, "seed": job.seed, "out": str(ddir / f"{tag}{t}.wav")}
+                if spec.env is None and job.knobs:  # local backends (mock / SAPI) take pitch hints
+                    it["knobs"] = dict(job.knobs)
+                items.append(it)
+                meta[iid] = (tag, row)
+        results = gu.run_batched(backend, "design", items, chunk=max(1, len(items)))
+        samples, refs_extra = [], []
+        for it, r in zip(items, results):
+            tag, row = meta[it["id"]]
+            wav = Path(it["out"])
+            if r.get("error") or not wav.exists():
+                ctx.log.warning("design %s failed: %s", it["id"], r.get("error", "no audio"))
+                continue
+            if tag == "s":
+                samples.append({"line_id": row["line_id"], "wav": ctx.paths.rel(wav), "text": row["text"]})
+            else:
+                refs_extra.append({"wav": ctx.paths.rel(wav), "text": row["text"]})
+        if tick is not None:
+            tick(job.design_id)
+        if not samples and not refs_extra:
+            shutil.rmtree(ddir, ignore_errors=True)
+            continue
+        out.append(
+            {
+                "design_id": job.design_id, "kind": "voice_design", "backend": spec.name, "prompt": job.prompt,
+                "description": job.description, "samples": samples, "ref_clips": refs_extra,
+                "spk_sim": None, "f0_median_hz": None, "f0_delta_st": None, "rank_score": -1.0,
+                "license": spec.license, "commercial_ok": bool(spec.commercial_ok), "created": gu.ts_now(),
+                "origin": job.origin, "seed": job.seed, "design_index": job.index,
+            }
+        )
+    return out
+
+
+def _tts_backend(ctx: Any) -> tuple[Any, str, dict[str, Any]] | None:
+    """The first usable synth TTS backend (the one that clones a reference): (handle, name, options)."""
+    for name in ctx.cfg.enabled_backends():
+        opts = gu.backend_options(ctx.cfg, name)
+        b, used, _ = gu.acquire_first(ctx, [name], opts or None)
+        if b is not None:
+            return b, used or name, opts
+    return None
+
+
+def _render_cloned(
+    ctx: Any, sid: str, design_id: str, kind: str, timbre_ref: Path, timbre_text: str | None, audition: list[dict[str, str]],
+    char: Character, char_f0: float | None, cross_lingual: bool, origin: str, extra: dict[str, Any] | None = None, tick: Any = None,
+) -> dict[str, Any] | None:
+    """A design whose audition clips are the audition lines spoken by a zero-shot clone of ``timbre_ref``."""
+    got = _tts_backend(ctx)
+    if got is None:
+        ctx.log.warning("%s: no usable TTS backend for the %s design", sid, kind)
+        return None
+    backend, bname, bopts = got
+    caps = backend.spec.caps or {}
+    lang = ctx.cfg.project.tgt_lang
+    spec = StyleSpec()
+    rendered = render(spec, caps, bopts, cross_lingual=cross_lingual)
+    ddir = dz.design_dir(ctx, sid, design_id)
+    ddir.mkdir(parents=True, exist_ok=True)
+    items = []
+    for t, row in enumerate(audition):
+        text = (rendered["text_prefix"] + " " + row["text"]).strip() if rendered["text_prefix"] else row["text"]
+        knobs = dict(rendered["knobs"] or {})
+        if backend.spec.env is None:
+            knobs.setdefault("f0_hz", _f0_hint(char, char_f0))
+            knobs.setdefault("gender", char.gender)
+        items.append(
+            {
+                "id": f"{sid}|{design_id}|s{t}", "text": text, "lang": lang, "timbre_ref": str(timbre_ref), "timbre_ref_text": timbre_text,
+                "emotion_ref": str(timbre_ref), "instruct": rendered["instruct"], "knobs": knobs,
+                "seed": ctx.cfg.synth.seed_base + gu.stable_seed("design", sid, design_id, t), "target_duration": None, "out": str(ddir / f"s{t}.wav"),
+            }
+        )
+    results = gu.run_batched(backend, "synthesize", items, chunk=max(1, len(items)))
+    samples = []
+    for it, r, row in zip(items, results, audition):
+        if r.get("error") or not Path(it["out"]).exists():
+            ctx.log.warning("%s design %s failed: %s", kind, it["id"], r.get("error", "no audio"))
+            continue
+        samples.append({"line_id": row["line_id"], "wav": ctx.paths.rel(it["out"]), "text": row["text"]})
+    if tick is not None:
+        tick(design_id)
+    if not samples:
+        return None
+    d = {
+        "design_id": design_id, "kind": kind, "backend": bname, "prompt": "", "description": "", "samples": samples, "ref_clips": [],
+        "spk_sim": None, "f0_median_hz": None, "f0_delta_st": None, "rank_score": -1.0,
+        "license": backend.spec.license, "commercial_ok": bool(backend.spec.commercial_ok), "created": gu.ts_now(), "origin": origin,
+    }
+    d.update(extra or {})
+    return d
+
+
+def _clone_design(ctx: Any, sid: str, char: Character, refs: list[RefClip], char_f0: float | None, audition: list[dict[str, str]], origin: str, tick: Any = None) -> dict[str, Any] | None:
+    """The route-A design: the audition lines in a zero-shot clone of the character's best timbre reference."""
+    pool = [r for r in refs if r.usage in ("timbre", "both")] or refs
+    if not pool:
+        return None
+    best = max(pool, key=lambda r: float(r.snr or 0.0))
+    return _render_cloned(
+        ctx, sid, "clone", "clone", ctx.paths.abs(best.path), best.text or None, audition, char, char_f0, cross_lingual=True, origin=origin,
+        extra={"ref_line_id": best.line_id}, tick=tick,
+    )
+
+
+# ----------------------------------------------------------------------------
+# scoring designs
+# ----------------------------------------------------------------------------
+
+
+def _ref_clip_jobs(ctx: Any, sid: str, refs: list[RefClip], ls: list[LineRecord], passports: dict[str, dict[str, Any]], emb_name: str) -> list[tuple[str, Path, Path]]:
+    """Embedding jobs of the character itself: reference clips + the cleanest original clips."""
+    edir = ctx.paths.vb(sid) / "emb"
+    jobs = [(f"ref|{sid}|{r.path}", ctx.paths.abs(r.path), edir / f"ref_{Path(r.path).stem}.{emb_name}.npy") for r in refs]
+    clean = sorted((l for l in ls if l.src_wav16 or l.src_wav), key=lambda l: -float((passports.get(l.line_id) or {}).get("snr_db") or 0.0))[:N_CLIPS_FOR_CENTROID]
+    for l in clean:
+        jobs.append((f"clip|{sid}|{l.line_id}", ctx.paths.abs(l.src_wav16 or l.src_wav), edir / f"clip_{l.line_id}.{emb_name}.npy"))
+    return jobs
+
+
+def _design_clip_jobs(ctx: Any, sid: str, ds: list[dict[str, Any]], emb_name: str) -> list[tuple[str, Path, Path]]:
+    jobs = []
+    for d in ds:
+        for p in dz.clip_paths(ctx, d):
+            if p.exists():
+                jobs.append((f"design|{sid}|{d['design_id']}|{p.name}", p, p.with_suffix(f".{emb_name}.npy")))
+    return jobs
+
+
+def _score_designs(
+    ctx: Any, sid: str, ds: list[dict[str, Any]], char: Character, char_f0: float | None, vecs: dict[str, np.ndarray],
+    char_centroid: np.ndarray | None, emb_name: str | None, f0_backend: Any,
+) -> None:
+    """Fill spk_sim / F0 / rank_score of ``ds`` in place (``vecs``: embedding vectors by job key)."""
+    max_delta = ctx.cfg.voicebank.performer.max_f0_delta_semitones
+    jobs = [(f"{d['design_id']}|{p.name}", p, p.with_suffix(".f0.npy")) for d in ds for p in dz.clip_paths(ctx, d) if p.exists()]
+    f0s = gu.f0_of(ctx, f0_backend, jobs)
+    for d in ds:
+        clips = [p for p in dz.clip_paths(ctx, d) if p.exists()]
+        meds = [m for m in (gu.median_f0(f0s.get(f"{d['design_id']}|{p.name}")) for p in clips) if m]
+        d["f0_median_hz"] = float(np.median(meds)) if meds else None
+        d["f0_delta_st"] = gu.semitone_delta(d["f0_median_hz"], char_f0)
+        dv = [vecs[k] for k in (f"design|{sid}|{d['design_id']}|{p.name}" for p in clips) if k in vecs]
+        d["spk_sim"] = cosine(centroid(dv), char_centroid) if dv and char_centroid is not None else None
+        if emb_name:
+            d["embedder"] = emb_name
+        d["rank_score"] = dz.rank_score(d["spk_sim"], d["f0_delta_st"], max_delta)
+
+
+def _measure_new_designs(ctx: Any, sid: str, char: Character, new: list[dict[str, Any]], has_audio: bool) -> None:
+    """API path (casting screen): embed + F0 + rank the designs just created for one character."""
+    emb_backend, emb_name, emb_reason = gu.acquire_first(ctx, [ctx.cfg.score.speaker]) if has_audio else (None, None, "no original audio")
+    centroid_vec = None
+    vecs: dict[str, np.ndarray] = {}
+    char_f0 = char.stats.f0_median_hz
+    if emb_backend is not None:
+        jobs: list[tuple[str, Path, Path]] = []
+        ref_keys: list[str] = []
+        if has_audio:
+            ls = [l for l in ctx.voiced_lines(apply_only=False) if l.speaker_id == sid]
+            passports = {l.line_id: p for l in ls if (p := gu.load_passport(ctx, l.line_id))}
+            refs = gu.load_refs(ctx, sid)
+            if not refs and ls:
+                cache = ctx.cache(NAME, VERSION, "voicebank", "score", "project")
+                chars = {sid: char}
+                refs = _ensure_refs(ctx, cache, sid, ls, passports, chars)
+                cache.save()
+            char_f0 = char_f0 or _char_f0(ctx, {sid: char}, sid, refs)
+            jobs = _ref_clip_jobs(ctx, sid, refs, ls, passports, emb_name)
+            ref_keys = [j[0] for j in jobs]
+        jobs += _design_clip_jobs(ctx, sid, new, emb_name)
+        vecs = gu.embed_paths(ctx, emb_backend, jobs)
+        own = [vecs[k] for k in ref_keys if k in vecs]
+        centroid_vec = centroid(own) if own else None
+    elif has_audio:
+        ctx.log.warning("speaker embedder unavailable (%s): designs are ranked by F0 only", emb_reason)
+    # the F0 of a design only matters against a character's F0: without original audio the cheap core pYIN is enough
+    f0_backend = gu.acquire_first(ctx, [ctx.cfg.analyze.f0])[0] if has_audio else None
+    _score_designs(ctx, sid, new, char, char_f0 if has_audio else None, vecs, centroid_vec, emb_name, f0_backend)
+
+
+# ----------------------------------------------------------------------------
+# performer (what synth reads: performer.yaml) from a design
+# ----------------------------------------------------------------------------
+
+
+def _ref_emotion_from_name(stem: str) -> str:
+    from vndub.text.style_prompt import ALL_EMOTIONS
+
+    head = stem.split("_", 1)[0].lower()
+    return head if head in ALL_EMOTIONS else "neutral"
+
+
+def _write_performer(ctx: Any, sid: str, d: dict[str, Any], chars: dict[str, Character], chosen_by: str) -> dict[str, Any]:
+    """performer.yaml + performer/*.wav from a design, and the character's ``performer`` record."""
+    c = chars[sid]
+    pdir = ctx.paths.vb(sid) / "performer"
+    pdir.mkdir(parents=True, exist_ok=True)
+    for p in pdir.glob("*.wav"):  # the previous design's clips and emotion variants
+        p.unlink()
+    refs = []
+    for i, clip in enumerate(dz.performer_clips(ctx, d)):
+        dst = pdir / f"neutral_{i + 1:02d}.wav"
+        shutil.copy2(clip["src"], dst)
+        refs.append({"path": ctx.paths.rel(dst), "emotion": clip.get("emotion", "neutral"), "text": clip["text"]})
+    for v in d.get("variants") or []:
+        src = ctx.paths.abs(v["wav"])
+        if src.exists():
+            dst = pdir / f"{v['emotion']}_01.wav"
+            shutil.copy2(src, dst)
+            refs.append({"path": ctx.paths.rel(dst), "emotion": v["emotion"], "text": v.get("text", "")})
+    f0, sim, delta = d.get("f0_median_hz"), d.get("spk_sim"), d.get("f0_delta_st")
+    max_delta = ctx.cfg.voicebank.performer.max_f0_delta_semitones
+    perf = {
+        "kind": "reference" if d.get("kind") == "reference" else "voice_design",
+        "backend": d.get("backend", ""),
+        "description": d.get("prompt") or d.get("description") or "",
+        "seed": d.get("seed"),
+        "design_index": d.get("design_index"),
+        "design_id": d["design_id"],
+        "refs": refs,
+        "f0_median_hz": None if f0 is None else round(float(f0), 2),
+        "spk_sim": None if sim is None else round(float(sim), 4),
+        "f0_delta_st": None if delta is None else round(float(delta), 2),
+        "embedder": d.get("embedder"),
+        "warnings": ["f0 outside window"] if delta is not None and abs(delta) > max_delta else [],
+        "source": chosen_by,
+        "variants_done": "variants" in d,
+    }
+    write_yaml(ctx.paths.vb_performer(sid), perf)
+    tuning = (c.performer or {}).get("tuning")
+    c.performer = {k: perf[k] for k in ("kind", "backend", "description", "f0_median_hz", "spk_sim", "f0_delta_st")}
+    c.performer.update(path=ctx.paths.rel(ctx.paths.vb_performer(sid)), design_id=d["design_id"], chosen_by=chosen_by)
+    if tuning:
+        c.performer["tuning"] = tuning
+    return perf
+
+
+def _performer_key(cache: Any, sid: str, vb: Any, char_f0: dict[str, Any], chars: dict[str, Character]) -> str:
+    c = chars[sid]
+    parts: list[Any] = [vb.performer.model_dump(), char_f0.get(sid), c.gender, c.age_hint, c.stats.emotion_hist]
+    words = design_words((c.performer or {}).get("tuning"))
+    if c.description:
+        parts.append(c.description)
+    if words:
+        parts.append(words)
+    return cache.key("performer", *parts)
+
+
+def _performer_refs_ok(ctx: Any, perf: dict[str, Any] | None) -> bool:
+    return bool(perf) and bool(perf.get("refs")) and all(ctx.paths.abs(r["path"]).exists() for r in perf["refs"])
+
+
+def _performer_state(ctx: Any, cache: Any, sid: str, vb: Any, char_f0: dict[str, Any], chars: dict[str, Character]) -> str:
+    """``fresh`` | ``write`` (rewrite performer.yaml from the chosen design) | ``variants`` | ``regen`` (new designs).
+
+    A design the user chose is never replaced by a config change: it is only (re)written from its design
+    entry and given emotion variants when it has none. A stage-picked performer is recomputed when its key changes.
+    """
+    perf = gu.load_performer(ctx, sid)
+    ch = chars[sid].performer or {}
+    if ch.get("chosen_by") == "user" and ch.get("design_id"):
+        d = dz.get_design(ctx, sid, ch["design_id"])
+        if d is not None:
+            if d["kind"] == "clone":
+                return "fresh"  # route A: the performer is not used
+            if not (_performer_refs_ok(ctx, perf) and perf.get("design_id") == d["design_id"]):
+                return "write"
+            if d["kind"] == "voice_design" and not perf.get("variants_done"):
+                return "variants"
+            return "fresh"
+    if not _performer_refs_ok(ctx, perf):
+        return "regen"
+    return "fresh" if cache.fresh(f"performer:{sid}", _performer_key(cache, sid, vb, char_f0, chars), [ctx.paths.vb_performer(sid)]) else "regen"
+
+
 # ----------------------------------------------------------------------------
 # stage
 # ----------------------------------------------------------------------------
@@ -228,26 +636,36 @@ def performer_description(char: Character, lang: str) -> str:
 def run(ctx: Any) -> dict[str, Any]:
     vb = ctx.cfg.voicebank
     lang = ctx.cfg.project.tgt_lang
-    lines = ctx.voiced_lines(apply_only=False)
-    if not lines:
+    voiced = ctx.voiced_lines(apply_only=False)
+    unvoiced_on = bool(ctx.cfg.synth.voice_unvoiced)
+    dub = ctx.dub_lines(apply_only=False) if unvoiced_on else voiced
+    if not voiced and not any(not l.has_voice for l in dub):
         raise StageError("no voiced lines: run parse/extract (and analyze) first")
     chars = ctx.characters()
     by_spk: dict[str, list[LineRecord]] = {}
-    for l in lines:
+    for l in voiced:
         if l.speaker_id == "narrator":
             continue
         by_spk.setdefault(l.speaker_id, []).append(l)
+    unvoiced_raw: dict[str, str] = {}
+    if unvoiced_on:
+        for l in dub:
+            if not l.has_voice and l.speaker_id != "narrator":
+                unvoiced_raw.setdefault(l.speaker_id, l.speaker_raw or l.speaker_id)
     if ctx.only:
         sel = {s for s in by_spk if s in ctx.only}
         if sel:
             by_spk = {s: by_spk[s] for s in sel}
+        only_u = {s for s in unvoiced_raw if s in ctx.only}
+        if only_u or sel:
+            unvoiced_raw = {s: r for s, r in unvoiced_raw.items() if s in only_u}
     passports: dict[str, dict[str, Any]] = {}
     for spk_lines in by_spk.values():
         for l in spk_lines:
             p = gu.load_passport(ctx, l.line_id)
             if p:
                 passports[l.line_id] = p
-    if not passports:
+    if not passports and by_spk:
         ctx.log.warning("no passports found: refs use durations only (run analyze for emotion/SNR-aware selection)")
 
     cache = ctx.cache(NAME, VERSION, "voicebank", "score", "project")
@@ -264,218 +682,207 @@ def run(ctx: Any) -> dict[str, Any]:
         eligible[sid] = ls
         chars.setdefault(sid, Character(names={"src": ls[0].speaker_raw or sid, "tgt": ""}))
     summary["characters"] = len(eligible)
+    # mode B: characters with dub lines but no usable original audio (designed from the character sheet)
+    mode_b = [sid for sid in unvoiced_raw if sid not in eligible]
+    for sid in mode_b:
+        chars.setdefault(sid, Character(names={"src": unvoiced_raw[sid], "tgt": ""}))
+        if chars[sid].route is None:
+            chars[sid].route = "P"
+    if mode_b:
+        summary["mode_b"] = mode_b
+    perf_chars = [*eligible, *mode_b]
+    n_rvc = len(eligible) if vb.rvc.enabled else 0
+    tick = _Ticker(ctx, len(eligible) + len(perf_chars) + n_rvc)
 
     # 1. refs -------------------------------------------------------------------
     refs: dict[str, list[RefClip]] = {}
     for sid, ls in eligible.items():
-        key = cache.key("refs", [(l.line_id, l.src_wav) for l in ls], [passports.get(l.line_id, {}).get("snr_db") for l in ls], vb.refs.model_dump())
-        if cache.fresh(f"refs:{sid}", key, [ctx.paths.vb_refs_json(sid)]):
-            refs[sid] = gu.load_refs(ctx, sid)
-        else:
-            chosen, relaxed = select_refs(
-                ls, passports,
-                min_snr_db=vb.refs.min_snr_db, min_sec=vb.refs.min_sec, max_sec=vb.refs.max_sec,
-                per_emotion=vb.refs.per_emotion, max_total=vb.refs.max_total, min_refs=vb.refs.min_refs,
-            )
-            if relaxed:
-                ctx.log.warning("%s: fewer than %d clips meet the ref criteria; relaxed SNR/duration filters", sid, vb.refs.min_refs)
-            refs[sid] = _write_refs(ctx, sid, chosen)
-            cache.put(f"refs:{sid}", key)
-        chars[sid].refs = [r.path for r in refs[sid]]
+        refs[sid] = _ensure_refs(ctx, cache, sid, ls, passports, chars)
         summary["refs"] += len(refs[sid])
+        tick(sid)
 
-    # character F0 (stats from analyze, else core pYIN over the refs)
-    char_f0: dict[str, float | None] = {}
-    for sid in eligible:
-        f0 = chars[sid].stats.f0_median_hz
-        if not f0 and refs[sid]:
-            res = gu.f0_of(ctx, None, [(r.path, ctx.paths.abs(r.path), ctx.paths.vb(sid) / "feat" / f"{Path(r.path).stem}.f0.npy") for r in refs[sid]])
-            vals = [m for m in (gu.median_f0(v) for v in res.values()) if m]
-            f0 = float(np.median(vals)) if vals else None
-        char_f0[sid] = f0
+    char_f0: dict[str, float | None] = {sid: _char_f0(ctx, chars, sid, refs[sid]) for sid in eligible}
+    for sid in mode_b:
+        char_f0[sid] = chars[sid].stats.f0_median_hz
 
-    # 2. performer designs ------------------------------------------------------
+    # 2. voice designs ----------------------------------------------------------
     perf_kind = vb.performer.kind
-    sentences = TEST_SENTENCES.get(lang, TEST_SENTENCES["en"])[: max(1, vb.performer.test_sentences)]
-    designs: dict[str, list[dict[str, Any]]] = {}  # sid -> [{d, seed, description, clips:[(path,text)]}]
+    state = {sid: _performer_state(ctx, cache, sid, vb, char_f0, chars) for sid in perf_chars}
+    regen = [sid for sid in perf_chars if state[sid] == "regen"]
     performer_reason: dict[str, str] = {}
     design_backend_name = None
     design_caps: dict[str, Any] = {}
-    need_perf = [sid for sid in eligible if not _performer_fresh(ctx, cache, sid, vb, char_f0, chars)]
-    if perf_kind == "voice_design" and need_perf:
+    kept: dict[str, list[dict[str, Any]]] = {}  # sid -> designs that stay (user's, imported, the chosen one)
+    new: dict[str, list[dict[str, Any]]] = {}  # sid -> designs rendered in this run
+    for sid in regen:
+        chosen_id = (chars[sid].performer or {}).get("design_id") if (chars[sid].performer or {}).get("chosen_by") == "user" else None
+        old = dz.load_designs(ctx, sid)
+        kept[sid] = [d for d in old if d.get("origin") != "stage" or d["design_id"] == chosen_id]
+        for d in old:
+            if d not in kept[sid]:
+                dz.remove_design_files(ctx, sid, d["design_id"])
+        new[sid] = []
+    if perf_kind == "voice_design" and regen:
         backend, design_backend_name, reason = gu.acquire_first(ctx, [vb.performer.backend])
         if backend is None:
-            for sid in need_perf:
+            for sid in regen:
                 performer_reason[sid] = f"design backend unavailable: {reason}"
         else:
             design_caps = dict(backend.spec.caps)
-            items = []
-            for sid in need_perf:
-                c = chars[sid]
-                desc = performer_description(c, lang)
-                designs[sid] = []
-                for d in range(max(1, vb.performer.n_designs)):
-                    seed = ctx.cfg.synth.seed_base + gu.stable_seed("performer", sid, d)
-                    factor = 1.0 if vb.performer.n_designs <= 1 else 0.85 + 0.3 * d / (vb.performer.n_designs - 1)
-                    entry = {"d": d, "seed": seed, "description": desc, "clips": []}
-                    for t, text in enumerate(sentences):
-                        out = ctx.paths.vb(sid) / "performer" / "designs" / f"d{d}_s{t}.wav"
-                        it = {"id": f"{sid}|{d}|{t}", "text": text, "description": desc, "instruct": desc, "lang": lang, "seed": seed, "out": str(out)}
-                        if backend.spec.env is None:  # local backends (mock/sapi) take pitch hints
-                            it["knobs"] = {"f0_hz": (char_f0[sid] or 200.0) * factor, "gender": c.gender}
-                        items.append(it)
-                        entry["clips"].append((out, text))
-                    designs[sid].append(entry)
-            results = gu.run_batched(backend, "design", items, chunk=8)
-            failed = {r["id"] for r in results if r.get("error")}
-            for r in results:
-                if r.get("error"):
-                    ctx.log.warning("design %s failed: %s", r["id"], r["error"])
-            for sid in list(designs):
-                for entry in designs[sid]:
-                    entry["clips"] = [(p, t) for i, (p, t) in enumerate(entry["clips"]) if f"{sid}|{entry['d']}|{i}" not in failed and p.exists()]
-                designs[sid] = [e for e in designs[sid] if e["clips"]]
-                if not designs[sid]:
+            for sid in regen:
+                jobs = _plan_designs(ctx, sid, chars[sid], kept[sid], max(1, vb.performer.n_designs), char_f0.get(sid))
+                new[sid] = _render_designs(ctx, backend, jobs)
+                if not new[sid]:
                     performer_reason[sid] = "all performer designs failed"
-    elif perf_kind == "reference" and need_perf:
-        for sid in need_perf:
+    elif perf_kind == "reference" and regen:
+        for sid in regen:
             src_dir = Path(ctx.cfg.resolve(vb.performer.reference_dir)) / sid if vb.performer.reference_dir else None
             clips = sorted(src_dir.glob("*.wav")) if src_dir and src_dir.exists() else []
             if not clips:
                 performer_reason[sid] = f"no native reference clips in {src_dir}"
                 continue
-            designs[sid] = [{"d": 0, "seed": None, "description": f"reference clips from {src_dir}", "clips": [(p, "") for p in clips], "reference": True}]
+            did = dz.next_design_id(ctx, sid, kept[sid], "ref")
+            ddir = dz.design_dir(ctx, sid, did)
+            samples = []
+            for i, p in enumerate(clips):
+                dst = ddir / f"s{i}.wav"
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, dst)
+                samples.append({"line_id": "", "wav": ctx.paths.rel(dst), "text": "", "emotion": _ref_emotion_from_name(p.stem)})
+            new[sid] = [
+                {
+                    "design_id": did, "kind": "reference", "backend": "reference", "prompt": "", "description": f"reference clips from {src_dir}",
+                    "samples": samples, "ref_clips": [], "spk_sim": None, "f0_median_hz": None, "f0_delta_st": None, "rank_score": -1.0,
+                    "license": "user-supplied", "commercial_ok": True, "created": gu.ts_now(), "origin": "stage", "seed": None, "design_index": 0,
+                }
+            ]
+    if vb.performer.offer_clone and perf_kind == "voice_design":
+        for sid in regen:
+            if sid in eligible and not any(d["design_id"] == "clone" for d in kept[sid]) and sid not in performer_reason:
+                aud = dz.sample_items(ctx, sid, max(1, vb.performer.sample_lines))
+                clone = _clone_design(ctx, sid, chars[sid], refs[sid], char_f0.get(sid), aud, "stage")
+                if clone is not None:
+                    new[sid].append(clone)
 
-    # 3. embeddings: refs + clean clips (centroid, calibration) + designs ---------
-    emb_backend, emb_name, emb_reason = gu.acquire_first(ctx, [ctx.cfg.score.speaker])
+    # 3. embeddings: refs + clean clips (centroid, calibration) + design clips ------
+    # (characters without original audio have nothing to compare with: no embedder for them)
+    emb_backend, emb_name, emb_reason = gu.acquire_first(ctx, [ctx.cfg.score.speaker]) if eligible else (None, None, "no character with original audio")
     centroids: dict[str, np.ndarray] = {}
     ref_vecs: dict[str, list[np.ndarray]] = {}
-    design_vecs: dict[str, dict[int, np.ndarray]] = {}
+    design_vecs: dict[str, dict[str, np.ndarray]] = {}
     if emb_backend is not None:
-        jobs = []
         for sid in eligible:
-            edir = ctx.paths.vb(sid) / "emb"
-            for r in refs[sid]:
-                jobs.append((f"ref|{sid}|{r.path}", ctx.paths.abs(r.path), edir / f"ref_{Path(r.path).stem}.{emb_name}.npy"))
-            clean = sorted(
-                (l for l in eligible[sid] if l.src_wav16 or l.src_wav),
-                key=lambda l: -float((passports.get(l.line_id) or {}).get("snr_db") or 0.0),
-            )[:N_CLIPS_FOR_CENTROID]
-            for l in clean:
-                wav = ctx.paths.abs(l.src_wav16 or l.src_wav)
-                jobs.append((f"clip|{sid}|{l.line_id}", wav, edir / f"clip_{l.line_id}.{emb_name}.npy"))
-            for entry in designs.get(sid, []):
-                for p, _ in entry["clips"]:
-                    jobs.append((f"design|{sid}|{entry['d']}|{p.name}", p, p.with_suffix(f".{emb_name}.npy")))
-        vecs = gu.embed_paths(ctx, emb_backend, jobs)
-        for sid in eligible:
-            rv = [v for k, v in vecs.items() if k.startswith(f"ref|{sid}|")]
-            cv = [v for k, v in vecs.items() if k.startswith(f"clip|{sid}|")]
-            ref_vecs[sid] = rv + cv
+            jobs = _ref_clip_jobs(ctx, sid, refs[sid], eligible[sid], passports, emb_name)
+            ref_keys = [j[0] for j in jobs]
+            jobs += _design_clip_jobs(ctx, sid, new.get(sid, []), emb_name)
+            vecs = gu.embed_paths(ctx, emb_backend, jobs)
+            ref_vecs[sid] = [vecs[k] for k in ref_keys if k in vecs]
             if ref_vecs[sid]:
                 centroids[sid] = centroid(ref_vecs[sid])
                 np.save(ctx.paths.vb(sid) / f"centroid.{emb_name}.npy", centroids[sid])
-            design_vecs[sid] = {}
-            for entry in designs.get(sid, []):
-                dv = [v for k, v in vecs.items() if k.startswith(f"design|{sid}|{entry['d']}|")]
-                if dv:
-                    design_vecs[sid][entry["d"]] = centroid(dv)
+            design_vecs[sid] = {k: v for k, v in vecs.items() if k.startswith("design|")}
         if vb.calibrate_spk:
             summary["calibration"] = _calibrate(ctx, emb_name, ref_vecs)
-    else:
+    elif eligible:
         ctx.log.warning("speaker embedder unavailable (%s): no calibration, performer chosen by F0 only", emb_reason)
         summary["calibration"] = f"unavailable: {emb_reason}"
 
-    # 4. F0 of designs + performer choice ----------------------------------------
+    # 4. F0 + ranking + choice --------------------------------------------------
     f0_backend = None
-    if designs:
+    if any(new.get(sid) for sid in eligible):  # characters without audio use the cheap core pYIN
         f0_backend, _, _ = gu.acquire_first(ctx, [ctx.cfg.analyze.f0])
-    chosen_design: dict[str, dict[str, Any]] = {}
-    for sid, entries in designs.items():
-        jobs = [(f"{entry['d']}|{p.name}", p, p.with_suffix(".f0.npy")) for entry in entries for p, _ in entry["clips"]]
-        f0s = gu.f0_of(ctx, f0_backend, jobs)
-        scored = []
-        for entry in entries:
-            meds = [m for m in (gu.median_f0(f0s.get(f"{entry['d']}|{p.name}")) for p, _ in entry["clips"]) if m]
-            entry["f0_median_hz"] = float(np.median(meds)) if meds else None
-            entry["f0_delta_st"] = gu.semitone_delta(entry["f0_median_hz"], char_f0.get(sid))
-            sim = None
-            if sid in centroids and entry["d"] in design_vecs.get(sid, {}):
-                sim = cosine(design_vecs[sid][entry["d"]], centroids[sid])
-            entry["spk_sim"] = sim
-            scored.append(entry)
-        within = [e for e in scored if e["f0_delta_st"] is None or abs(e["f0_delta_st"]) <= vb.performer.max_f0_delta_semitones]
-        pool = within or scored
-        if not within:
-            ctx.log.warning("%s: no performer design within %.1f st of the character F0; using the closest overall", sid, vb.performer.max_f0_delta_semitones)
-        best = max(pool, key=lambda e: (e["spk_sim"] if e["spk_sim"] is not None else -1.0, -abs(e["f0_delta_st"] or 0.0)))
-        best["warning"] = "" if within else "f0 outside window"
-        chosen_design[sid] = best
+    picked: dict[str, dict[str, Any]] = {}  # sid -> design the performer is written from
+    for sid in regen:
+        ds = new[sid]
+        if ds:
+            _score_designs(
+                ctx, sid, ds, chars[sid], char_f0.get(sid) if sid in eligible else None, design_vecs.get(sid, {}), centroids.get(sid), emb_name, f0_backend,
+            )
+        allds = [*kept[sid], *ds]
+        if not allds:
+            tick(sid)
+            continue
+        dz.save_designs(ctx, sid, allds)
+        chosen_id = (chars[sid].performer or {}).get("design_id") if (chars[sid].performer or {}).get("chosen_by") == "user" else None
+        pool = [d for d in allds if d["kind"] != "clone"]
+        pick = next((d for d in pool if d["design_id"] == chosen_id), None) if chosen_id else None
+        if pick is None and pool:
+            pick = max(pool, key=lambda d: d["rank_score"])  # max() keeps the first of equals: creation order
+            max_delta = vb.performer.max_f0_delta_semitones
+            if not any(d.get("f0_delta_st") is None or abs(d["f0_delta_st"]) <= max_delta for d in pool):
+                ctx.log.warning("%s: no performer design within %.1f st of the character F0; using the closest overall", sid, max_delta)
+        if pick is not None:
+            picked[sid] = pick
+        tick(sid)
+    for sid in perf_chars:
+        if state[sid] in ("write", "variants"):
+            ch = chars[sid].performer or {}
+            d = dz.get_design(ctx, sid, ch.get("design_id", ""))
+            if d is not None:
+                picked[sid] = d
+            tick(sid)
+        elif state[sid] == "fresh":
+            tick(sid)
 
-    # 5. performer refs (+ emotion variants) -> performer.yaml --------------------
-    variant_items: list[dict[str, Any]] = []
-    can_vary = design_caps.get("instruct", "none") != "none" or design_caps.get("knobs", "none") != "none"
-    for sid, best in chosen_design.items():
-        pdir = ctx.paths.vb(sid) / "performer"
-        prefs = []
-        for i, (p, text) in enumerate(best["clips"]):
-            dst = pdir / f"neutral_{i + 1:02d}.wav"
-            shutil.copy2(p, dst)
-            prefs.append({"path": ctx.paths.rel(dst), "emotion": _ref_emotion_from_name(p.stem) if best.get("reference") else "neutral", "text": text})
-        best["refs"] = prefs
-        if can_vary and not best.get("reference"):
-            emos = [e for e in dict.fromkeys(r.emotion for r in refs[sid]) if e not in ("neutral", "other", "unknown")]
+    # 5. emotion variants of the chosen designs, then performer.yaml -----------------
+    variant_ids = [sid for sid, d in picked.items() if d["kind"] == "voice_design" and "variants" not in d]
+    if variant_ids:
+        if not design_caps:
+            vb_backend, design_backend_name, _ = gu.acquire_first(ctx, [vb.performer.backend])
+            design_caps = dict(vb_backend.spec.caps) if vb_backend is not None else {}
+        can_vary = design_caps.get("instruct", "none") != "none" or design_caps.get("knobs", "none") != "none"
+        variant_items: list[dict[str, Any]] = []
+        sentence0 = dz.TEST_SENTENCES.get(lang, dz.TEST_SENTENCES["en"])[0]
+        for sid in variant_ids:
+            best = picked[sid]
+            best["variants"] = []
+            if not can_vary or not design_backend_name:
+                continue
+            emos = [e for e in dict.fromkeys(r.emotion for r in refs.get(sid, [])) if e not in ("neutral", "other", "unknown")]
+            vdir = dz.design_dir(ctx, sid, best["design_id"]) / "variants"
             for emo in emos[:5]:
-                spec = StyleSpec(emotion=emo, intensity=0.65)
-                rendered = render(spec, design_caps)
+                rendered = render(StyleSpec(emotion=emo, intensity=0.65), design_caps)
                 instr = rendered.get("instruct") or rendered.get("style_prompt") or ""
-                out = pdir / f"{emo}_01.wav"
-                it = {
-                    "id": f"{sid}|{emo}", "text": sentences[0], "lang": lang, "seed": best["seed"], "out": str(out),
-                    "description": f"{best['description']} {instr}".strip(), "instruct": f"{best['description']} {instr}".strip(),
-                }
+                desc = f"{best['prompt']} {instr}".strip()
+                it = {"id": f"{sid}|{emo}", "text": sentence0, "lang": lang, "seed": best.get("seed"), "out": str(vdir / f"{emo}_01.wav"), "description": desc, "instruct": desc}
                 knobs = dict(rendered.get("knobs") or {})
                 if design_backend_name and gu_is_local(ctx, design_backend_name):
                     knobs.update({"f0_hz": best.get("f0_median_hz") or char_f0.get(sid) or 200.0, "gender": chars[sid].gender})
                 if knobs:
                     it["knobs"] = knobs
                 variant_items.append(it)
-    if variant_items and design_backend_name:
-        try:
-            backend = ctx.models.acquire(design_backend_name)
-            for r in gu.run_batched(backend, "design", variant_items, chunk=8):
-                sid, emo = r["id"].split("|", 1)
-                out = ctx.paths.vb(sid) / "performer" / f"{emo}_01.wav"
-                if not r.get("error") and out.exists():
-                    chosen_design[sid]["refs"].append({"path": ctx.paths.rel(out), "emotion": emo, "text": sentences[0]})
-                elif r.get("error"):
-                    ctx.log.warning("performer variant %s failed: %s", r["id"], r["error"])
-        except BackendUnavailable as e:
-            ctx.log.warning("performer emotion variants skipped: %s", e)
-    for sid, best in chosen_design.items():
-        perf = {
-            "kind": perf_kind,
-            "backend": design_backend_name or ("reference" if best.get("reference") else ""),
-            "description": best["description"],
-            "seed": best["seed"],
-            "design_index": best["d"],
-            "refs": best["refs"],
-            "f0_median_hz": None if best.get("f0_median_hz") is None else round(best["f0_median_hz"], 2),
-            "spk_sim": None if best.get("spk_sim") is None else round(best["spk_sim"], 4),
-            "f0_delta_st": None if best.get("f0_delta_st") is None else round(best["f0_delta_st"], 2),
-            "embedder": emb_name,
-            "warnings": [w for w in [best.get("warning", "")] if w],
-        }
-        write_yaml(ctx.paths.vb_performer(sid), perf)
-        chars[sid].performer = {k: perf[k] for k in ("kind", "backend", "description", "f0_median_hz", "spk_sim", "f0_delta_st")}
-        chars[sid].performer["path"] = ctx.paths.rel(ctx.paths.vb_performer(sid))
-        cache.put(f"performer:{sid}", _performer_key(cache, sid, vb, char_f0, chars))
-    for sid in eligible:
+        if variant_items:
+            try:
+                backend = ctx.models.acquire(design_backend_name)
+                for r in gu.run_batched(backend, "design", variant_items, chunk=8):
+                    sid, emo = r["id"].split("|", 1)
+                    out = dz.design_dir(ctx, sid, picked[sid]["design_id"]) / "variants" / f"{emo}_01.wav"
+                    if not r.get("error") and out.exists():
+                        picked[sid]["variants"].append({"emotion": emo, "wav": ctx.paths.rel(out), "text": sentence0})
+                    elif r.get("error"):
+                        ctx.log.warning("performer variant %s failed: %s", r["id"], r["error"])
+            except BackendUnavailable as e:
+                ctx.log.warning("performer emotion variants skipped: %s", e)
+        for sid in variant_ids:  # persist the variants on the design entries
+            allds = dz.load_designs(ctx, sid)
+            for d in allds:
+                if d["design_id"] == picked[sid]["design_id"]:
+                    d["variants"] = picked[sid]["variants"]
+            dz.save_designs(ctx, sid, allds)
+    for sid, d in picked.items():
+        if d["kind"] == "clone":
+            continue
+        chosen_by = "user" if (chars[sid].performer or {}).get("chosen_by") == "user" and (chars[sid].performer or {}).get("design_id") == d["design_id"] else "stage"
+        _write_performer(ctx, sid, d, chars, chosen_by)
+        if state[sid] == "regen":
+            cache.put(f"performer:{sid}", _performer_key(cache, sid, vb, char_f0, chars))
+    for sid in perf_chars:
         if ctx.paths.vb_performer(sid).exists():
             summary["performers"] += 1
             if not chars[sid].performer:
                 perf = gu.load_performer(ctx, sid) or {}
                 chars[sid].performer = {k: perf.get(k) for k in ("kind", "backend", "description", "f0_median_hz", "spk_sim", "f0_delta_st")}
+    summary["designs"] = sum(len(dz.load_designs(ctx, sid)) for sid in perf_chars)
     if performer_reason:
         summary["performer_missing"] = performer_reason
         for sid, reason in performer_reason.items():
@@ -483,7 +890,7 @@ def run(ctx: Any) -> dict[str, Any]:
 
     # 6. RVC --------------------------------------------------------------------
     if vb.rvc.enabled:
-        summary["rvc"] = _train_rvc(ctx, cache, eligible, passports, refs, chars, char_f0, summary)
+        summary["rvc"] = _train_rvc(ctx, cache, eligible, passports, refs, chars, char_f0, summary, tick)
 
     # 7. route C ------------------------------------------------------------------
     if vb.route_c.enabled:
@@ -504,25 +911,6 @@ def gu_is_local(ctx: Any, name: str) -> bool:
         return registry.get(name).env is None
     except KeyError:
         return False
-
-
-def _ref_emotion_from_name(stem: str) -> str:
-    from vndub.text.style_prompt import ALL_EMOTIONS
-
-    head = stem.split("_", 1)[0].lower()
-    return head if head in ALL_EMOTIONS else "neutral"
-
-
-def _performer_key(cache: Any, sid: str, vb: Any, char_f0: dict[str, Any], chars: dict[str, Character]) -> str:
-    c = chars[sid]
-    return cache.key("performer", vb.performer.model_dump(), char_f0.get(sid), c.gender, c.age_hint, c.stats.emotion_hist)
-
-
-def _performer_fresh(ctx: Any, cache: Any, sid: str, vb: Any, char_f0: dict[str, Any], chars: dict[str, Character]) -> bool:
-    perf = gu.load_performer(ctx, sid)
-    if not perf or not all(ctx.paths.abs(r["path"]).exists() for r in perf.get("refs", [])):
-        return False
-    return cache.fresh(f"performer:{sid}", _performer_key(cache, sid, vb, char_f0, chars), [ctx.paths.vb_performer(sid)])
 
 
 def _stats(xs: list[float]) -> dict[str, float]:
@@ -562,90 +950,135 @@ def _calibrate(ctx: Any, emb_name: str | None, vecs: dict[str, list[np.ndarray]]
     return f"threshold={thr:.3f} eer={eer:.3f}"
 
 
-def _train_rvc(ctx: Any, cache: Any, eligible: dict[str, list[LineRecord]], passports: dict[str, dict[str, Any]], refs: dict[str, list[RefClip]], chars: dict[str, Character], char_f0: dict[str, Any], summary: dict[str, Any]) -> int:
+# ----------------------------------------------------------------------------
+# RVC (route B)
+# ----------------------------------------------------------------------------
+
+
+def _rvc_clips(ctx: Any, ls: list[LineRecord], passports: dict[str, dict[str, Any]]) -> tuple[list[str], str]:
+    """Training clips of one character (emotion-coverage round robin up to ``max_minutes``) or ('', reason)."""
     rv = ctx.cfg.voicebank.rvc
     vbref = ctx.cfg.voicebank.refs
+    clean = []
+    for l in ls:
+        p = passports.get(l.line_id) or {}
+        snr = p.get("snr_db")
+        if p.get("bgm") or snr is None or float(snr) < vbref.min_snr_db or float(p.get("duration_s") or 0) < 1.0:
+            continue
+        clean.append((l, p))
+    mins = sum(float(p.get("duration_s") or 0) for _, p in clean) / 60.0
+    if mins + 1e-9 < rv.min_minutes:
+        return [], f"{mins:.1f} min clean audio < {rv.min_minutes} min"
+    by_emo: dict[str, list[tuple[LineRecord, dict[str, Any]]]] = {}
+    for l, p in sorted(clean, key=lambda lp: -float(lp[1].get("snr_db") or 0)):
+        by_emo.setdefault(_emotion_of(p), []).append((l, p))
+    picked: list[str] = []
+    total = 0.0
+    idx = 0
+    while total < rv.max_minutes * 60 and any(idx < len(v) for v in by_emo.values()):
+        for v in by_emo.values():
+            if idx < len(v) and total < rv.max_minutes * 60:
+                l, p = v[idx]
+                picked.append(str(ctx.paths.abs(l.src_wav)))
+                total += float(p.get("duration_s") or 0)
+        idx += 1
+    return picked, ""
+
+
+def _rvc_f0_transpose(ctx: Any, sid: str, char_f0: float | None) -> int:
+    perf = gu.load_performer(ctx, sid) or {}
+    if char_f0 and perf.get("f0_median_hz"):
+        return int(round(12 * math.log2(float(char_f0) / float(perf["f0_median_hz"]))))
+    return 0
+
+
+def _rvc_train_character(
+    ctx: Any, cache: Any, sid: str, clips: list[str], chars: dict[str, Character], char_f0: float | None, holder: dict[str, Any], reasons: dict[str, str],
+    progress: Any = None,
+) -> str:
+    """Train (or reuse) one character's RVC model. Returns ``done`` | ``cached`` | ``failed``."""
+    rv = ctx.cfg.voicebank.rvc
+    out_dir = ctx.paths.vb_rvc(sid)
+    f0_t = _rvc_f0_transpose(ctx, sid, char_f0)
+    key = cache.key("rvc", rv.model_dump(), sorted(clips))
+    meta = read_json(out_dir / "meta.json")
+    if meta and cache.fresh(f"rvc:{sid}", key, [out_dir / "meta.json"]) and ctx.paths.abs(meta.get("model", "missing")).exists():
+        if meta.get("f0_transpose") != f0_t:
+            meta["f0_transpose"] = f0_t
+            write_json(out_dir / "meta.json", meta)
+        chars[sid].rvc = meta
+        return "cached"
+    if holder.get("backend") is None:
+        backend, _, reason = gu.acquire_first(ctx, [rv.backend])
+        if backend is None:
+            holder["unavailable"] = reason
+            reasons[sid] = f"rvc backend unavailable: {reason}"
+            return "failed"
+        holder["backend"] = backend
+    backend = holder["backend"]
+    job = {
+        "speaker_id": sid, "clips": clips, "out_dir": str(out_dir), "sample_rate": rv.sample_rate, "epochs": rv.epochs,
+        "batch_size": rv.batch_size, "f0_method": rv.f0_method, "overfit_patience": rv.overfit_patience,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if progress is not None:
+        progress(1, 3, sid)
+    try:
+        res = backend.train(job) or {}
+    except BackendUnavailable:
+        raise
+    except Exception as e:
+        reasons[sid] = f"rvc training failed: {type(e).__name__}: {e}"
+        ctx.log.error("%s: %s", sid, reasons[sid])
+        return "failed"
+    if res.get("error") or not res.get("model"):
+        reasons[sid] = f"rvc training failed: {res.get('error', 'no model returned')}"
+        return "failed"
+    meta = {
+        "model": ctx.paths.rel(res["model"]),
+        "index": ctx.paths.rel(res["index"]) if res.get("index") else None,
+        "f0_transpose": f0_t,
+        "minutes": round(sum(gu_duration(c) for c in clips) / 60.0, 2),
+        "epochs": res.get("epochs"),
+        "sample_rate": rv.sample_rate,
+        "backend": backend.spec.name,
+    }
+    write_json(out_dir / "meta.json", meta)
+    chars[sid].rvc = meta
+    cache.put(f"rvc:{sid}", key)
+    return "done"
+
+
+def _train_rvc(ctx: Any, cache: Any, eligible: dict[str, list[LineRecord]], passports: dict[str, dict[str, Any]], refs: dict[str, list[RefClip]], chars: dict[str, Character], char_f0: dict[str, Any], summary: dict[str, Any], tick: Any = None) -> int:
     plans: dict[str, list[str]] = {}
     reasons: dict[str, str] = {}
     for sid, ls in eligible.items():
-        clean = []
-        for l in ls:
-            p = passports.get(l.line_id) or {}
-            snr = p.get("snr_db")
-            if p.get("bgm") or snr is None or float(snr) < vbref.min_snr_db or float(p.get("duration_s") or 0) < 1.0:
-                continue
-            clean.append((l, p))
-        mins = sum(float(p.get("duration_s") or 0) for _, p in clean) / 60.0
-        if mins + 1e-9 < rv.min_minutes:
-            reasons[sid] = f"{mins:.1f} min clean audio < {rv.min_minutes} min"
+        if chars[sid].route in ("A", "P"):  # no VC step on these routes: skip the training
+            reasons[sid] = f"route {chars[sid].route}: no voice conversion"
+            if tick is not None:
+                tick(sid)
             continue
-        # emotion-coverage round robin until max_minutes
-        by_emo: dict[str, list[tuple[LineRecord, dict[str, Any]]]] = {}
-        for l, p in sorted(clean, key=lambda lp: -float(lp[1].get("snr_db") or 0)):
-            by_emo.setdefault(_emotion_of(p), []).append((l, p))
-        picked: list[str] = []
-        total = 0.0
-        idx = 0
-        while total < rv.max_minutes * 60 and any(idx < len(v) for v in by_emo.values()):
-            for v in by_emo.values():
-                if idx < len(v) and total < rv.max_minutes * 60:
-                    l, p = v[idx]
-                    picked.append(str(ctx.paths.abs(l.src_wav)))
-                    total += float(p.get("duration_s") or 0)
-            idx += 1
-        plans[sid] = picked
+        clips, why = _rvc_clips(ctx, ls, passports)
+        if why:
+            reasons[sid] = why
+            if tick is not None:
+                tick(sid)
+            continue
+        plans[sid] = clips
     n = 0
-    backend = None
+    holder: dict[str, Any] = {}
     for sid, clips in plans.items():
-        out_dir = ctx.paths.vb_rvc(sid)
-        perf = gu.load_performer(ctx, sid) or {}
-        f0_t = 0
-        if char_f0.get(sid) and perf.get("f0_median_hz"):
-            f0_t = int(round(12 * math.log2(float(char_f0[sid]) / float(perf["f0_median_hz"]))))
-        key = cache.key("rvc", rv.model_dump(), sorted(clips))
-        meta = read_json(out_dir / "meta.json")
-        if meta and cache.fresh(f"rvc:{sid}", key, [out_dir / "meta.json"]) and ctx.paths.abs(meta.get("model", "missing")).exists():
-            if meta.get("f0_transpose") != f0_t:
-                meta["f0_transpose"] = f0_t
-                write_json(out_dir / "meta.json", meta)
-            chars[sid].rvc = meta
+        outcome = _rvc_train_character(ctx, cache, sid, clips, chars, char_f0.get(sid), holder, reasons)
+        if outcome in ("done", "cached"):
             n += 1
-            continue
-        if backend is None:
-            backend, _, reason = gu.acquire_first(ctx, [rv.backend])
-            if backend is None:
-                for s in plans:
-                    reasons[s] = f"rvc backend unavailable: {reason}"
-                break
-        job = {
-            "speaker_id": sid, "clips": clips, "out_dir": str(out_dir), "sample_rate": rv.sample_rate, "epochs": rv.epochs,
-            "batch_size": rv.batch_size, "f0_method": rv.f0_method, "overfit_patience": rv.overfit_patience,
-        }
-        out_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            res = backend.train(job) or {}
-        except BackendUnavailable:
-            raise
-        except Exception as e:
-            reasons[sid] = f"rvc training failed: {type(e).__name__}: {e}"
-            ctx.log.error("%s: %s", sid, reasons[sid])
-            continue
-        if res.get("error") or not res.get("model"):
-            reasons[sid] = f"rvc training failed: {res.get('error', 'no model returned')}"
-            continue
-        meta = {
-            "model": ctx.paths.rel(res["model"]),
-            "index": ctx.paths.rel(res["index"]) if res.get("index") else None,
-            "f0_transpose": f0_t,
-            "minutes": round(sum(gu_duration(c) for c in clips) / 60.0, 2),
-            "epochs": res.get("epochs"),
-            "sample_rate": rv.sample_rate,
-            "backend": backend.spec.name,
-        }
-        write_json(out_dir / "meta.json", meta)
-        chars[sid].rvc = meta
-        cache.put(f"rvc:{sid}", key)
-        n += 1
+        if holder.get("unavailable"):
+            for s in plans:
+                reasons[s] = f"rvc backend unavailable: {holder['unavailable']}"
+            if tick is not None:
+                tick(sid)
+            break
+        if tick is not None:
+            tick(sid)
     if reasons:
         summary["rvc_skipped"] = reasons
     return n
@@ -670,7 +1103,7 @@ def _train_lora(ctx: Any, cache: Any, eligible: dict[str, list[LineRecord]], cha
     reasons: dict[str, str] = {}
     n = 0
     backend = None
-    sentences = TEST_SENTENCES.get(ctx.cfg.project.tgt_lang, TEST_SENTENCES["en"])
+    sentences = dz.TEST_SENTENCES.get(ctx.cfg.project.tgt_lang, dz.TEST_SENTENCES["en"])
     for sid, ls in eligible.items():
         pairs = []
         total = 0.0
@@ -748,3 +1181,306 @@ def _train_lora(ctx: Any, cache: Any, eligible: dict[str, list[LineRecord]], cha
     if reasons:
         summary["lora_skipped"] = reasons
     return n
+
+
+# ----------------------------------------------------------------------------
+# casting screen API (vndub_app/API.md 2.3)
+# ----------------------------------------------------------------------------
+
+
+def _enter(ctx: Any) -> None:
+    """Progress callbacks are keyed by stage name; API calls run outside ``run_stage``."""
+    if not ctx.stage:
+        ctx.stage = NAME
+
+
+def _character(ctx: Any, sid: str) -> tuple[dict[str, Character], Character]:
+    chars = ctx.characters()
+    if sid not in chars:
+        raise ValueError("unknown_character")
+    return chars, chars[sid]
+
+
+def _has_original_audio(ctx: Any, sid: str) -> bool:
+    return any(l.speaker_id == sid for l in ctx.voiced_lines(apply_only=False))
+
+
+def list_designs(ctx: Any, speaker_id: str) -> list[dict[str, Any]]:
+    """All designs of a character, best first (``rank_score``), with ``stars`` filled in.
+
+    ``stars``: 1..5 from ``spk_sim`` with the speaker gate threshold as the 3-star point (formula in
+    :mod:`vndub.stages.designs`); ``None`` for characters without original audio. No model is loaded.
+    """
+    return dz.ranked(ctx, dz.load_designs(ctx, speaker_id))
+
+
+def sample_lines(ctx: Any, speaker_id: str, n: int = 2) -> list[str]:
+    """Texts of ``n`` translated lines of the character (the audition lines); the configured test
+    sentences fill the gap when there are not enough translated lines."""
+    return [row["text"] for row in dz.sample_items(ctx, speaker_id, max(0, int(n)))]
+
+
+def propose_designs(
+    ctx: Any, speaker_id: str, n: int = 3, description: str | None = None, sample_line_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Add ``n`` voice designs for the character; returns the new designs (ranked best first).
+
+    GPU work through the model registry: the design backend, then (characters with audio) the speaker
+    embedder and the F0 backend. A character with original audio also gets its ``clone`` design (route A)
+    the first time. ``description`` replaces ``Character.description`` (and is saved there). Raises
+    ``BackendUnavailable`` when the design backend cannot run.
+    """
+    _enter(ctx)
+    vb = ctx.cfg.voicebank
+    n = min(MAX_PROPOSE, max(1, int(n)))
+    chars, char = _character(ctx, speaker_id)
+    if description is not None and description.strip() != char.description:
+        char.description = description.strip()
+        save_characters(ctx.paths.characters, chars)
+    existing = dz.load_designs(ctx, speaker_id)
+    has_audio = _has_original_audio(ctx, speaker_id)
+    refs = gu.load_refs(ctx, speaker_id)
+    ls = [l for l in ctx.voiced_lines(apply_only=False) if l.speaker_id == speaker_id] if has_audio else []
+    if has_audio and not refs and ls:
+        passports = {l.line_id: p for l in ls if (p := gu.load_passport(ctx, l.line_id))}
+        cache = ctx.cache(NAME, VERSION, "voicebank", "score", "project")
+        refs = _ensure_refs(ctx, cache, speaker_id, ls, passports, chars)
+        cache.save()
+        save_characters(ctx.paths.characters, chars)
+    char_f0 = _char_f0(ctx, chars, speaker_id, refs) if has_audio else None
+    want_clone = has_audio and bool(refs) and not any(d["design_id"] == "clone" for d in existing)
+    tick = _Ticker(ctx, n + (1 if want_clone else 0) + 1)
+    ctx.progress(0, tick.total, speaker_id)
+    backend, _, reason = gu.acquire_first(ctx, [vb.performer.backend])
+    if backend is None:
+        raise BackendUnavailable(vb.performer.backend, reason)
+    jobs = _plan_designs(ctx, speaker_id, char, existing, n, char_f0, description, sample_line_ids, origin="user")
+    new = _render_designs(ctx, backend, jobs, tick)
+    if want_clone:
+        clone = _clone_design(ctx, speaker_id, char, refs, char_f0, dz.sample_items(ctx, speaker_id, max(1, vb.performer.sample_lines), sample_line_ids), "user", tick)
+        if clone is not None:
+            new.append(clone)
+        else:
+            tick("clone")
+    if new:
+        _measure_new_designs(ctx, speaker_id, char, new, has_audio)
+        dz.save_designs(ctx, speaker_id, [*existing, *new])
+    tick(speaker_id)
+    p = dz.star_params(ctx)
+    return sorted((dz.public(ctx, d, p) for d in new), key=lambda d: -float(d["rank_score"]))
+
+
+def add_reference_design(ctx: Any, speaker_id: str, wav_path: str) -> dict[str, Any]:
+    """A design from the user's own sample (wav / mp3, 5-20 s of native speech of the voice).
+
+    Raises ``ValueError`` with the message ``sample_too_short`` / ``sample_too_long`` /
+    ``sample_bad_format``. The sample is decoded to ``designs/<id>/ref.wav``; when a synth TTS backend
+    is usable the audition lines are rendered as a zero-shot clone of it (else the sample itself is the
+    only audition clip). The sample becomes the performer's first timbre reference when chosen.
+    """
+    _enter(ctx)
+    chars, char = _character(ctx, speaker_id)
+    existing = dz.load_designs(ctx, speaker_id)
+    did = dz.next_design_id(ctx, speaker_id, existing, "ref")
+    ddir = dz.design_dir(ctx, speaker_id, did)
+    ref = ddir / "ref.wav"
+    try:
+        dur = dz.decode_sample(ctx, wav_path, ref)
+    except Exception:
+        shutil.rmtree(ddir, ignore_errors=True)
+        raise
+    has_audio = _has_original_audio(ctx, speaker_id)
+    char_f0 = (char.stats.f0_median_hz or _char_f0(ctx, chars, speaker_id, gu.load_refs(ctx, speaker_id))) if has_audio else None
+    audition = dz.sample_items(ctx, speaker_id, max(1, ctx.cfg.voicebank.performer.sample_lines))
+    d = _render_cloned(
+        ctx, speaker_id, did, "reference", ref, None, audition, char, char_f0, cross_lingual=False, origin="user",
+        extra={"ref_wav": ctx.paths.rel(ref), "duration_s": round(dur, 2)},
+    )
+    if d is None:  # no TTS backend: the sample itself is the audition clip
+        spec = None
+        got = _tts_backend(ctx)
+        if got is not None:
+            spec = got[0].spec
+        d = {
+            "design_id": did, "kind": "reference", "backend": spec.name if spec else "reference", "prompt": "", "description": "",
+            "samples": [{"line_id": "", "wav": ctx.paths.rel(ref), "text": ""}], "ref_clips": [], "spk_sim": None, "f0_median_hz": None,
+            "f0_delta_st": None, "rank_score": -1.0, "license": spec.license if spec else "user-supplied",
+            "commercial_ok": bool(spec.commercial_ok) if spec else True, "created": gu.ts_now(), "origin": "user",
+            "ref_wav": ctx.paths.rel(ref), "duration_s": round(dur, 2),
+        }
+    _measure_new_designs(ctx, speaker_id, char, [d], has_audio)
+    dz.save_designs(ctx, speaker_id, [*existing, d])
+    return dz.public(ctx, d)
+
+
+def import_design(ctx: Any, speaker_id: str, design: dict[str, Any], wav_paths: list[str]) -> dict[str, Any]:
+    """Reuse a voice saved in the cross-project voice library.
+
+    ``design``: the library entry (``kind``, ``backend``, ``prompt``, ``description``, ``name``,
+    optional ``samples: [{"text"}]`` aligned with ``wav_paths``). The wavs are copied (decoded to wav) into
+    a new design ``imp<NN>`` and become the performer's timbre references when it is chosen. Raises
+    ``ValueError("sample_bad_format")`` when a file cannot be read, ``ValueError("design_empty")`` without wavs.
+    """
+    from vndub.audio import ffmpeg
+
+    _enter(ctx)
+    chars, char = _character(ctx, speaker_id)
+    if not wav_paths:
+        raise ValueError("design_empty")
+    existing = dz.load_designs(ctx, speaker_id)
+    did = dz.next_design_id(ctx, speaker_id, existing, "imp")
+    ddir = dz.design_dir(ctx, speaker_id, did)
+    texts = [str((s or {}).get("text", "")) for s in (design.get("samples") or [])]
+    samples = []
+    try:
+        for i, src in enumerate(wav_paths):
+            p = Path(src)
+            if not p.is_file():
+                raise ValueError("sample_bad_format")
+            dst = ddir / f"s{i}.wav"
+            try:
+                ffmpeg.decode(ctx.tools, p, dst, mono=True)
+            except Exception as e:  # noqa: BLE001
+                from vndub.tools import ToolMissing
+
+                if isinstance(e, ToolMissing) and p.suffix.lower() == ".wav":
+                    shutil.copy2(p, dst)
+                else:
+                    raise ValueError("sample_bad_format") from e
+            samples.append({"line_id": "", "wav": ctx.paths.rel(dst), "text": texts[i] if i < len(texts) else ""})
+    except Exception:
+        shutil.rmtree(ddir, ignore_errors=True)
+        raise
+    kind = "voice_design" if design.get("kind") == "voice_design" else "reference"
+    from vndub.backends import registry
+
+    try:
+        spec = registry.get(str(design.get("backend") or ""))
+        lic, comm = spec.license, bool(spec.commercial_ok)
+    except KeyError:
+        lic, comm = str(design.get("license") or "unknown"), bool(design.get("commercial_ok", False))
+    d = {
+        "design_id": did, "kind": kind, "backend": str(design.get("backend") or "library"), "prompt": str(design.get("prompt") or ""),
+        "description": str(design.get("description") or ""), "samples": samples, "ref_clips": [], "spk_sim": None, "f0_median_hz": None,
+        "f0_delta_st": None, "rank_score": -1.0, "license": lic, "commercial_ok": comm, "created": gu.ts_now(), "origin": "library",
+        "imported": True, "source_name": str(design.get("name") or design.get("id") or ""),
+    }
+    _measure_new_designs(ctx, speaker_id, char, [d], _has_original_audio(ctx, speaker_id))
+    dz.save_designs(ctx, speaker_id, [*existing, d])
+    return dz.public(ctx, d)
+
+
+def choose_design(ctx: Any, speaker_id: str, design_id: str, route: str) -> dict[str, Any]:
+    """Make a design the character's performer and set its route (``A`` clone / ``B`` performer + VC /
+    ``C`` / ``P`` performer only). Writes ``characters.yaml`` (``performer`` incl. ``design_id`` and
+    ``chosen_by: user``, ``route``) and ``performer.yaml`` (+ ``performer/*.wav``, what synth reads).
+
+    A ``clone`` design only goes with route ``A`` (``ValueError("route_mismatch")``) and leaves
+    performer.yaml alone. Returns ``{"speaker_id", "design_id", "route", "kind", "performer"}``.
+    Raises ``ValueError`` (``unknown_character`` / ``design_not_found`` / ``bad_route``). No model is loaded;
+    the emotion variants of the performer are rendered by the next ``voicebank`` run.
+    """
+    _enter(ctx)
+    chars, char = _character(ctx, speaker_id)
+    d = dz.get_design(ctx, speaker_id, design_id)
+    if d is None:
+        raise ValueError("design_not_found")
+    if route not in ("A", "B", "C", "P"):
+        raise ValueError("bad_route")
+    if d["kind"] == "clone" and route != "A":
+        raise ValueError("route_mismatch")
+    if d["kind"] == "clone":
+        tuning = (char.performer or {}).get("tuning")
+        char.performer = {"kind": "clone", "backend": d.get("backend", ""), "description": "", "design_id": design_id, "chosen_by": "user"}
+        if tuning:
+            char.performer["tuning"] = tuning
+    else:
+        _write_performer(ctx, speaker_id, d, chars, "user")
+        meta_path = ctx.paths.vb_rvc(speaker_id) / "meta.json"
+        meta = read_json(meta_path)
+        if meta:  # the pitch offset to the character depends on the performer's F0
+            f0_t = _rvc_f0_transpose(ctx, speaker_id, char.stats.f0_median_hz)
+            if meta.get("f0_transpose") != f0_t:
+                meta["f0_transpose"] = f0_t
+                write_json(meta_path, meta)
+                char.rvc = meta
+    char.route = route  # type: ignore[assignment]
+    save_characters(ctx.paths.characters, chars)
+    return {"speaker_id": speaker_id, "design_id": design_id, "route": route, "kind": d["kind"], "performer": dict(char.performer)}
+
+
+def auto_cast(ctx: Any) -> dict[str, str]:
+    """Choose the top-ranked design for every character that has designs; returns ``{speaker_id: design_id}``.
+
+    The ``clone`` design is only taken when it is the character's only design (its similarity is high by
+    construction, but it is route A with the accent risk). Route: ``B`` for characters with original audio,
+    ``P`` without, ``A`` for a clone. No model is loaded.
+    """
+    _enter(ctx)
+    voiced = {l.speaker_id for l in ctx.voiced_lines(apply_only=False)}
+    out: dict[str, str] = {}
+    for sid in ctx.characters():
+        if sid == "narrator":
+            continue
+        ds = list_designs(ctx, sid)
+        pool = [d for d in ds if d["kind"] != "clone"] or ds
+        if not pool:
+            continue
+        d = pool[0]
+        route = "A" if d["kind"] == "clone" else ("B" if sid in voiced else "P")
+        choose_design(ctx, sid, d["design_id"], route)
+        out[sid] = d["design_id"]
+    return out
+
+
+def set_tuning(ctx: Any, speaker_id: str, tuning: dict[str, Any] | None) -> dict[str, Any]:
+    """Store ``characters.yaml.<sid>.performer.tuning`` (normalized: clamped, defaults filled); returns it."""
+    chars, char = _character(ctx, speaker_id)
+    t = normalize_tuning(tuning)
+    perf = dict(char.performer or {})
+    perf["tuning"] = t
+    char.performer = perf
+    save_characters(ctx.paths.characters, chars)
+    return t
+
+
+def train_rvc(ctx: Any, speaker_id: str) -> dict[str, Any]:
+    """Train (or reuse) the character's RVC model for route B; reports ``ctx.progress`` (3 steps).
+
+    Returns ``{"speaker_id", "state": "done" | "skipped" | "failed", "reason_code", "reason", "cached",
+    "meta"}``; ``reason_code``: ``none`` | ``disabled`` | ``no_voiced_lines`` | ``not_enough_audio`` |
+    ``training_failed``. ``meta`` is the ``rvc/meta.json`` content (model, index, f0_transpose, minutes,
+    epochs, sample_rate, backend) once a model exists. Raises ``BackendUnavailable`` when the RVC backend
+    cannot run. Cached on the clip set and the RVC config; ``f0_transpose`` follows the chosen performer.
+    """
+    _enter(ctx)
+    rv = ctx.cfg.voicebank.rvc
+    chars, char = _character(ctx, speaker_id)
+
+    def result(state: str, code: str = "none", reason: str = "", cached: bool = False) -> dict[str, Any]:
+        return {"speaker_id": speaker_id, "state": state, "reason_code": code, "reason": reason, "cached": cached, "meta": dict(char.rvc) if char.rvc else None}
+
+    if not rv.enabled:
+        return result("skipped", "disabled", "voicebank.rvc.enabled is false")
+    ls = [l for l in ctx.voiced_lines(apply_only=False) if l.speaker_id == speaker_id]
+    if not ls:
+        return result("skipped", "no_voiced_lines", "the character has no original audio")
+    ctx.progress(0, 3, speaker_id)
+    passports = {l.line_id: p for l in ls if (p := gu.load_passport(ctx, l.line_id))}
+    clips, why = _rvc_clips(ctx, ls, passports)
+    if why:
+        ctx.progress(3, 3, speaker_id)
+        return result("skipped", "not_enough_audio", why)
+    char_f0 = _char_f0(ctx, chars, speaker_id, gu.load_refs(ctx, speaker_id))
+    cache = ctx.cache(NAME, VERSION, "voicebank", "score", "project")
+    reasons: dict[str, str] = {}
+    holder: dict[str, Any] = {}
+    outcome = _rvc_train_character(ctx, cache, speaker_id, clips, chars, char_f0, holder, reasons, progress=ctx.progress)
+    ctx.save_caches()
+    if holder.get("unavailable"):
+        raise BackendUnavailable(rv.backend, holder["unavailable"])
+    if outcome == "failed":
+        return result("failed", "training_failed", reasons.get(speaker_id, ""))
+    save_characters(ctx.paths.characters, chars)
+    ctx.progress(3, 3, speaker_id)
+    return {"speaker_id": speaker_id, "state": "done", "reason_code": "none", "reason": "", "cached": outcome == "cached", "meta": dict(chars[speaker_id].rvc)}

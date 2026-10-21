@@ -20,6 +20,19 @@ Post-processing (Russian): numbers -> words, abbreviations, ruaccent stress
 the stress-free CER reference ``text_plain``.
 
 ``--seed-glossary`` writes/extends ``configs/glossary.yaml`` from characters.yaml.
+
+Delivery (mode B, speaker lines without original audio -- translated like the voiced ones unless
+``translate.include_unvoiced`` is ``off`` (``auto`` follows ``synth.voice_unvoiced``); narration never): for those lines the same request carries
+``"want_delivery": true`` and the same answer entry gets one more field, ``delivery``
+``{emotion, intensity, tempo, loudness, events, confidence}``, produced with the neighbouring script lines
+(+-``text_emotion.llm_context_lines``, narration included) and the character sheet. Invalid delivery objects are
+dropped (the stage ``text_emotion`` then falls back to its rule/cue layers); they never fail or re-run a batch.
+The result is stored as the extra field ``TranslationRecord.delivery``. These lines are sent in their own
+batches after the scene's regular batches, so the cached batches of voiced lines are never invalidated.
+``text_emotion.llm: off`` disables the request; with an imported translation (``translate.import``) no LLM is
+loaded for delivery unless ``text_emotion.llm: on`` (then a delivery-only request runs through the same client).
+
+``preview_import(ctx, path, n)`` shows how an import file would match the lines (no writes).
 """
 
 from __future__ import annotations
@@ -35,15 +48,19 @@ import yaml
 
 from vndub.backends import registry
 from vndub.backends.base import BackendUnavailable
+from vndub.engines.base import VOICE_OVER
 from vndub.manifest.io import Character, LineRecord, TranslationRecord, read_json, read_jsonl, write_jsonl, write_yaml
+from vndub.stages import text_emotion as te_stage
 from vndub.stages._opcache import OpCache
 from vndub.stages.common import StageContext, StageError
 from vndub.text import ja, ru
+from vndub.text.delivery import EMOTIONS, EVENTS, LOUDNESSES, TEMPOS, validate_delivery
 from vndub.util import hash_obj
 
 NAME = "translate"
 VERSION = "1"
-CONFIG_SECTIONS = ("translate",)
+CONFIG_SECTIONS = ("translate", "text_emotion")
+DELIVERY_PROTOCOL = "1"  # part of the cache key of delivery batches: bump when the delivery request changes
 
 LANG_NAMES = {"ru": "Russian", "en": "English", "de": "German", "fr": "French", "es": "Spanish", "zh": "Chinese", "ko": "Korean", "it": "Italian", "pt": "Portuguese"}
 
@@ -85,7 +102,7 @@ def seed_glossary(ctx: StageContext) -> dict[str, Any]:
     g.setdefault("style_rules", list(DEFAULT_RULES))
     added = 0
     for sid, c in ctx.characters().items():
-        if sid == "narrator" or sid in chars_g:
+        if sid in ("narrator", VOICE_OVER) or sid in chars_g:
             continue
         chars_g[sid] = {
             "src": c.names.get("src", sid),
@@ -134,7 +151,63 @@ def glossary_hits(text: str, gloss: dict[str, Any], chars: dict[str, Character])
     return hits
 
 
-def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gloss: dict[str, Any], chars: dict[str, Character], short_words: int) -> str:
+_NEUTRAL_ANSWER = '{"emotion": "neutral", "intensity": 0.3, "tempo": "normal", "loudness": "normal", "events": [], "confidence": 0.2}'
+
+
+def _delivery_object_doc() -> str:
+    return (
+        f'{{"emotion": one of {"|".join(EMOTIONS)}, "intensity": 0..1, "tempo": {"|".join(TEMPOS)}, '
+        f'"loudness": {"|".join(LOUDNESSES)}, "events": a list drawn from {"|".join(EVENTS)} (usually empty), "confidence": 0..1}}'
+    )
+
+
+def delivery_rules() -> list[str]:
+    """Prompt lines that ask for the ``delivery`` object (only added to batches that contain target lines)."""
+    return [
+        '- Lines with "want_delivery": true are spoken by a character nobody voices yet. For those lines also give '
+        f"'delivery': an object describing HOW the line is spoken: {_delivery_object_doc()}. 'other' means expressive without a specific emotion.",
+        "- Decide the delivery from the line itself, from the neighbouring lines in 'scene_lines' (narration often says how a "
+        "line is spoken: shouted, whispered, through tears ...) and from the character sheet.",
+        f"- When nothing in the text or the surrounding narration indicates a delivery, answer {_NEUTRAL_ANSWER} -- low confidence. "
+        "Do not invent drama.",
+    ]
+
+
+def _character_lines(speakers: list[str], text_all: str, gloss: dict[str, Any], chars: dict[str, Character], delivery: bool = False) -> list[str]:
+    names = []
+    gchars = gloss.get("characters") or {}
+    for sid in sorted(set(speakers) | {sid for sid, gc in gchars.items() if str((gc or {}).get("src") or "") and str(gc["src"]) in text_all}):
+        if sid in ("narrator", VOICE_OVER):  # the voice-over has no name in the text and no character sheet
+            continue
+        gc = gchars.get(sid) or {}
+        c = chars.get(sid)
+        src = gc.get("src") or (c.names.get("src") if c else sid)
+        tgt_name = gc.get("tgt") or (c.names.get("tgt") if c else "")
+        gender = _gender_of(sid, chars, gloss)
+        note = gc.get("notes") or (c.notes if c else "")
+        if delivery and c is not None:
+            note = "; ".join(x for x in (note, f"age {c.age_hint}" if c.age_hint else "", c.description) if x)
+        names.append(f"  - {src} -> {tgt_name or '(transliterate)'} [id {sid}, gender {gender}]" + (f": {note}" if note else ""))
+    return names
+
+
+def delivery_system_prompt(batch: list[dict[str, Any]], speakers: list[str], gloss: dict[str, Any], chars: dict[str, Character]) -> str:
+    """System prompt of the delivery-only request (imported translations + ``text_emotion.llm: on``)."""
+    out = [
+        "You are an assistant for the voice-acting team of a Japanese visual novel.",
+        "For each input line decide HOW it is spoken. The 'text' is the Japanese line, 'translation' its (already final) translation.",
+        *delivery_rules()[1:],
+        f"- 'delivery' is an object {_delivery_object_doc()}.",
+        '- Answer with JSON only: {"lines": [{"id": "...", "delivery": {...}}]} containing exactly one entry for every input id.',
+    ]
+    names = _character_lines(speakers, " ".join(b["text"] for b in batch), gloss, chars, delivery=True)
+    if names:
+        out.append("Characters:")
+        out += names
+    return "\n".join(out)
+
+
+def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gloss: dict[str, Any], chars: dict[str, Character], short_words: int, delivery: bool = False) -> str:
     lang = LANG_NAMES.get(tgt, tgt)
     text_all = " ".join(b["text"] for b in batch)
     rules = list(gloss.get("style_rules") or DEFAULT_RULES)
@@ -146,6 +219,12 @@ def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gl
         f"- For each line give '{tgt}': the full translation; '{tgt}_short': a version at least 20% shorter when the translation has more than {short_words} words (otherwise repeat the full translation); 'notes': a delivery hint of at most 6 words in English (for example: teasing, rising at the end).",
         f"- Answer with JSON only: {{\"lines\": [{{\"id\": \"...\", \"{tgt}\": \"...\", \"{tgt}_short\": \"...\", \"notes\": \"...\"}}]}} containing exactly one entry for every input id.",
     ]
+    if delivery:
+        out[-1] = (
+            f'- Answer with JSON only: {{"lines": [{{"id": "...", "{tgt}": "...", "{tgt}_short": "...", "notes": "...", '
+            '"delivery": {...} (only for lines with want_delivery)}]} containing exactly one entry for every input id.'
+        )
+        out += delivery_rules()
     hon = gloss.get("honorifics")
     if hon:
         policy = {"drop": "drop Japanese honorifics (-san, -chan, -kun)", "transliterate": "transliterate honorifics (-сан, -тян, -кун)", "map": "render honorifics with the mapping below"}.get(str(hon), str(hon))
@@ -159,18 +238,7 @@ def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gl
     if addr:
         out.append("- Address forms (speaker: listener -> form):")
         out += [f"  {a}" for a in addr]
-    names = []
-    gchars = gloss.get("characters") or {}
-    for sid in sorted(set(speakers) | {sid for sid, gc in gchars.items() if str((gc or {}).get("src") or "") and str(gc["src"]) in text_all}):
-        if sid == "narrator":
-            continue
-        gc = gchars.get(sid) or {}
-        c = chars.get(sid)
-        src = gc.get("src") or (c.names.get("src") if c else sid)
-        tgt_name = gc.get("tgt") or (c.names.get("tgt") if c else "")
-        gender = _gender_of(sid, chars, gloss)
-        note = gc.get("notes") or (c.notes if c else "")
-        names.append(f"  - {src} -> {tgt_name or '(transliterate)'} [id {sid}, gender {gender}]" + (f": {note}" if note else ""))
+    names = _character_lines(speakers, text_all, gloss, chars, delivery)
     if names:
         out.append("Characters:")
         out += names
@@ -188,26 +256,48 @@ def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gl
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
 
 
-def parse_response(content: str, batch_ids: list[str], tgt: str) -> dict[str, dict[str, str]]:
-    """Valid entries of a model answer keyed by id (invalid/missing ids are omitted)."""
+def _json_rows(content: str) -> list[Any] | None:
+    """The ``lines`` list of a model answer (fences / chatter around the JSON tolerated), None when unusable."""
     if not isinstance(content, str) or not content.strip():
-        return {}
+        return None
     text = _FENCE.sub("", content.strip())
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         m = re.search(r"\{.*\}", text, re.S)
         if not m:
-            return {}
+            return None
         try:
             data = json.loads(m.group(0))
         except json.JSONDecodeError:
-            return {}
+            return None
     rows = data.get("lines") if isinstance(data, dict) else data
-    if not isinstance(rows, list):
+    return rows if isinstance(rows, list) else None
+
+
+def parse_delivery_response(content: str, batch_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Valid ``delivery`` objects of a delivery-only answer keyed by id (invalid ones are omitted)."""
+    ids = set(batch_ids)
+    out: dict[str, dict[str, Any]] = {}
+    for r in _json_rows(content) or []:
+        if isinstance(r, dict) and str(r.get("id", "")) in ids:
+            dv = validate_delivery(r.get("delivery"), str(r["id"]))
+            if dv:
+                out[str(r["id"])] = dv
+    return out
+
+
+def parse_response(content: str, batch_ids: list[str], tgt: str, want_delivery: set[str] | None = None) -> dict[str, dict[str, Any]]:
+    """Valid entries of a model answer keyed by id (invalid/missing ids are omitted).
+
+    For ids in ``want_delivery`` a valid ``delivery`` object is added as ``entry["delivery"]``; an invalid or
+    missing one is simply left out (it never invalidates the translation).
+    """
+    rows = _json_rows(content)
+    if rows is None:
         return {}
     ids = set(batch_ids)
-    out: dict[str, dict[str, str]] = {}
+    out: dict[str, dict[str, Any]] = {}
     for r in rows:
         if not isinstance(r, dict):
             continue
@@ -222,6 +312,10 @@ def parse_response(content: str, batch_ids: list[str], tgt: str) -> dict[str, di
             "text_tgt_short": short.strip() if isinstance(short, str) and short.strip() else full.strip(),
             "notes": " ".join(notes.split()[:6]) if isinstance(notes, str) else "",
         }
+        if want_delivery and rid in want_delivery:
+            dv = validate_delivery(r.get("delivery"), rid)
+            if dv:
+                out[rid]["delivery"] = dv
     return out
 
 
@@ -241,26 +335,38 @@ class LlmTranslator:
         # MockTranslator needs the target language code; llama-server derives it from the prompt
         return {"tgt": self.tgt} if self.name.startswith("mock") else {}
 
-    def messages(self, batch: list[dict[str, Any]], context: list[dict[str, Any]], summary: str) -> list[dict[str, str]]:
+    def _context_messages(self, summary: str, context: list[dict[str, Any]], scene_context: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+        ctx_text = (f"Scene summary: {summary}\n" if summary else "") + (
+            "Previously translated lines, for context only:\n" + json.dumps(context, ensure_ascii=False) if context else ""
+        )
+        if scene_context:
+            ctx_text += ("\n" if ctx_text else "") + (
+                "scene_lines: the script around the lines to deliver (source text, narration included; the lines you answer for "
+                "are marked deliver=true), for context only:\n" + json.dumps(scene_context, ensure_ascii=False)
+            )
+        if not ctx_text.strip():
+            return []
+        return [{"role": "user", "content": ctx_text.strip()}, {"role": "assistant", "content": "Understood."}]
+
+    def messages(self, batch: list[dict[str, Any]], context: list[dict[str, Any]], summary: str, scene_context: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
         speakers = sorted({b["speaker_id"] for b in batch})
         visible = [{k: v for k, v in b.items() if k != "speaker_id"} for b in batch]
-        msgs = [{"role": "system", "content": system_prompt(self.tgt, batch, speakers, self.gloss, self.chars, self.t.short_variant_min_words)}]
-        if summary or context:
-            ctx_text = (f"Scene summary: {summary}\n" if summary else "") + (
-                "Previously translated lines, for context only:\n" + json.dumps(context, ensure_ascii=False) if context else ""
-            )
-            msgs.append({"role": "user", "content": ctx_text.strip()})
-            msgs.append({"role": "assistant", "content": "Understood."})
+        delivery = any(b.get("want_delivery") for b in batch)
+        msgs = [{"role": "system", "content": system_prompt(self.tgt, batch, speakers, self.gloss, self.chars, self.t.short_variant_min_words, delivery)}]
+        msgs += self._context_messages(summary, context, scene_context)
         msgs.append({"role": "user", "content": "Translate these lines and answer with JSON only:\n" + json.dumps(visible, ensure_ascii=False)})
         return msgs
 
-    def attempt(self, batch: list[dict[str, Any]], context: list[dict[str, Any]], summary: str, temperature: float) -> dict[str, dict[str, str]]:
+    def attempt(
+        self, batch: list[dict[str, Any]], context: list[dict[str, Any]], summary: str, temperature: float, scene_context: list[dict[str, Any]] | None = None
+    ) -> dict[str, dict[str, Any]]:
         self.calls += 1
+        want = {b["id"] for b in batch if b.get("want_delivery")}
         try:
             content = self.backend.chat(
-                self.messages(batch, context, summary),
+                self.messages(batch, context, summary, scene_context),
                 temperature=temperature,
-                max_tokens=max(512, 160 * len(batch)),
+                max_tokens=max(512, 160 * len(batch) + 80 * len(want)),
                 json_mode=True,
                 seed=1234,
                 **self._extra(),
@@ -270,24 +376,50 @@ class LlmTranslator:
         except Exception as e:  # adapter/http errors count as an invalid answer
             self.ctx.log.warning("llm call failed (%s): %s", self.name, e)
             return {}
-        got = parse_response(content, [b["id"] for b in batch], self.tgt)
+        got = parse_response(content, [b["id"] for b in batch], self.tgt, want)
         if len(got) < len(batch):
             self.failures += 1
             self.ctx.log.info("llm answer covered %d/%d lines (T=%.1f)", len(got), len(batch), temperature)
         return got
 
-    def translate(self, batch: list[dict[str, Any]], context: list[dict[str, Any]], summary: str) -> dict[str, dict[str, str]]:
-        got = self.attempt(batch, context, summary, self.t.llm.temperature)
+    def translate(self, batch: list[dict[str, Any]], context: list[dict[str, Any]], summary: str, scene_context: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+        got = self.attempt(batch, context, summary, self.t.llm.temperature, scene_context)
         for _ in range(max(1, self.t.llm.max_retries - 1)):
             missing = [b for b in batch if b["id"] not in got]
             if not missing:
                 return got
-            got.update(self.attempt(missing, context, summary, 0.0))
+            got.update(self.attempt(missing, context, summary, 0.0, scene_context))
         missing = [b for b in batch if b["id"] not in got]
         if missing and len(missing) > 1:
             half = len(missing) // 2
             for part in (missing[:half], missing[half:]):
-                got.update(self.translate(part, context, summary))
+                got.update(self.translate(part, context, summary, scene_context))
+        return got
+
+    def deliver(self, batch: list[dict[str, Any]], scene_context: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+        """Delivery-only request (imported translations, ``text_emotion.llm: on``): ``{id: validated delivery}``.
+
+        One attempt plus one at temperature 0 for the lines still missing; failures only mean "no llm delivery".
+        """
+        got: dict[str, dict[str, Any]] = {}
+        for _ in range(2):
+            todo = [b for b in batch if b["id"] not in got]
+            if not todo:
+                break
+            self.calls += 1
+            speakers = sorted({b["speaker_id"] for b in todo})
+            visible = [{k: v for k, v in b.items() if k != "speaker_id"} for b in todo]
+            msgs = [{"role": "system", "content": delivery_system_prompt(todo, speakers, self.gloss, self.chars)}]
+            msgs += self._context_messages("", [], scene_context)
+            msgs.append({"role": "user", "content": "Describe how these lines are spoken and answer with JSON only:\n" + json.dumps(visible, ensure_ascii=False)})
+            try:
+                content = self.backend.chat(msgs, temperature=0.0, max_tokens=max(512, 120 * len(todo)), json_mode=True, seed=1234, **self._extra())
+            except BackendUnavailable:
+                raise
+            except Exception as e:
+                self.ctx.log.warning("llm delivery call failed (%s): %s", self.name, e)
+                break
+            got.update(parse_delivery_response(content, [b["id"] for b in todo]))
         return got
 
     def summarize(self, scene: str, rows: list[dict[str, Any]]) -> str:
@@ -526,11 +658,30 @@ def finalize(rec: TranslationRecord, tgt: str, stresser: Any, fmt: str, plus: bo
 # ----------------------------------------------------------------------------
 
 
-def lines_to_translate(ctx: StageContext) -> list[LineRecord]:
+def include_unvoiced(ctx: StageContext) -> bool:
+    """Translate speaker lines without original audio too (mode B)? ``auto`` follows ``synth.voice_unvoiced``."""
+    mode = ctx.cfg.translate.include_unvoiced
+    if mode == "auto":
+        return bool(getattr(ctx.cfg.synth, "voice_unvoiced", False))
+    return mode == "on"
+
+
+def lines_to_translate(ctx: StageContext, apply_select: bool = True) -> list[LineRecord]:
     voiced = {l.line_id for l in ctx.voiced_lines(apply_only=False)}
     all_lines = ctx.lines()
-    out = [l for l in all_lines if l.line_id in voiced or "voice_sustain" in l.flags]
-    return ctx.select(out, voiced_only=False)
+    extra = {l.line_id for l in te_stage.unvoiced_speaker_lines(all_lines, voiced)} if include_unvoiced(ctx) else set()
+    out = [l for l in all_lines if l.line_id in voiced or "voice_sustain" in l.flags or l.line_id in extra]
+    return ctx.select(out, voiced_only=False) if apply_select else out
+
+
+def delivery_target_ids(ctx: StageContext, lines: list[LineRecord]) -> set[str]:
+    """Lines of this run whose delivery is wanted from the LLM: unvoiced speaker lines, when text_emotion uses the LLM."""
+    te = ctx.cfg.text_emotion
+    if not te.enabled or te.llm == "off":
+        return set()
+    voiced = {l.line_id for l in ctx.voiced_lines(apply_only=False)}
+    unvoiced = {l.line_id for l in te_stage.unvoiced_speaker_lines(ctx.lines(), voiced)}
+    return {l.line_id for l in lines if l.line_id in unvoiced}
 
 
 def _acquire_llm(ctx: StageContext) -> tuple[Any, str]:
@@ -557,6 +708,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
         return seed_glossary(ctx)
     tgt = (ctx.project.tgt_lang if ctx.project else None) or ctx.cfg.project.tgt_lang
     lines = lines_to_translate(ctx)
+    delivery_ids = delivery_target_ids(ctx, lines)
     chars = ctx.characters()
     gloss = load_glossary(glossary_path(ctx))
     lexicon = ja.load_interjections(ctx.cfg.resolve(t.interjections)) if tgt == "ru" else {}
@@ -582,10 +734,18 @@ def run(ctx: StageContext) -> dict[str, Any]:
                 txt = str(imported[l.line_id]).strip()
                 entries[l.line_id] = {"text_tgt": txt, "text_tgt_short": txt, "notes": "", "source": "import"}
         backend_name = "import"
+        # no LLM is loaded just for delivery unless text_emotion.llm == "on"
+        if delivery_ids and ctx.cfg.text_emotion.llm == "on":
+            targets = [l for l in lines if l.line_id in delivery_ids and (entries.get(l.line_id) or {}).get("text_tgt")]
+            if targets:
+                try:
+                    translate_deliveries(ctx, targets, entries, tgt, gloss, chars)
+                except (BackendUnavailable, StageError) as e:
+                    ctx.log.warning("llm delivery skipped: %s", e)
     else:
         todo = [l for l in lines if l.line_id not in entries]
         if todo:
-            backend_name = translate_llm(ctx, todo, entries, flags, tgt, gloss, chars)
+            backend_name = translate_llm(ctx, todo, entries, flags, tgt, gloss, chars, delivery_ids & {l.line_id for l in todo})
 
     # 3. records + post-processing
     plus = needs_plus(ctx) and tgt == "ru"
@@ -611,6 +771,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
                 source=e.get("source", ""),
                 glossary_hits=glossary_hits(l.text_src, gloss, chars),
                 flags=list(dict.fromkeys(fl)),
+                **({"delivery": e["delivery"]} if e.get("delivery") else {}),
             )
         )
 
@@ -636,11 +797,53 @@ def run(ctx: StageContext) -> dict[str, Any]:
         "interjections": sum(1 for r in recs if "interjection" in r.flags),
         "failed": sum(1 for r in recs if "translate_failed" in r.flags),
         "missing": sum(1 for r in recs if "translate_missing" in r.flags),
+        "deliveries": sum(1 for r in recs if (r.model_extra or {}).get("delivery")),
         "stress": stress_backend or f"none ({stress_reason})",
         "plus_variant": plus,
         "glossary": str(glossary_path(ctx)) if gloss else "none",
         "out": str(out_path),
     }
+
+
+
+def _scene_lines(ctx: StageContext) -> dict[str, list[LineRecord]]:
+    out: dict[str, list[LineRecord]] = {}
+    for l in ctx.lines():
+        out.setdefault(l.scene, []).append(l)
+    return out
+
+
+def _delivery_scene_context(
+    scene_all: list[LineRecord], ids: list[str], k: int, chars: dict[str, Character], gloss: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The script around ``ids`` (+-k lines, narration included) for the delivery request; ``deliver`` marks the targets."""
+    pos = {l.line_id: i for i, l in enumerate(scene_all)}
+    keep: set[int] = set()
+    for lid in ids:
+        i = pos.get(lid)
+        if i is not None:
+            keep.update(range(max(0, i - k), min(len(scene_all), i + k + 1)))
+    want = set(ids)
+    out: list[dict[str, Any]] = []
+    for i in sorted(keep):
+        l = scene_all[i]
+        if not (l.text_src or "").strip():
+            continue
+        r: dict[str, Any] = {"id": l.line_id, "speaker": _display_name(l.speaker_id, l, chars, gloss), "text": l.text_src}
+        if l.line_id in want:
+            r["deliver"] = True
+        out.append(r)
+    return out
+
+
+def _llm_key_backend(ctx: StageContext) -> str:
+    """The backend name decides the cache key: resolve without loading."""
+    llm = ctx.cfg.translate.llm
+    primary = llm.real_backend if (ctx.extra.get("real") and llm.backend.startswith("mock")) else llm.backend
+    try:
+        return ctx.models.resolve(primary)[0].name
+    except BackendUnavailable:
+        return primary
 
 
 def translate_llm(
@@ -651,17 +854,23 @@ def translate_llm(
     tgt: str,
     gloss: dict[str, Any],
     chars: dict[str, Character],
+    delivery_ids: set[str] | None = None,
 ) -> str:
+    """Translate ``todo`` per scene. Lines in ``delivery_ids`` (unvoiced speaker lines) go in their own batches after
+    the scene's regular ones and also return a ``delivery`` object (see the module docstring)."""
     t = ctx.cfg.translate
+    delivery_ids = delivery_ids or set()
     store = OpCache(ctx, "translate_llm")
     gloss_hash = hash_obj(gloss)
     scenes: dict[str, list[LineRecord]] = {}
     for l in todo:
         scenes.setdefault(l.scene, []).append(l)
+    scene_all = _scene_lines(ctx) if delivery_ids else {}
 
-    def row(l: LineRecord) -> dict[str, Any]:
-        style = (read_json(ctx.paths.passport(l.line_id)) or {}).get("style") or {}
-        return {
+    def row(l: LineRecord, want: bool = False) -> dict[str, Any]:
+        # the emotion hint comes from an audio passport; delivery targets have none (a text passport would feed back)
+        style = {} if want else ((read_json(ctx.paths.passport(l.line_id)) or {}).get("style") or {})
+        r = {
             "id": l.line_id,
             "speaker": _display_name(l.speaker_id, l, chars, gloss),
             "speaker_id": l.speaker_id,
@@ -669,6 +878,9 @@ def translate_llm(
             "emotion": style.get("emotion", ""),
             "text": l.text_src,
         }
+        if want:
+            r["want_delivery"] = True
+        return r
 
     translator: LlmTranslator | None = None
     backend_name = ""
@@ -680,17 +892,24 @@ def translate_llm(
             translator = LlmTranslator(ctx, backend, backend_name, tgt, gloss, chars)
         return translator
 
-    # the backend name decides the cache key: resolve without loading
+    def context_before(scene: str, line_id: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for l in scene_all.get(scene, []):
+            if l.line_id == line_id:
+                break
+            e = entries.get(l.line_id)
+            if e is not None and e.get("text_tgt"):
+                out.append({"speaker": _display_name(l.speaker_id, l, chars, gloss), "text": l.text_src, tgt: e["text_tgt"]})
+        return out[-t.context_window_lines :] if t.context_window_lines else []
+
     llm = t.llm
-    primary = llm.real_backend if (ctx.extra.get("real") and llm.backend.startswith("mock")) else llm.backend
-    try:
-        key_backend = ctx.models.resolve(primary)[0].name
-    except BackendUnavailable:
-        key_backend = primary
+    key_backend = _llm_key_backend(ctx)
 
     for scene, scene_lines in scenes.items():
-        rows = [row(l) for l in scene_lines]
-        summary_key = store.key("summary", key_backend, scene, [r["text"] for r in rows])
+        rows = [row(l) for l in scene_lines if l.line_id not in delivery_ids]
+        t_rows = [row(l, True) for l in scene_lines if l.line_id in delivery_ids]
+        summary_rows = rows or t_rows
+        summary_key = store.key("summary", key_backend, scene, [r["text"] for r in summary_rows])
         summary = store.get(f"summary:{scene}", summary_key)
         history: list[dict[str, Any]] = []
         for i in range(0, len(rows), max(1, t.batch_lines)):
@@ -702,7 +921,7 @@ def translate_llm(
             if got is None:
                 tr = get_translator()
                 if summary is None:
-                    summary = tr.summarize(scene, rows)
+                    summary = tr.summarize(scene, summary_rows)
                     store.put(f"summary:{scene}", summary_key, summary)
                 got = tr.translate(batch, context, summary)
                 if len(got) == len(batch):
@@ -714,7 +933,142 @@ def translate_llm(
                     continue
                 entries[b["id"]] = {**e, "source": f"llm:{backend_name or key_backend}"}
                 history.append({"speaker": b["speaker"], "text": b["text"], tgt: e["text_tgt"]})
+        # delivery stream: lines nobody voices, translated with the surrounding script as context
+        for i in range(0, len(t_rows), max(1, t.batch_lines)):
+            batch = t_rows[i : i + t.batch_lines]
+            context = context_before(scene, batch[0]["id"])
+            sc = _delivery_scene_context(scene_all.get(scene, []), [b["id"] for b in batch], ctx.cfg.text_emotion.llm_context_lines, chars, gloss)
+            bkey = store.key(DELIVERY_PROTOCOL, key_backend, tgt, gloss_hash, batch, context, sc, llm.temperature)
+            item_id = f"batch:{scene}:{batch[0]['id']}:{len(batch)}:delivery"
+            got = store.get(item_id, bkey)
+            if got is None:
+                tr = get_translator()
+                if summary is None:
+                    summary = tr.summarize(scene, summary_rows)
+                    store.put(f"summary:{scene}", summary_key, summary)
+                got = tr.translate(batch, context, summary, sc)
+                if len(got) == len(batch):
+                    store.put(item_id, bkey, got)
+                store.save()
+            for b in batch:
+                e = got.get(b["id"])
+                if e is not None:
+                    entries[b["id"]] = {**e, "source": f"llm:{backend_name or key_backend}"}
     store.save()
     if translator is not None:
         ctx.log.info("llm calls: %d, incomplete answers: %d", translator.calls, translator.failures)
     return backend_name or key_backend
+
+
+def translate_deliveries(
+    ctx: StageContext,
+    targets: list[LineRecord],
+    entries: dict[str, dict[str, Any]],
+    tgt: str,
+    gloss: dict[str, Any],
+    chars: dict[str, Character],
+) -> None:
+    """Delivery-only LLM pass for lines whose translation is already known (``text_emotion.llm: on`` with an import).
+
+    Adds ``entry["delivery"]`` where the model gave a valid object; the same client, batching and cache as
+    :func:`translate_llm`, one model load shared with nothing else in this run.
+    """
+    t = ctx.cfg.translate
+    store = OpCache(ctx, "translate_delivery")
+    gloss_hash = hash_obj(gloss)
+    key_backend = _llm_key_backend(ctx)
+    scene_all = _scene_lines(ctx)
+    translator: LlmTranslator | None = None
+    scenes: dict[str, list[LineRecord]] = {}
+    for l in targets:
+        scenes.setdefault(l.scene, []).append(l)
+    for scene, scene_lines in scenes.items():
+        rows = [
+            {
+                "id": l.line_id, "speaker": _display_name(l.speaker_id, l, chars, gloss), "speaker_id": l.speaker_id,
+                "gender": _gender_of(l.speaker_id, chars, gloss), "text": l.text_src,
+                "translation": entries[l.line_id]["text_tgt"], "want_delivery": True,
+            }
+            for l in scene_lines
+        ]
+        for i in range(0, len(rows), max(1, t.batch_lines)):
+            batch = rows[i : i + t.batch_lines]
+            sc = _delivery_scene_context(scene_all.get(scene, []), [b["id"] for b in batch], ctx.cfg.text_emotion.llm_context_lines, chars, gloss)
+            bkey = store.key(DELIVERY_PROTOCOL, "delivery_only", key_backend, tgt, gloss_hash, batch, sc)
+            item_id = f"batch:{scene}:{batch[0]['id']}:{len(batch)}"
+            got = store.get(item_id, bkey)
+            if got is None:
+                if translator is None:
+                    backend, name = _acquire_llm(ctx)
+                    translator = LlmTranslator(ctx, backend, name, tgt, gloss, chars)
+                got = translator.deliver(batch, sc)
+                store.put(item_id, bkey, got)
+                store.save()
+            for b in batch:
+                if b["id"] in got:
+                    entries[b["id"]]["delivery"] = got[b["id"]]
+    store.save()
+
+
+# ----------------------------------------------------------------------------
+# import preview (the app's "I have a translation" step)
+# ----------------------------------------------------------------------------
+
+IMPORT_SUFFIXES = (".jsonl", ".json", ".csv", ".tsv", ".xlsx")
+
+
+def detect_import_format(path: Path, lines: list[LineRecord] | None = None) -> str:
+    """Name of the import format ``load_import`` will use: jsonl | json_map | json_rows | json_pairs |
+    vntextpatch | csv | tsv | xlsx | folder:<suffixes> (a folder holding several of them)."""
+    if path.is_dir():
+        kinds = sorted({p.suffix.lower().lstrip(".") for p in path.iterdir() if p.suffix.lower() in IMPORT_SUFFIXES})
+        return "folder:" + "+".join(kinds) if kinds else "folder"
+    suf = path.suffix.lower()
+    if suf == ".json":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return "json"
+        if isinstance(data, dict):
+            if all(isinstance(v, str) for v in data.values()):
+                return "json_map"
+            data = data.get("lines") or data.get("messages") or []
+        rows = [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+        if rows and any(k in rows[0] for k in _ID_KEYS):
+            return "json_rows"
+        if rows and any(k in rows[0] for k in _SRC_KEYS):
+            return "json_pairs"
+        return "vntextpatch"
+    return {".jsonl": "jsonl", ".csv": "csv", ".tsv": "tsv", ".xlsx": "xlsx"}.get(suf, "unknown")
+
+
+def preview_import(ctx: StageContext, path: str, n: int = 5) -> dict[str, Any]:
+    """How a translation file/folder would match the lines, with the importers ``translate.import`` uses. No writes.
+
+    Returns ``{"format", "matched", "total", "preview": [{"line_id", "text_src", "text_tgt"}], "files", "in_file"}``:
+    ``total`` = lines translate would handle (voiced + sustain, + unvoiced speaker lines when included), ``matched``
+    = those the file gives a non-empty text for, ``preview`` = the first ``n`` of them in script order.
+    """
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = ctx.cfg.resolve(path)
+    tgt = (ctx.project.tgt_lang if ctx.project else None) or ctx.cfg.project.tgt_lang
+    all_lines = ctx.lines()
+    cand = lines_to_translate(ctx, apply_select=False)
+    try:
+        imported = load_import(p, all_lines, tgt, ctx.log)
+        fmt = detect_import_format(p)
+    except StageError:
+        raise
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError, KeyError) as e:
+        raise StageError(f"cannot read the translation {p.name}: {e}") from e
+    matched = [l for l in cand if str(imported.get(l.line_id, "")).strip()]
+    files = len([q for q in p.iterdir() if q.suffix.lower() in IMPORT_SUFFIXES]) if p.is_dir() else 1
+    return {
+        "format": fmt,
+        "matched": len(matched),
+        "total": len(cand),
+        "preview": [{"line_id": l.line_id, "text_src": l.text_src, "text_tgt": str(imported[l.line_id]).strip()} for l in matched[: max(0, int(n))]],
+        "files": files,
+        "in_file": len(imported),
+    }

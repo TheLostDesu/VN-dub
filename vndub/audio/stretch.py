@@ -52,3 +52,34 @@ def stretch(tools: Tools, src: Path, dst: Path, factor: float, engine: str = "ru
     # atempo: tempo = 1/factor
     ffmpeg.atempo(tools, src, dst, 1.0 / factor)
     return "atempo"
+
+
+def retune(tools: Tools, src: Path, dst: Path, factor: float = 1.0, pitch_st: float = 0.0, engine: str = "rubberband") -> str:
+    """Write ``dst`` with duration ``factor`` x the input and the pitch moved by ``pitch_st`` semitones.
+
+    ``master``'s last-resort pass for the voice tuning (backends with no native pitch / speed knob).
+    Rubber Band does both in one pass (``-t`` and ``-p``); without it ffmpeg shifts pitch and speed
+    together (``asetrate`` + ``aresample``) and ``atempo`` then restores the duration and applies ``factor``.
+    Returns the engine actually used.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if engine == "rubberband":
+        rb = tools.resolve("rubberband")
+        if rb is not None:
+            cmd = [str(rb), "-q", "--fine", "-t", f"{factor:.6f}"]
+            if pitch_st:
+                cmd += ["-p", f"{pitch_st:.4f}"]
+            r = subprocess.run([*cmd, str(src), str(dst)], capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if r.returncode == 0 and dst.exists():
+                return "rubberband"
+    import soundfile as sf
+
+    ratio = 2.0 ** (pitch_st / 12.0)
+    sr = int(sf.info(str(src)).samplerate)
+    filters = []
+    if pitch_st:
+        filters += [f"asetrate={sr * ratio:.3f}", f"aresample={sr}"]
+    filters.append(ffmpeg.atempo_chain(1.0 / (ratio * factor)))
+    ff = tools.require("ffmpeg", "pitch / tempo pass")
+    ffmpeg._run([str(ff), "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-filter:a", ",".join(filters), "-c:a", "pcm_s16le", str(dst)])
+    return "atempo"

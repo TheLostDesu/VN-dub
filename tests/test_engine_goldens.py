@@ -9,7 +9,7 @@ import pytest
 from engine_helpers import check_golden, detect_and_parse
 
 CASES = [
-    ("renpy_mini", "renpy", 20, 25),
+    ("renpy_mini", "renpy", 20, 41),
     ("kag_mini", "kirikiri", 5, 7),
     ("nscripter_mini", "nscripter", 4, 6),
     ("siglus_mini", "siglus", 4, 4),
@@ -41,8 +41,8 @@ def test_renpy_fixture_details(make_ctx, fixtures_dir: Path) -> None:
     assert "voice_sustain" in cont.flags and not cont.has_voice and cont.voice_file is None
     assert head.voice_file == "voice/har_0006.ogg"
     speakers = {l.speaker_id for l in res.lines}
-    assert speakers == {"narrator", "sakura", "haruto", "yui"}
-    assert {l.scene for l in res.lines} == {"start", "after_menu"}
+    assert speakers == {"narrator", "sakura", "haruto", "yui", "hero"}
+    assert {l.scene for l in res.lines} == {"start", "after_menu", "epilogue"}
     assert all(l.context_prev == [] or set(l.context_prev) <= set(by) for l in res.lines)
     assert res.characters["sakura"].names["src"] == "さくら" and res.characters["sakura"].voice_prefix == "sak"
 

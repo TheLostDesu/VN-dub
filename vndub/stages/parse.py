@@ -6,6 +6,17 @@ switches any engine to the generic VNTextPatch import with prefix voices.
 Existing ``characters.yaml`` user edits (target names, gender, age, route,
 notes, performer/rvc/lora) are kept. Audio files no line refers to are
 listed in ``manifest/unbound_audio.jsonl`` (link can search them globally).
+
+Mode C (``link.recover_text``): when the script yields no lines at all (unsupported or
+encrypted script, generic engine without a text import) but voice files exist, parse still
+writes one voiced line with empty text per file (``flags: [voice_only]``) so ``link`` can
+recover the text from the audio. With the option off the engine's own error is raised as before.
+
+Voiced lines the script shows without a speaker name (``parse.hidden_speakers: auto``): an off-screen
+voice in the narrator box, or a name such as ``？？？``, goes to the character its voice-file prefix
+names (flag ``speaker_from_voice``); narrator-box lines no prefix identifies go to the ``voice_over``
+speaker (flag ``offscreen_voice``), which is cast and dubbed like any character. Unvoiced narration is
+never touched. See :func:`vndub.engines.base.resolve_hidden_speakers`.
 """
 
 from __future__ import annotations
@@ -13,16 +24,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from vndub.engines.base import ExtractResult, ParseResult
-from vndub.engines.generic_prefix import import_vntextpatch
+from vndub.engines.base import VOICE_OVER, VOICE_OVER_NAMES, ExtractResult, ParseResult, build_characters, resolve_hidden_speakers
+from vndub.engines.generic_prefix import import_vntextpatch, textless_result
 from vndub.manifest.io import AudioIndexRecord, Character, load_characters, read_jsonl, save_characters, write_jsonl
 from vndub.stages.common import StageContext, StageError
 
 NAME = "parse"
-VERSION = "1"
+VERSION = "2"
 CONFIG_SECTIONS = ("parse",)
 
-USER_FIELDS = ("gender", "age_hint", "route", "notes", "performer", "rvc", "lora", "refs")
+USER_FIELDS = ("gender", "age_hint", "route", "notes", "performer", "rvc", "lora", "refs", "description")
 
 
 def merge_characters(new: dict[str, Character], old: dict[str, Character]) -> dict[str, Character]:
@@ -56,16 +67,38 @@ def run(ctx: StageContext) -> dict[str, Any]:
         result: ParseResult = import_vntextpatch(ctx, Path(imp), audio)
         source = f"vntextpatch:{imp}"
     else:
-        result = ctx.engine().parse(ctx, extracted, audio)
+        try:
+            result = ctx.engine().parse(ctx, extracted, audio)
+        except StageError as e:
+            if not (ctx.cfg.link.recover_text and audio):
+                raise
+            ctx.log.warning("script not parsed (%s): voice-only lines for text recovery", e)
+            result = textless_result(ctx, audio, str(e)[:120])
         source = proj.engine
+    if ctx.cfg.link.recover_text and audio and not result.lines:
+        result = textless_result(ctx, audio, "the script gave no lines")
+        source = f"{source}+voice_only"
     lines = result.lines
     seen: set[str] = set()
-    for l in lines:
+    n_units = max(1, 2 * len(lines))
+    for i, l in enumerate(lines, 1):
         if l.line_id in seen:
             raise StageError(f"duplicate line_id {l.line_id} from the {source} parser")
         seen.add(l.line_id)
+        if i % 100 == 0:
+            ctx.progress(i, n_units, l.line_id)
+    hidden = {"from_voice": 0, "voice_over": 0}
+    if ctx.cfg.parse.hidden_speakers == "auto":
+        before = {l.line_id: l.speaker_id for l in lines}
+        hidden = resolve_hidden_speakers(lines)
     old = load_characters(ctx.paths.characters) if ctx.paths.characters.exists() else {}
+    if any(hidden.values()):
+        result.characters = _hidden_characters(lines, before, result.characters, ctx.cfg.project.tgt_lang)
     chars = merge_characters(result.characters, old)
+    if any(hidden.values()):
+        live = {l.speaker_id for l in lines if l.has_voice or l.speaker_id != "narrator"}
+        for sid in set(before.values()) - live:  # the narrator / a ？？？ speaker whose voiced lines all moved
+            chars.pop(sid, None)
     write_jsonl(ctx.paths.lines, lines)
     save_characters(ctx.paths.characters, chars)
     bound = {l.audio_id for l in lines if l.audio_id}
@@ -76,8 +109,11 @@ def run(ctx: StageContext) -> dict[str, Any]:
     voiced = [l for l in lines if l.has_voice]
     missing = [l for l in lines if "voice_missing" in l.flags]
     speakers: dict[str, int] = {}
-    for l in voiced:
+    for i, l in enumerate(voiced, 1):
         speakers[l.speaker_id] = speakers.get(l.speaker_id, 0) + 1
+        if i % 100 == 0:
+            ctx.progress(len(lines) + i, n_units, l.line_id)
+    ctx.progress(n_units, n_units, None)
     coverage = len(bound) / len(audio) if audio else 0.0
     return {
         "source": source,
@@ -92,5 +128,22 @@ def run(ctx: StageContext) -> dict[str, Any]:
         "sustain_lines": sum(1 for l in lines if "voice_sustain" in l.flags),
         "speakers": speakers,
         "characters": len(chars),
+        "hidden_speakers": hidden,
         "notes": result.notes[:4],
     }
+
+
+def _hidden_characters(lines: list, before: dict[str, str], chars: dict[str, Character], tgt_lang: str) -> dict[str, Character]:
+    """Characters after :func:`resolve_hidden_speakers`: counts follow the moved lines, ``voice_over`` exists."""
+    out = dict(chars)
+    for sid in set(before.values()) - {l.speaker_id for l in lines}:
+        out.pop(sid, None)
+    if not any(l.has_voice and l.speaker_id == "narrator" for l in lines):
+        out.pop("narrator", None)
+    for c in out.values():
+        c.stats.n_lines = 0
+    out = build_characters(lines, existing=out)
+    vo = out.get(VOICE_OVER)
+    if vo is not None and vo.names.get("src") == VOICE_OVER:
+        vo.names = {"src": "", "tgt": VOICE_OVER_NAMES.get(tgt_lang, "")}
+    return out

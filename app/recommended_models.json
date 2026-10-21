@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "checked": "2026-10-21",
+  "comment": "Links shown under 'Add a model by link' (Models screen). Edit freely: the app reads this file at request time, no rebuild needed. Every repo was checked against the Hugging Face API on the date above (file name and size = the quantization the app would pick). Not tested on a GPU here: translation quality is for the user to judge.",
+  "items": [
+    {
+      "repo": "tencent/Hy-MT2-7B-GGUF",
+      "kind": "gguf_llm",
+      "file": "Hy-MT2-7B-Q4_K_M.gguf",
+      "size_gb": 4.62,
+      "license": "apache-2.0",
+      "title": {"ru": "Hy-MT2 7B: переводчик Tencent нового поколения", "en": "Hy-MT2 7B: Tencent's newer translation model"},
+      "note": {
+        "ru": "Специализированный машинный переводчик, преемник встроенной HY-MT 1.5 7B. Лицензия Apache-2.0, влезает в 8 ГБ видеопамяти.",
+        "en": "A dedicated machine-translation model, successor of the built-in HY-MT 1.5 7B. Apache-2.0, fits 8 GB of video memory."
+      }
+    },
+    {
+      "repo": "unsloth/gemma-3-12b-it-GGUF",
+      "kind": "gguf_llm",
+      "file": "gemma-3-12b-it-Q4_K_M.gguf",
+      "size_gb": 7.3,
+      "license": "gemma",
+      "title": {"ru": "Gemma 3 12B: универсальная модель Google", "en": "Gemma 3 12B: Google's general model"},
+      "note": {
+        "ru": "Прошлое поколение встроенной Gemma 4, универсальная модель (не только перевод). Около 8 ГБ видеопамяти и больше. Условия использования Gemma.",
+        "en": "The previous generation of the built-in Gemma 4, a general model (not only translation). About 8 GB of video memory or more. Gemma terms of use."
+      }
+    },
+    {
+      "repo": "tencent/Hy-MT2-1.8B-GGUF",
+      "kind": "gguf_llm",
+      "file": "Hy-MT2-1.8B-Q4_K_M.gguf",
+      "size_gb": 1.13,
+      "license": "apache-2.0",
+      "title": {"ru": "Hy-MT2 1.8B: лёгкий переводчик", "en": "Hy-MT2 1.8B: a light translator"},
+      "note": {
+        "ru": "Маленькая модель для слабых видеокарт и быстрых проб: занимает около 1 ГБ; от модели такого размера стоит ждать более простого перевода, чем от 7B. Apache-2.0.",
+        "en": "A small model for weak graphics cards and quick tries: about 1 GB; expect simpler translations than from the 7B. Apache-2.0."
+      }
+    }
+  ]
+}

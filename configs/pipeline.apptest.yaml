@@ -1,0 +1,63 @@
+# App test profile: every backend is a deterministic mock, nothing is downloaded or loaded.
+# Used by the desktop-app tests (FastAPI endpoints, Playwright wizard walk) and by
+# `VNDUB_APP_PROFILE=apptest uv run vndub-app` for UI work: a full run on
+# tests/fixtures/renpy_mini takes seconds, not minutes.
+#
+#   uv run vndub run --config configs/pipeline.apptest.yaml --project tests/fixtures/renpy_mini
+
+extends: pipeline.test.yaml
+profile: test
+fallback_to_mock: true
+
+link:
+  asr: mock_asr
+  asr_fallback: ""
+  recover_asr: mock_asr
+  speaker_embedder: mock_embedder
+
+analyze:
+  e2v: mock_ser
+  anime_ser: mock_anime_ser
+  adv: mock_adv
+  events: mock_events
+  aligner: mock_aligner
+  aligner_fallback: ""
+  f0: librosa_f0
+  vad: energy_vad
+  caption: false
+
+translate:
+  llm:
+    backend: mock_translator
+    fallbacks: []
+  stress:
+    tool: none
+
+voicebank:
+  performer:
+    backend: mock_tts
+  rvc:
+    backend: mock_vc
+  calibrate_spk: false
+
+synth:
+  n_candidates: 2
+  n_candidates_short: 2
+  backends:
+    mock_tts: {enabled: true}
+    sapi_tts: {enabled: false}
+  vc:
+    primary: mock_vc
+    fallback: ""
+
+score:
+  mos: mock_mos
+  mos_fallback: ""
+  aesthetics: mock_aesthetics
+  speaker: mock_embedder
+  speaker_extra: ""
+  cer_asr: mock_asr
+  cer_asr_fallback: ""
+  emotion: mock_ser
+  adv: mock_adv
+  regen_rounds: 0

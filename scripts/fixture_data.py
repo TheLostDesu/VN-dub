@@ -5,8 +5,14 @@ Japanese voice files ``game/voice/*.ogg`` and ``tests/fixtures/mock_dictionary.y
 (the MockTranslator dictionary). Golden parser output in tests is derived from
 the same table, so editing it means regenerating fixtures and goldens.
 
+The game is MIXED on purpose: the three heroines/friends are voiced, the protagonist `mc`
+(speaker id `hero`, name 蓮) has no voice at all, and unvoiced narration lines around his
+dialogue carry delivery cues in Japanese (…と叫んだ, 小さな声でささやいた, 笑いながら言った,
+泣きながら言った, 怒鳴った) -- plus lines with no cue at all. The 20 voiced lines and their audio
+are exactly the original fixture (the generator never re-renders existing voice files).
+
 Row kinds:
-  ("say", char, ja, ru, voice, delivery)     voiced (voice != None) or unvoiced line
+  ("say", char, ja, ru, voice, delivery)     voiced (voice != None) or unvoiced line (voice None, delivery None)
   ("narr", ja, ru)                           narrator line (never voiced)
   ("sustain", char, ja, ru)                  `voice sustain` + say: continues the previous voice file
   ("menu", [(choice_ja, choice_ru, [rows...]), ...])
@@ -23,6 +29,8 @@ CHARACTERS = {
     "s": ("さくら", "sakura", "f", "Сакура", "+15%", "+5%"),
     "h": ("陽翔", "haruto", "m", "Харуто", "-45%", "-5%"),
     "y": ("ゆい", "yui", "f", "Юи", "+35%", "-5%"),
+    # unvoiced protagonist (the player character): no audio is rendered for him
+    "mc": ("蓮", "hero", "m", "Рэн", "+0%", "+0%"),
 }
 
 HAPPY = ("+10%", "+10%", "loud")
@@ -44,6 +52,13 @@ SCRIPT = [
     ("narr", "ゆいは少し寂しそうに笑った。", "Юи немного грустно улыбнулась."),
     ("say", "y", "わたしは……今回もだめだった。", "А у меня... опять ничего не вышло.", "voice/yui_0002.ogg", SAD),
     ("say", "h", "次はきっと大丈夫だよ。", "В следующий раз всё обязательно получится.", "voice/har_0003.ogg", CALM),
+    # --- the unvoiced protagonist steps in; the narration around his lines holds the delivery cues
+    ("say", "mc", "……ゆい、大丈夫か？", "...Юи, ты в порядке?", None, None),
+    ("narr", "蓮はゆいにだけ聞こえるよう、小さな声でささやいた。", "Рэн прошептал так, чтобы слышала только Юи."),
+    ("narr", "さくらが胸を張るのを見て、蓮は笑いながら言った。", "Увидев, как Сакура гордо выпрямилась, Рэн сказал со смехом."),
+    ("say", "mc", "はいはい、百点はすごいよ。さくらは偉い偉い。", "Ладно-ладно, сто баллов — это здорово. Молодец, Сакура.", None, None),
+    ("say", "mc", "でも、ゆいだって毎日遅くまで頑張ってたんだぞ。", "Но Юи тоже каждый день допоздна старалась.", None, None),
+    ("narr", "蓮は悔しさをこらえきれず、泣きながら言った。", "Не в силах сдержать досаду, Рэн сказал сквозь слёзы."),
     (
         "menu",
         [
@@ -75,6 +90,18 @@ SCRIPT = [
     ("say", "h", "また明日な。", "До завтра.", "voice/har_0007.ogg", CALM),
     ("say", "y", "また明日ね！", "До завтра!", "voice/yui_0006.ogg", HAPPY),
     ("say", "s", "じゃあね！", "Пока!", "voice/sak_0007.ogg", HAPPY),
+    ("narr", "校門の前で、三人は手を振って別れた。", "У школьных ворот трое помахали друг другу и разошлись."),
+    # --- epilogue: the hero line "みんな、帰ったのか。" has no cue within three narration lines either way
+    ("label", "epilogue"),
+    ("narr", "三人の背中が、夕焼けの中へ遠ざかっていく。", "Три силуэта удалялись в закатном свете."),
+    ("say", "mc", "みんな、帰ったのか。", "Все уже ушли?", None, None),
+    ("narr", "教室には蓮ひとりだけが残った。", "В классе остался один Рэн."),
+    ("narr", "黒板の上の時計が、静かに時を刻んでいる。", "Часы над доской тихо отсчитывали время."),
+    ("narr", "机の上には、さくらの忘れ物のノートが置かれていた。", "На парте лежала тетрадь, которую забыла Сакура."),
+    ("say", "mc", "おい、さくら、ノートを忘れてるぞ！", "Эй, Сакура, ты забыла тетрадь!", None, None),
+    ("narr", "蓮は廊下に飛び出して、待ってくれと叫んだ。", "Рэн выбежал в коридор и крикнул, чтобы она подождала."),
+    ("narr", "返事がないので、蓮は腹立ちまぎれに怒鳴った。", "Ответа не было, и Рэн в сердцах рявкнул."),
+    ("say", "mc", "もういい、明日渡すからな！", "Ладно, завтра отдам!", None, None),
 ]
 
 

@@ -66,14 +66,16 @@ def run(ctx: StageContext) -> dict[str, Any]:
     if forced and forced not in ENGINES:
         raise StageError(f"unknown engine {forced!r}; known: {', '.join(ENGINES)}")
     results: list[DetectResult] = []
-    for eng in all_engines():
+    engines = list(all_engines())
+    for i, eng in enumerate(engines, 1):
         try:
             r = eng.detect(game)
         except Exception as e:  # a broken detector must not stop detection
             ctx.log.warning("detector %s failed: %s", eng.name, e)
-            continue
+            r = None
         if r is not None:
             results.append(r)
+        ctx.progress(i, len(engines), eng.name)
     results.sort(key=lambda r: -r.confidence)
     chosen: DetectResult | None = None
     if forced:

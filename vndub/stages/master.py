@@ -6,11 +6,23 @@ within ``max_stretch``), loudness-normalize to the character's median LUFS with 
 true-peak limiter, resample to the source sample rate / channel count, and
 encode to the source codec under exactly the original ``voice_file`` name in
 ``work/final/encoded/``. ``orig`` winners copy the original file bytes.
+
+Lines without original audio (``synth.voice_unvoiced``, route P) have no duration to match and no
+original silence profile: no stretch toward a source duration, trim to a default profile, loudness from the
+character's stats, else the game's median character loudness, else ``default_lufs``. They are written as
+``unvoiced/<dialogue id or line id>.<ext>`` (``FinalIndexRecord.unvoiced = true``; ``pack`` places them).
+
+The voice tuning's leftovers (recorded in the winner's sidecar by synth) are applied here: a pitch and / or
+tempo pass (Rubber Band, ffmpeg fallback) for what the backend could not do natively, and the energy ->
+loudness offset. The requested speed always applies (it is not limited by ``stretch.max_stretch``; it is
+within 0.8..1.2); the source-duration stretch then compares against the speed-adjusted duration.
 """
 
 from __future__ import annotations
 
+import re
 import shutil
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +61,9 @@ def trim_to_profile(y: np.ndarray, sr: int, lead_s: float, trail_s: float) -> np
     return np.concatenate([np.zeros(int(max(0.0, lead_s) * sr), dtype=y.dtype), body, np.zeros(int(max(0.0, trail_s) * sr), dtype=y.dtype)])
 
 
-def target_lufs(ctx: Any, sid: str, chars: dict[str, Any]) -> tuple[float, str]:
+def target_lufs(ctx: Any, sid: str, chars: dict[str, Any], game_median: float | None = None) -> tuple[float, str]:
+    """Loudness target of a character. ``game_median`` (lines without original audio only): used for a
+    character without own stats, so an unvoiced protagonist sits at the level of the voiced cast."""
     t = ctx.cfg.master.loudness.target
     if not isinstance(t, str):
         return float(t), "configured"
@@ -60,7 +74,26 @@ def target_lufs(ctx: Any, sid: str, chars: dict[str, Any]) -> tuple[float, str]:
     c = chars.get(sid)
     if t == "character_median" and c is not None and c.stats.lufs_median is not None:
         return float(c.stats.lufs_median), "character median"
+    if t == "character_median" and game_median is not None:
+        return float(game_median), "game median"
     return float(ctx.cfg.master.loudness.default_lufs), "default"
+
+
+_UNVOICED_EXT = {"vorbis": "ogg", "opus": "opus", "mp3": "mp3", "flac": "flac", "aac": "m4a", "pcm_s16le": "wav"}
+
+
+def unvoiced_name(line: LineRecord, codec: str | None) -> str:
+    """Encoded file name of a line without original audio: ``unvoiced/<dialogue id | line id>.<ext>``."""
+    stem = str((line.model_extra or {}).get("dialogue_id") or line.line_id)
+    stem = re.sub(r"[^0-9A-Za-z_.-]+", "_", stem)
+    return "unvoiced/" + stem + "." + _UNVOICED_EXT.get(codec or "vorbis", "ogg")
+
+
+def tuning_plan_of(ctx: Any, winner: Path) -> dict[str, Any] | None:
+    """The winner's recorded tuning plan (``params.tuning.plan`` of its synth sidecar), if it has one."""
+    side = read_json(winner.with_suffix(".json")) or {}
+    plan = (((side.get("params") or {}).get("tuning")) or {}).get("plan")
+    return plan if isinstance(plan, dict) else None
 
 
 def _bitrate(audio: AudioIndexRecord | None, project: Any) -> int | None:
@@ -76,14 +109,17 @@ def run(ctx: Any) -> dict[str, Any]:
     sel = gu.load_selection(ctx)
     if not sel:
         raise StageError(f"{ctx.paths.selection} not found: run `vndub score` first")
-    lines = {l.line_id: l for l in ctx.voiced_lines()}
+    lines = {l.line_id: l for l in ctx.dub_lines()}
     audio = gu.load_audio_index(ctx)
     chars = ctx.characters()
     project = ctx.project
     cache = ctx.cache(NAME, VERSION, "master")
     records: list[FinalIndexRecord] = []
     summary: dict[str, Any] = {"lines": 0, "encoded": 0, "cached": 0, "stretched": 0, "skipped": {}, "errors": {}}
-    for lid, line in lines.items():
+    medians = [float(c.stats.lufs_median) for c in chars.values() if c.stats.lufs_median is not None]
+    game_median = statistics.median(medians) if medians else None
+    for n_done, (lid, line) in enumerate(lines.items(), 1):
+        ctx.progress(n_done - 1, len(lines), lid)
         s: SelectionRecord | None = sel.get(lid)
         if s is None or not s.winner:
             summary["skipped"]["no winner"] = summary["skipped"].get("no winner", 0) + 1
@@ -100,7 +136,7 @@ def run(ctx: Any) -> dict[str, Any]:
         summary["lines"] += 1
         a = audio.get(line.audio_id or "")
         try:
-            rec, cached, stretched = _master_line(ctx, cache, line, s, a, chars, project, status)
+            rec, cached, stretched = _master_line(ctx, cache, line, s, a, chars, project, status, game_median)
         except Exception as e:  # keep going: one broken line must not stop the patch
             ctx.log.error("master %s failed: %s", lid, e)
             summary["errors"][lid] = f"{type(e).__name__}: {e}"[:200]
@@ -115,6 +151,8 @@ def run(ctx: Any) -> dict[str, Any]:
         prev = {r.line_id: r for r in read_jsonl(ctx.paths.final_index, FinalIndexRecord)} if ctx.paths.final_index.exists() else {}
         mine = {r.line_id for r in records}
         records += [r for lid, r in prev.items() if lid not in mine]
+    if lines:
+        ctx.progress(len(lines), len(lines), None)
     cache.save()
     write_jsonl(ctx.paths.final_index, records)
     for k in ("skipped", "errors"):
@@ -126,9 +164,16 @@ def run(ctx: Any) -> dict[str, Any]:
     return summary
 
 
-def _master_line(ctx: Any, cache: Any, line: LineRecord, s: SelectionRecord, a: AudioIndexRecord | None, chars: dict[str, Any], project: Any, status: str) -> tuple[FinalIndexRecord, bool, bool]:
+def _master_line(ctx: Any, cache: Any, line: LineRecord, s: SelectionRecord, a: AudioIndexRecord | None, chars: dict[str, Any], project: Any, status: str, game_median: float | None = None) -> tuple[FinalIndexRecord, bool, bool]:
     cfg = ctx.cfg.master
-    voice_file = line.voice_file or (a.relpath if a else f"{line.line_id}.wav")
+    unvoiced = not line.has_voice
+    codec_name = (a.codec if a else "") or (project.voice_codec.codec if project else "vorbis")
+    codec = _CODEC_MAP.get(codec_name, None)
+    if unvoiced:
+        voice_file = unvoiced_name(line, codec_name)
+    else:
+        voice_file = line.voice_file or (a.relpath if a else f"{line.line_id}.wav")
+    extra = {"unvoiced": True} if unvoiced else {}
     encoded = ctx.paths.final_encoded / voice_file
     final_wav = ctx.paths.final_wav(line.line_id)
     winner = ctx.paths.abs(s.winner)
@@ -136,16 +181,23 @@ def _master_line(ctx: Any, cache: Any, line: LineRecord, s: SelectionRecord, a: 
     pros = passport.get("prosody") or {}
     sr_out = a.sr if a and a.sr else (project.voice_codec.sr if project else 44100)
     ch_out = a.ch if a and a.ch else (project.voice_codec.ch if project else 1)
-    codec = _CODEC_MAP.get((a.codec if a else "") or (project.voice_codec.codec if project else "vorbis"), None)
-    lufs_t, _ = target_lufs(ctx, line.speaker_id, chars)
+    lufs_t, _ = target_lufs(ctx, line.speaker_id, chars, game_median if unvoiced else None)
     src_dur = gu.src_duration(ctx, line, passport, a)
-    key = cache.key(s.winner, s.route, cfg.model_dump(), lufs_t, sr_out, ch_out, codec, voice_file, files=[winner])
+    plan = tuning_plan_of(ctx, winner) if s.route != "orig" else None
+    if plan:
+        lufs_t += float(plan.get("lufs_offset_db") or 0.0)
+        if float(plan.get("speed") or 1.0) != 1.0 and src_dur > 0:
+            src_dur = src_dur / float(plan["speed"])  # the requested speed moves the expected duration too
+    key_parts: list[Any] = [s.winner, s.route, cfg.model_dump(), lufs_t, sr_out, ch_out, codec, voice_file]
+    if plan:  # lines without a tuning keep their pre-tuning key
+        key_parts.append({"post_pitch_st": plan.get("post_pitch_st"), "post_speed": plan.get("post_speed"), "speed": plan.get("speed")})
+    key = cache.key(*key_parts, files=[winner])
     if cache.fresh(line.line_id, key, [encoded, final_wav]):
         meta = read_json(final_wav.with_suffix(".json")) or {}
         return FinalIndexRecord(
             line_id=line.line_id, voice_file=voice_file, final_wav=ctx.paths.rel(final_wav), encoded=ctx.paths.rel(encoded),
             source=s.winner if s.route != "orig" else "orig", status=status, stretch=float(meta.get("stretch", 1.0)),
-            lufs=meta.get("lufs"), duration_s=float(meta.get("duration_s", 0.0)),
+            lufs=meta.get("lufs"), duration_s=float(meta.get("duration_s", 0.0)), **extra,
         ), True, False
 
     encoded.parent.mkdir(parents=True, exist_ok=True)
@@ -166,6 +218,16 @@ def _master_line(ctx: Any, cache: Any, line: LineRecord, s: SelectionRecord, a: 
     factor = 1.0
     stretched = False
     st = cfg.stretch
+    post_pitch = float((plan or {}).get("post_pitch_st") or 0.0)
+    post_speed = float((plan or {}).get("post_speed") or 1.0)
+    if post_pitch or post_speed != 1.0:  # voice tuning the backend could not do itself
+        tmp_in = final_wav.with_name(final_wav.stem + ".pretune.wav")
+        tmp_out = final_wav.with_name(final_wav.stem + ".tuned.wav")
+        features.save(tmp_in, y, sr)
+        stretch.retune(ctx.tools, tmp_in, tmp_out, 1.0 / post_speed, post_pitch, st.engine)
+        y, sr = features.load(tmp_out, mono=True)
+        for p in (tmp_in, tmp_out):
+            p.unlink(missing_ok=True)
     if st.enabled and src_dur > 0:
         plan = stretch.plan(len(y) / sr, src_dur, tuple(st.target_window), st.max_stretch)
         if plan.apply:
@@ -189,11 +251,13 @@ def _master_line(ctx: Any, cache: Any, line: LineRecord, s: SelectionRecord, a: 
         raise StageError(f"cannot re-encode to source codec '{a.codec if a else '?'}' for {voice_file}; write a converter or set the codec in project.yaml")
     ffmpeg.encode(ctx.tools, final_wav, encoded, codec, sr_out, ch_out, _bitrate(a, project))
     meta = {"stretch": round(factor, 4), "lufs": info.get("lufs_after"), "duration_s": round(len(y) / sr, 3), "target_lufs": lufs_t, "limiter_db": info.get("limiter_db")}
+    if post_pitch or post_speed != 1.0:
+        meta["tuning"] = {"pitch_st": post_pitch, "speed": post_speed}
     write_json(final_wav.with_suffix(".json"), meta)
     cache.put(line.line_id, key)
     return FinalIndexRecord(
         line_id=line.line_id, voice_file=voice_file, final_wav=ctx.paths.rel(final_wav), encoded=ctx.paths.rel(encoded),
         source=s.winner, status=status, stretch=round(factor, 4), lufs=None if info.get("lufs_after") is None else round(info["lufs_after"], 2),
-        duration_s=meta["duration_s"],
+        duration_s=meta["duration_s"], **extra,
     ), False, stretched
 

@@ -174,8 +174,13 @@ def models_dir(params: dict[str, Any]) -> Path:
 
 
 def env_src_dir(env: str, name: str) -> Path:
-    """Source checkout cloned by scripts/make_envs (``.venvs/<env>/src/<name>``)."""
-    return Path(__file__).resolve().parents[2] / ".venvs" / env / "src" / name
+    """Source checkout cloned by scripts/make_envs (``<envs dir>/<env>/src/<name>``).
+
+    The envs dir is ``$VNDUB_ENVS_DIR`` when set (desktop app: ``<data>/envs``), else ``<repo>/.venvs``.
+    """
+    base = os.environ.get("VNDUB_ENVS_DIR")
+    root = Path(base) if base else Path(__file__).resolve().parents[2] / ".venvs"
+    return root / env / "src" / name
 
 
 def load_audio(path: str, sr: int | None = 16000, mono: bool = True):

@@ -118,17 +118,27 @@ def run(ctx: StageContext) -> dict[str, Any]:
     if todo and any(u for *_, u in todo) and ctx.tools.resolve("vgmstream_cli") is None:
         ctx.log.warning("vgmstream-cli not configured: proprietary formats will fail to decode (tools.yaml: vgmstream_cli)")
     errors = 0
+    done = len(files) - len(todo)  # cached files count as done
+    if files:
+        ctx.progress(done, len(files), None)
     with ThreadPoolExecutor(max_workers=max(1, ctx.cfg.extract.workers)) as pool:
         futs = {pool.submit(_decode_one, ctx, f, rec, ctx.cfg.extract.keep_stereo_copy, ctx.cfg.extract.analysis_sr, vgm): (rec, key) for f, rec, key, vgm in todo}
-        for fut in as_completed(futs):
-            rec, key = futs[fut]
-            out = fut.result()
-            records[out.id] = out
-            if out.error:
-                errors += 1
-                ctx.log.warning("decode failed %s: %s", out.relpath, out.error)
-            else:
-                cache.put(out.id, key)
+        try:
+            for fut in as_completed(futs):
+                rec, key = futs[fut]
+                out = fut.result()
+                records[out.id] = out
+                if out.error:
+                    errors += 1
+                    ctx.log.warning("decode failed %s: %s", out.relpath, out.error)
+                else:
+                    cache.put(out.id, key)
+                done += 1
+                ctx.progress(done, len(files), out.id)  # between files; a cancel raises here
+        except BaseException:
+            for fut in futs:  # cancelled or failed: do not decode the queued rest
+                fut.cancel()
+            raise
     ordered = [records[ids[r]] for r in rels]
     write_jsonl(ctx.paths.audio_index, ordered)
     ok = [r for r in ordered if not r.error]

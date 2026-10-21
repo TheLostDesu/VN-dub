@@ -406,3 +406,211 @@ def to_emotion_ref(spec: StyleSpec, refs: Iterable[Mapping[str, Any]], usage: st
         return math.hypot(float(v) - tv, float(a) - ta)
 
     return min(pool, key=dist)["path"]
+
+
+# ----------------------------------------------------------------------------
+# per-character / per-line voice tuning (casting screen, step 3b)
+# ----------------------------------------------------------------------------
+#
+# ``characters.yaml.<sid>.performer.tuning`` (and the per-line ``tuning`` override in
+# overrides.jsonl, which *replaces* the character's tuning for that line):
+#
+#   pitch_st          -6 .. +6   semitones
+#   speed              0.8 .. 1.2  speech-rate multiplier
+#   expressiveness     0 .. 1      0.5 = the passport / text pass as is, 0 = always calm, 1 = amplified
+#   energy            -1 .. 1      softer .. louder
+#   timbre_preset     "" | younger | older | softer | sharper
+#   character_note    free text ("ехидная", "tired", "child")
+#
+# Every backend gets it the way it understands:
+#
+# * ``apply_tuning(spec, tuning)`` changes the StyleSpec, so every renderer follows: the words reach
+#   instruct-TTS (natural / Qwen / CosyVoice instruct / VoxCPM2 prefix), the scaled intensity drives
+#   Chatterbox ``exaggeration`` and Zonos ``emotion_strength``, the shifted loudness reaches the
+#   Fish / Higgs tags.
+# * ``tuning_knobs(tuning, caps, base)`` adds the backend-native knobs (CosyVoice ``speed``,
+#   Zonos ``speaking_rate``).
+# * ``tuning_plan(tuning, caps, route)`` splits what is left: RVC ``f0_transpose`` (route B), the
+#   Rubber Band pitch/tempo pass in ``master`` (last resort), the loudness offset.
+# * ``design_words(tuning)`` is the text VoiceDesign / VoxCPM2 designs get (voicebank).
+
+TUNING_DEFAULTS: dict[str, Any] = {
+    "pitch_st": 0.0,
+    "speed": 1.0,
+    "expressiveness": 0.5,
+    "energy": 0.0,
+    "timbre_preset": "",
+    "character_note": "",
+}
+TUNING_RANGES: dict[str, tuple[float, float]] = {
+    "pitch_st": (-6.0, 6.0),
+    "speed": (0.8, 1.2),
+    "expressiveness": (0.0, 1.0),
+    "energy": (-1.0, 1.0),
+}
+TIMBRE_PRESETS = ("", "younger", "older", "softer", "sharper")
+TIMBRE_PHRASE = {
+    "younger": "a younger, brighter voice",
+    "older": "an older, deeper voice",
+    "softer": "a softer, gentler voice",
+    "sharper": "a sharper, crisper voice",
+}
+CALM_BELOW = 0.1  # expressiveness at or below this collapses the delivery to calm
+NEUTRAL_CAP = 0.45  # amplifying a neutral line never goes past "moderately expressive"
+NOTE_MAX_CHARS = 200
+PRESET_PITCH_ST = {"younger": 1.5, "older": -1.5}  # stand-in for words on backends that cannot read them
+ENERGY_LUFS_DB = 3.0  # energy -1..1 moves the mastered loudness by -3..+3 dB
+_LOUD_LEVELS = ["soft", "normal", "loud"]
+
+
+def normalize_tuning(tuning: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Complete, clamped tuning dict (unknown keys dropped, bad values -> default)."""
+    out = dict(TUNING_DEFAULTS)
+    src = tuning or {}
+    for k, (lo, hi) in TUNING_RANGES.items():
+        try:
+            f = float(src.get(k))
+        except (TypeError, ValueError):
+            continue
+        if f != f:  # NaN
+            continue
+        out[k] = round(min(hi, max(lo, f)), 4)
+    preset = str(src.get("timbre_preset") or "").strip().lower()
+    out["timbre_preset"] = preset if preset in TIMBRE_PRESETS else ""
+    out["character_note"] = str(src.get("character_note") or "").strip()[:NOTE_MAX_CHARS]
+    return out
+
+
+def is_default_tuning(tuning: Mapping[str, Any] | None) -> bool:
+    return normalize_tuning(tuning) == TUNING_DEFAULTS
+
+
+def tuning_key(tuning: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Cache-key part: ``None`` for the default tuning (keeps pre-tuning cache keys valid)."""
+    t = normalize_tuning(tuning)
+    return None if t == TUNING_DEFAULTS else t
+
+
+def apply_tuning(spec: StyleSpec, tuning: Mapping[str, Any] | None) -> StyleSpec:
+    """Return ``spec`` with the tuning applied (``spec`` itself is not modified).
+
+    * expressiveness e: intensity x (e / 0.5), clamped to 0..1 (a neutral line is amplified at most
+      to ``NEUTRAL_CAP``); ``e <= CALM_BELOW`` is "always calm": neutral emotion, no events, flat arc,
+      normal tempo and loudness.
+    * energy: shifts the loudness class by 0 / 1 / 2 steps (|energy| < 0.25 / < 0.75 / above).
+    * timbre preset and character note: appended to ``notes`` (rendered as "Delivery: ..." by the
+      instruct renderers and as the parenthesized style words by VoxCPM2).
+    * pitch and speed are not style words: see :func:`tuning_plan` / :func:`tuning_knobs`.
+    """
+    t = normalize_tuning(tuning)
+    out = StyleSpec.from_dict(spec.to_dict())
+    if t == TUNING_DEFAULTS:
+        return out
+    e = float(t["expressiveness"])
+    if e != 0.5:
+        scale = e / 0.5
+        intensity = float(out.intensity) * scale
+        if scale > 1.0 and out.emotion in ("neutral", "other", "unknown"):
+            intensity = min(intensity, max(NEUTRAL_CAP, float(out.intensity)))
+        out.intensity = round(min(1.0, max(0.0, intensity)), 3)
+        if e <= CALM_BELOW:
+            out.emotion = "neutral"
+            out.emotion_probs = {"neutral": 1.0}
+            out.events = []
+            out.arc = "flat"
+            out.tempo = "normal"
+            out.loudness = "normal"
+            out.voice_quality = [q for q in out.voice_quality if q not in ("whispery", "tense", "breathy")]
+    en = float(t["energy"])
+    steps = 0 if abs(en) < 0.25 else (1 if abs(en) < 0.75 else 2)
+    if steps:
+        idx = _LOUD_LEVELS.index(out.loudness) if out.loudness in _LOUD_LEVELS else 1
+        out.loudness = _LOUD_LEVELS[min(2, max(0, idx + (steps if en > 0 else -steps)))]
+    extra = []
+    if t["timbre_preset"]:
+        extra.append(TIMBRE_PHRASE[t["timbre_preset"]])
+    if t["character_note"]:
+        extra.append(t["character_note"])
+    if extra:
+        out.notes = "; ".join(x.strip().rstrip(".") for x in [out.notes, *extra] if x and x.strip())
+    return out
+
+
+def _has_text_channel(caps: Mapping[str, Any]) -> bool:
+    """Can the backend read words (natural / Qwen / Cosy instruct, VoxCPM2 style prefix)?"""
+    return caps.get("instruct", "none") not in ("none", None)
+
+
+def speed_is_native(caps: Mapping[str, Any]) -> bool:
+    """The backend applies a requested speed itself (duration target, CosyVoice ``speed``, Zonos rate)."""
+    return bool(caps.get("duration")) or caps.get("instruct") == "cosy" or caps.get("knobs") == "zonos"
+
+
+def tuning_knobs(tuning: Mapping[str, Any] | None, caps: Mapping[str, Any], base: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Backend-native knobs (merged over the rendered ``knobs``); ``{}`` when there is nothing to add.
+
+    CosyVoice3 instruct: ``speed``. Zonos: ``speaking_rate`` = rendered rate x speed (``base`` = the
+    rendered knobs). Duration-controllable backends take the speed through ``target_duration`` (see
+    :func:`tuning_plan`), the others through the master pass. Chatterbox's ``exaggeration`` follows the
+    expressiveness through the intensity :func:`apply_tuning` already scaled.
+    """
+    t = normalize_tuning(tuning)
+    s = float(t["speed"])
+    if s == 1.0:
+        return {}
+    if caps.get("instruct") == "cosy":
+        return {"speed": round(s, 3)}
+    if caps.get("knobs") == "zonos":
+        rate = float((base or {}).get("speaking_rate", 14.0))
+        return {"speaking_rate": round(rate * s, 2)}
+    return {}
+
+
+def tuning_plan(tuning: Mapping[str, Any] | None, caps: Mapping[str, Any], route: str = "") -> dict[str, Any]:
+    """What is not expressed through the style / knobs, per backend capability and route.
+
+    ``vc_f0_transpose``      whole semitones added to RVC's ``f0_transpose`` (route B)
+    ``post_pitch_st``        master pass (Rubber Band, ffmpeg fallback): the pitch for routes without a VC step
+                             (A, P, C), and the fractional remainder on route B
+    ``speed``                requested multiplier; ``speed_native``: the backend applies it itself
+    ``post_speed``           multiplier the master pass applies (1.0 when native)
+    ``target_duration_scale``  factor for ``target_duration`` on duration-controllable backends
+    ``lufs_offset_db``       energy -> mastered loudness offset
+    ``timbre_pitch_st``      pitch the timbre preset contributed (younger / older) where words cannot reach
+    """
+    t = normalize_tuning(tuning)
+    pitch = float(t["pitch_st"])
+    preset_pitch = 0.0
+    if t["timbre_preset"] in PRESET_PITCH_ST and (route == "B" or not _has_text_channel(caps)):
+        preset_pitch = PRESET_PITCH_ST[t["timbre_preset"]]
+    total = pitch + preset_pitch
+    if route == "B":
+        whole = int(round(total))
+        vc, post = whole, total - whole
+        if abs(post) < 0.25:
+            post = 0.0
+    else:
+        vc, post = 0, total
+    s = float(t["speed"])
+    native = speed_is_native(caps) and s != 1.0
+    return {
+        "vc_f0_transpose": vc,
+        "post_pitch_st": round(post, 3),
+        "speed": s,
+        "speed_native": bool(native),
+        "post_speed": 1.0 if native else s,
+        "target_duration_scale": round(1.0 / s, 5) if caps.get("duration") else 1.0,
+        "lufs_offset_db": round(ENERGY_LUFS_DB * float(t["energy"]), 3),
+        "timbre_pitch_st": preset_pitch,
+    }
+
+
+def design_words(tuning: Mapping[str, Any] | None) -> str:
+    """Words for a voice-design prompt (VoiceDesign / VoxCPM2): timbre preset + character note."""
+    t = normalize_tuning(tuning)
+    parts = []
+    if t["timbre_preset"]:
+        parts.append(TIMBRE_PHRASE[t["timbre_preset"]])
+    if t["character_note"]:
+        parts.append(t["character_note"])
+    return "; ".join(p.strip().rstrip(".") for p in parts if p.strip())

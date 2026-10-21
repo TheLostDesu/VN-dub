@@ -14,7 +14,7 @@ from typing import Any
 from vndub.manifest.io import CandidateScore, OverrideRecord, append_jsonl, read_json, read_jsonl
 from vndub.paths import WorkPaths
 
-ACTIONS = ("accept", "reject", "regen", "set_text", "set_ref", "keep_original")
+ACTIONS = ("accept", "reject", "regen", "set_text", "set_ref", "keep_original", "set_src_text", "tuning")
 
 
 def write_override(paths: WorkPaths, line_id: str, action: str, payload: dict[str, Any] | None = None) -> OverrideRecord:

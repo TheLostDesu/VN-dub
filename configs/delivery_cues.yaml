@@ -1,0 +1,297 @@
+# Delivery cues for the text_emotion stage (narration -> how the neighbouring dialogue line is spoken).
+# Edited from the VNDub app (Step 2, "Подсказки по ремаркам") or by hand. Per language: a list of entries
+#   {cue, emotion, intensity, tempo, loudness, events, confidence, position, notes}
+# cue         ja: substring of the narration line (kana/katakana are compared as hiragana, spaces ignored).
+#             other languages: word STEMS, matched as word prefixes (воскликнул matches воскликнула / воскликнули);
+#             several words must follow each other; "ё" = "е"; a reflexive ending (-ся/-сь) is ignored, so
+#             усмехнулся matches усмехнулась.
+# emotion     angry disgusted fearful happy neutral other sad surprised unknown embarrassed (omit = no opinion);
+#             "other" = emphatic / expressive, direction unspecified (shouting, exclaiming)
+# intensity   0..1     tempo  slow|normal|fast     loudness  soft|normal|loud     events  laugh sigh cry breath whisper
+# confidence  0..1, default 0.75; after attribution a cue below text_emotion.min_confidence (0.6) is ignored
+# position    after  = tag that FOLLOWS the speech (...と叫んだ, "воскликнул"): describes the PRECEDING line
+#             before = lead-in that PRECEDES the speech: describes the FOLLOWING line
+#             any    = the nearest line; the speaker's name in the narration decides first
+# Attribution: a cue applies to the dialogue line it describes: the line whose speaker name appears in the
+# narration; otherwise the nearest line on the side given by position (the preceding line on a tie). Narration
+# further than text_emotion.narration_window lines away, or in another scene, is never used.
+
+ja:
+  # --- shouting, exclaiming ---------------------------------------------------------------------------
+  - {cue: 叫んだ, emotion: other, intensity: 0.85, loudness: loud, position: after, confidence: 0.8}
+  - {cue: 叫ぶ, emotion: other, intensity: 0.85, loudness: loud}
+  - {cue: 叫び, emotion: other, intensity: 0.85, loudness: loud, confidence: 0.7}
+  - {cue: 絶叫, emotion: other, intensity: 0.95, loudness: loud, confidence: 0.8}
+  - {cue: 怒鳴る, emotion: angry, intensity: 0.85, loudness: loud}
+  - {cue: 怒鳴った, emotion: angry, intensity: 0.85, loudness: loud, position: after, confidence: 0.8}
+  - {cue: 怒鳴り, emotion: angry, intensity: 0.85, loudness: loud, confidence: 0.7}
+  - {cue: 怒声, emotion: angry, intensity: 0.85, loudness: loud, confidence: 0.7}
+  - {cue: 声を荒げ, emotion: angry, intensity: 0.8, loudness: loud}
+  - {cue: 声を張り上げ, emotion: other, intensity: 0.8, loudness: loud}
+  - {cue: 声を上げ, emotion: other, intensity: 0.7, loudness: loud, position: after, confidence: 0.65}
+  - {cue: 大声で, emotion: other, intensity: 0.8, loudness: loud}
+  - {cue: 大きな声, emotion: other, intensity: 0.75, loudness: loud, confidence: 0.7}
+  - {cue: 喚い, emotion: angry, intensity: 0.8, loudness: loud, confidence: 0.7}
+  - {cue: わめい, emotion: angry, intensity: 0.8, loudness: loud, confidence: 0.7}
+  - {cue: 力強く, emotion: other, intensity: 0.75, loudness: loud, confidence: 0.65}
+  - {cue: 鋭く, emotion: other, intensity: 0.6, loudness: loud, confidence: 0.65}
+  # --- whispering, murmuring ----------------------------------------------------------------------------
+  - {cue: ささやいた, intensity: 0.25, loudness: soft, events: [whisper], position: after, confidence: 0.8}
+  - {cue: 囁いた, intensity: 0.25, loudness: soft, events: [whisper], position: after, confidence: 0.8}
+  - {cue: ささやく, intensity: 0.25, loudness: soft, events: [whisper]}
+  - {cue: 囁く, intensity: 0.25, loudness: soft, events: [whisper]}
+  - {cue: ささやき, intensity: 0.25, loudness: soft, events: [whisper], confidence: 0.7}
+  - {cue: 小声で, intensity: 0.25, loudness: soft, events: [whisper], confidence: 0.8}
+  - {cue: 小さな声, intensity: 0.25, loudness: soft, confidence: 0.75}
+  - {cue: 声を潜め, intensity: 0.25, loudness: soft, events: [whisper], confidence: 0.8}
+  - {cue: 声をひそめ, intensity: 0.25, loudness: soft, events: [whisper], confidence: 0.8}
+  - {cue: ひそひそ, intensity: 0.25, loudness: soft, events: [whisper], confidence: 0.8}
+  - {cue: 耳打ち, intensity: 0.25, loudness: soft, events: [whisper], confidence: 0.75}
+  - {cue: ぼそっと, intensity: 0.3, loudness: soft, notes: mumbling, confidence: 0.75}
+  - {cue: ぼそりと, intensity: 0.3, loudness: soft, notes: mumbling, confidence: 0.75}
+  - {cue: つぶやいた, intensity: 0.3, loudness: soft, notes: murmuring, position: after, confidence: 0.75}
+  - {cue: 呟いた, intensity: 0.3, loudness: soft, notes: murmuring, position: after, confidence: 0.75}
+  - {cue: か細い声, emotion: sad, intensity: 0.25, loudness: soft, confidence: 0.7}
+  - {cue: 消え入るような, emotion: sad, intensity: 0.2, loudness: soft, tempo: slow, confidence: 0.75}
+  # --- laughter and smiles ---------------------------------------------------------------------------------
+  - {cue: 笑いながら, emotion: happy, intensity: 0.65, events: [laugh], confidence: 0.7}
+  - {cue: 笑って, emotion: happy, intensity: 0.6, events: [laugh], confidence: 0.65}
+  - {cue: 笑った, emotion: happy, intensity: 0.55, position: after, confidence: 0.55}
+  - {cue: 吹き出, emotion: happy, intensity: 0.7, events: [laugh], confidence: 0.75}
+  - {cue: 高笑い, emotion: happy, intensity: 0.85, loudness: loud, events: [laugh], confidence: 0.8}
+  - {cue: 爆笑, emotion: happy, intensity: 0.9, loudness: loud, events: [laugh], confidence: 0.8}
+  - {cue: くすくす, emotion: happy, intensity: 0.45, events: [laugh], confidence: 0.75}
+  - {cue: 微笑んで, emotion: happy, intensity: 0.4, notes: "gentle, warm", confidence: 0.65}
+  - {cue: 微笑ん, emotion: happy, intensity: 0.4, notes: "gentle, warm", confidence: 0.65}
+  - {cue: にやり, emotion: happy, intensity: 0.5, notes: smirking, confidence: 0.65}
+  - {cue: にやにや, emotion: happy, intensity: 0.5, notes: smirking, confidence: 0.65}
+  - {cue: 苦笑, emotion: embarrassed, intensity: 0.45, notes: wry, confidence: 0.65}
+  # --- crying, sighing -----------------------------------------------------------------------------------------
+  - {cue: 泣きながら, emotion: sad, intensity: 0.7, events: [cry], confidence: 0.8}
+  - {cue: 泣いて, emotion: sad, intensity: 0.65, events: [cry], confidence: 0.7}
+  - {cue: 泣き出, emotion: sad, intensity: 0.75, events: [cry], position: after, confidence: 0.75}
+  - {cue: 涙声, emotion: sad, intensity: 0.65, events: [cry], confidence: 0.8}
+  - {cue: 涙ながら, emotion: sad, intensity: 0.7, events: [cry], confidence: 0.8}
+  - {cue: 涙を浮かべ, emotion: sad, intensity: 0.5, confidence: 0.65}
+  - {cue: 涙をこぼ, emotion: sad, intensity: 0.6, events: [cry], confidence: 0.7}
+  - {cue: 嗚咽, emotion: sad, intensity: 0.85, events: [cry], confidence: 0.8}
+  - {cue: しゃくり, emotion: sad, intensity: 0.75, events: [cry], confidence: 0.75}
+  - {cue: すすり泣, emotion: sad, intensity: 0.6, loudness: soft, events: [cry], confidence: 0.8}
+  - {cue: ため息, intensity: 0.3, loudness: soft, events: [sigh], notes: weary, confidence: 0.75}
+  - {cue: 溜め息, intensity: 0.3, loudness: soft, events: [sigh], notes: weary, confidence: 0.75}
+  - {cue: 息をつい, intensity: 0.3, loudness: soft, events: [sigh], confidence: 0.65}
+  - {cue: 吐息, intensity: 0.3, loudness: soft, events: [breath], confidence: 0.65}
+  # --- anger, coldness ------------------------------------------------------------------------------------------
+  - {cue: 怒って, emotion: angry, intensity: 0.75, confidence: 0.75}
+  - {cue: 怒りを込め, emotion: angry, intensity: 0.8, loudness: loud, confidence: 0.8}
+  - {cue: 睨み, emotion: angry, intensity: 0.6, confidence: 0.65}
+  - {cue: 不機嫌, emotion: angry, intensity: 0.5, confidence: 0.7}
+  - {cue: むっと, emotion: angry, intensity: 0.5, confidence: 0.7}
+  - {cue: 苛立, emotion: angry, intensity: 0.6, confidence: 0.7}
+  - {cue: 冷たく, emotion: neutral, intensity: 0.3, notes: "cold, flat", confidence: 0.7}
+  - {cue: 淡々と, emotion: neutral, intensity: 0.2, notes: "flat, matter-of-fact", confidence: 0.8}
+  - {cue: 無表情で, emotion: neutral, intensity: 0.2, notes: flat, confidence: 0.7}
+  - {cue: 低い声, intensity: 0.5, notes: low voice, confidence: 0.65}
+  # --- fear, surprise ---------------------------------------------------------------------------------------------
+  - {cue: 怯え, emotion: fearful, intensity: 0.7, confidence: 0.8}
+  - {cue: 恐る恐る, emotion: fearful, intensity: 0.5, loudness: soft, tempo: slow, confidence: 0.75}
+  - {cue: おそるおそる, emotion: fearful, intensity: 0.5, loudness: soft, tempo: slow, confidence: 0.75}
+  - {cue: びくびく, emotion: fearful, intensity: 0.6, confidence: 0.7}
+  - {cue: 青ざめ, emotion: fearful, intensity: 0.6, confidence: 0.65}
+  - {cue: 震える声, intensity: 0.6, notes: trembling voice, confidence: 0.65}
+  - {cue: 震え声, intensity: 0.6, notes: trembling voice, confidence: 0.65}
+  - {cue: 声を震わせ, intensity: 0.6, notes: trembling voice, confidence: 0.65}
+  - {cue: 驚いて, emotion: surprised, intensity: 0.7, confidence: 0.75}
+  - {cue: 驚き, emotion: surprised, intensity: 0.65, confidence: 0.7}
+  - {cue: 目を丸く, emotion: surprised, intensity: 0.6, confidence: 0.7}
+  - {cue: 息を呑ん, emotion: surprised, intensity: 0.6, events: [breath], confidence: 0.75}
+  - {cue: 仰天, emotion: surprised, intensity: 0.8, loudness: loud, confidence: 0.75}
+  # --- embarrassment, sadness --------------------------------------------------------------------------------------
+  - {cue: 照れ, emotion: embarrassed, intensity: 0.6, confidence: 0.8}
+  - {cue: 赤くなっ, emotion: embarrassed, intensity: 0.6, confidence: 0.7}
+  - {cue: 頬を染め, emotion: embarrassed, intensity: 0.55, confidence: 0.7}
+  - {cue: 顔を赤らめ, emotion: embarrassed, intensity: 0.6, confidence: 0.7}
+  - {cue: 恥ずかしそう, emotion: embarrassed, intensity: 0.55, loudness: soft, confidence: 0.8}
+  - {cue: 恥ずかしげ, emotion: embarrassed, intensity: 0.55, loudness: soft, confidence: 0.8}
+  - {cue: もじもじ, emotion: embarrassed, intensity: 0.5, loudness: soft, tempo: slow, confidence: 0.75}
+  - {cue: 悲しげ, emotion: sad, intensity: 0.55, confidence: 0.8}
+  - {cue: 悲しそう, emotion: sad, intensity: 0.55, confidence: 0.8}
+  - {cue: 寂しそう, emotion: sad, intensity: 0.4, confidence: 0.8}
+  - {cue: 寂しげ, emotion: sad, intensity: 0.4, confidence: 0.8}
+  - {cue: 沈んだ声, emotion: sad, intensity: 0.3, loudness: soft, tempo: slow, confidence: 0.8}
+  - {cue: 落ち込ん, emotion: sad, intensity: 0.4, tempo: slow, confidence: 0.7}
+  - {cue: しょんぼり, emotion: sad, intensity: 0.4, loudness: soft, tempo: slow, confidence: 0.75}
+  - {cue: 力なく, emotion: sad, intensity: 0.3, loudness: soft, confidence: 0.7}
+  # --- cheerful, gentle, proud ---------------------------------------------------------------------------------------
+  - {cue: 明るく, emotion: happy, intensity: 0.65, confidence: 0.7}
+  - {cue: 元気よく, emotion: happy, intensity: 0.75, loudness: loud, confidence: 0.75}
+  - {cue: 嬉しそう, emotion: happy, intensity: 0.65, confidence: 0.8}
+  - {cue: 楽しそう, emotion: happy, intensity: 0.6, confidence: 0.75}
+  - {cue: はしゃい, emotion: happy, intensity: 0.8, loudness: loud, tempo: fast, confidence: 0.75}
+  - {cue: 弾んだ声, emotion: happy, intensity: 0.7, tempo: fast, confidence: 0.8}
+  - {cue: 得意げ, emotion: happy, intensity: 0.6, notes: "proud, smug", confidence: 0.7}
+  - {cue: 甘えた声, emotion: happy, intensity: 0.5, loudness: soft, notes: coquettish, confidence: 0.75}
+  - {cue: 優しく, loudness: soft, intensity: 0.4, notes: "gentle, warm", confidence: 0.75}
+  - {cue: 穏やかに, loudness: soft, intensity: 0.35, notes: "calm, warm", confidence: 0.75}
+  # --- pace, hesitation ------------------------------------------------------------------------------------------------
+  - {cue: ためらいがちに, tempo: slow, notes: hesitant, position: before, confidence: 0.75}
+  - {cue: 言い淀, tempo: slow, notes: hesitant, confidence: 0.8}
+  - {cue: 口ごもっ, emotion: embarrassed, intensity: 0.4, tempo: slow, notes: hesitant, confidence: 0.8}
+  - {cue: 言葉を探し, tempo: slow, notes: hesitant, position: before, confidence: 0.7}
+  - {cue: 息を整え, intensity: 0.4, events: [breath], position: before, confidence: 0.65}
+  - {cue: 早口で, tempo: fast, confidence: 0.85}
+  - {cue: まくし立て, emotion: other, intensity: 0.8, loudness: loud, tempo: fast, confidence: 0.8}
+  - {cue: 慌てて, emotion: fearful, intensity: 0.6, tempo: fast, confidence: 0.65}
+  - {cue: ゆっくりと, tempo: slow, confidence: 0.6}
+  - {cue: 皮肉っぽく, emotion: other, intensity: 0.5, notes: sarcastic, confidence: 0.7}
+  - {cue: 真剣な声, intensity: 0.6, notes: serious, confidence: 0.7}
+
+ru:
+  # --- shouting, exclaiming ---------------------------------------------------------------------------------
+  - {cue: воскликнул, emotion: other, intensity: 0.75, loudness: loud, position: after, confidence: 0.8}
+  - {cue: вскрикнул, emotion: surprised, intensity: 0.8, loudness: loud, position: after, confidence: 0.8}
+  - {cue: выкрикнул, emotion: other, intensity: 0.85, loudness: loud, position: after, confidence: 0.8}
+  - {cue: крикнул, emotion: other, intensity: 0.85, loudness: loud, position: after, confidence: 0.8}
+  - {cue: закричал, emotion: other, intensity: 0.9, loudness: loud, position: after, confidence: 0.8}
+  - {cue: прокричал, emotion: other, intensity: 0.85, loudness: loud, position: after, confidence: 0.8}
+  - {cue: кричал, emotion: other, intensity: 0.85, loudness: loud, confidence: 0.75}
+  - {cue: заорал, emotion: angry, intensity: 0.9, loudness: loud, position: after, confidence: 0.8}
+  - {cue: рявкнул, emotion: angry, intensity: 0.9, loudness: loud, position: after, confidence: 0.8}
+  - {cue: взвизгнул, emotion: fearful, intensity: 0.85, loudness: loud, position: after, confidence: 0.75}
+  - {cue: выпалил, emotion: other, intensity: 0.75, loudness: loud, tempo: fast, position: after, confidence: 0.8}
+  - {cue: громко, emotion: other, intensity: 0.75, loudness: loud, confidence: 0.7}
+  - {cue: во весь голос, emotion: other, intensity: 0.9, loudness: loud, confidence: 0.8}
+  - {cue: оглушительно, emotion: other, intensity: 0.9, loudness: loud, confidence: 0.75}
+  # --- whispering, murmuring --------------------------------------------------------------------------------
+  - {cue: прошептал, intensity: 0.25, loudness: soft, events: [whisper], position: after, confidence: 0.8}
+  - {cue: шепнул, intensity: 0.25, loudness: soft, events: [whisper], position: after, confidence: 0.8}
+  - {cue: шептал, intensity: 0.25, loudness: soft, events: [whisper], confidence: 0.75}
+  - {cue: шепотом, intensity: 0.25, loudness: soft, events: [whisper], confidence: 0.8}
+  - {cue: полушепотом, intensity: 0.25, loudness: soft, events: [whisper], confidence: 0.8}
+  - {cue: вполголоса, intensity: 0.3, loudness: soft, confidence: 0.75}
+  - {cue: едва слышно, intensity: 0.2, loudness: soft, confidence: 0.8}
+  - {cue: еле слышно, intensity: 0.2, loudness: soft, confidence: 0.8}
+  - {cue: тихим голосом, intensity: 0.25, loudness: soft, confidence: 0.8}
+  - {cue: негромко, intensity: 0.3, loudness: soft, confidence: 0.7}
+  - {cue: тихо, intensity: 0.3, loudness: soft, confidence: 0.65}
+  - {cue: пробормотал, intensity: 0.3, loudness: soft, notes: murmuring, position: after, confidence: 0.75}
+  - {cue: пробурчал, emotion: angry, intensity: 0.35, loudness: soft, notes: grumbling, position: after, confidence: 0.7}
+  - {cue: буркнул, emotion: angry, intensity: 0.35, loudness: soft, notes: grumbling, position: after, confidence: 0.7}
+  - {cue: проворчал, emotion: angry, intensity: 0.4, loudness: soft, notes: grumbling, position: after, confidence: 0.7}
+  - {cue: пролепетал, emotion: fearful, intensity: 0.5, loudness: soft, position: after, confidence: 0.7}
+  - {cue: прошипел, emotion: angry, intensity: 0.6, loudness: soft, position: after, confidence: 0.75}
+  # --- laughter and smiles ------------------------------------------------------------------------------------
+  - {cue: засмеялся, emotion: happy, intensity: 0.75, events: [laugh], confidence: 0.8}
+  - {cue: рассмеялся, emotion: happy, intensity: 0.75, events: [laugh], confidence: 0.8}
+  - {cue: захохотал, emotion: happy, intensity: 0.85, loudness: loud, events: [laugh], confidence: 0.8}
+  - {cue: хохотал, emotion: happy, intensity: 0.85, loudness: loud, events: [laugh], confidence: 0.8}
+  - {cue: смеясь, emotion: happy, intensity: 0.7, events: [laugh], confidence: 0.8}
+  - {cue: смеялся, emotion: happy, intensity: 0.7, events: [laugh], confidence: 0.75}
+  - {cue: хихикнул, emotion: happy, intensity: 0.5, events: [laugh], confidence: 0.8}
+  - {cue: хихикая, emotion: happy, intensity: 0.5, events: [laugh], confidence: 0.8}
+  - {cue: прыснул, emotion: happy, intensity: 0.7, events: [laugh], position: after, confidence: 0.75}
+  - {cue: усмехнулся, emotion: happy, intensity: 0.45, notes: "smirking, amused", position: after, confidence: 0.65}
+  - {cue: ухмыльнулся, emotion: happy, intensity: 0.45, notes: "smirking, smug", position: after, confidence: 0.65}
+  - {cue: улыбаясь, emotion: happy, intensity: 0.5, confidence: 0.6}
+  - {cue: улыбнулся, emotion: happy, intensity: 0.5, position: after, confidence: 0.6}
+  - {cue: радостно, emotion: happy, intensity: 0.7, confidence: 0.75}
+  - {cue: весело, emotion: happy, intensity: 0.7, confidence: 0.75}
+  - {cue: восторженно, emotion: happy, intensity: 0.85, loudness: loud, confidence: 0.75}
+  - {cue: восхищенно, emotion: happy, intensity: 0.75, confidence: 0.75}
+  - {cue: задорно, emotion: happy, intensity: 0.75, confidence: 0.7}
+  - {cue: игриво, emotion: happy, intensity: 0.55, notes: playful, confidence: 0.75}
+  - {cue: кокетливо, emotion: happy, intensity: 0.55, notes: playful, confidence: 0.75}
+  - {cue: ласково, emotion: happy, intensity: 0.5, loudness: soft, notes: "gentle, warm", confidence: 0.75}
+  - {cue: нежно, emotion: happy, intensity: 0.5, loudness: soft, notes: "gentle, warm", confidence: 0.75}
+  - {cue: мягко, loudness: soft, intensity: 0.4, notes: "gentle, warm", confidence: 0.7}
+  - {cue: гордо, emotion: happy, intensity: 0.6, notes: proud, confidence: 0.7}
+  - {cue: с облегчением, emotion: happy, intensity: 0.4, events: [sigh], confidence: 0.7}
+  # --- crying, sighing ------------------------------------------------------------------------------------------
+  - {cue: сквозь слёзы, emotion: sad, intensity: 0.7, events: [cry], confidence: 0.85}
+  - {cue: со слезами, emotion: sad, intensity: 0.65, events: [cry], confidence: 0.8}
+  - {cue: в слезах, emotion: sad, intensity: 0.65, events: [cry], confidence: 0.8}
+  - {cue: всхлипнул, emotion: sad, intensity: 0.7, events: [cry], position: after, confidence: 0.85}
+  - {cue: всхлипывая, emotion: sad, intensity: 0.7, events: [cry], confidence: 0.85}
+  - {cue: всхлипывал, emotion: sad, intensity: 0.7, events: [cry], confidence: 0.85}
+  - {cue: рыдая, emotion: sad, intensity: 0.85, events: [cry], confidence: 0.85}
+  - {cue: рыдал, emotion: sad, intensity: 0.85, events: [cry], confidence: 0.85}
+  - {cue: зарыдал, emotion: sad, intensity: 0.85, events: [cry], position: after, confidence: 0.85}
+  - {cue: плача, emotion: sad, intensity: 0.7, events: [cry], confidence: 0.8}
+  - {cue: плакал, emotion: sad, intensity: 0.7, events: [cry], confidence: 0.75}
+  - {cue: заплакал, emotion: sad, intensity: 0.75, events: [cry], position: after, confidence: 0.8}
+  - {cue: простонал, emotion: sad, intensity: 0.6, position: after, confidence: 0.7}
+  - {cue: вздохнул, intensity: 0.3, loudness: soft, events: [sigh], position: after, confidence: 0.8}
+  - {cue: вздыхая, intensity: 0.3, loudness: soft, events: [sigh], confidence: 0.8}
+  - {cue: со вздохом, intensity: 0.3, loudness: soft, events: [sigh], confidence: 0.8}
+  - {cue: выдохнул, intensity: 0.3, loudness: soft, events: [sigh], position: after, confidence: 0.65}
+  # --- anger, coldness, irony -------------------------------------------------------------------------------------
+  - {cue: сердито, emotion: angry, intensity: 0.65, confidence: 0.8}
+  - {cue: злобно, emotion: angry, intensity: 0.75, confidence: 0.8}
+  - {cue: гневно, emotion: angry, intensity: 0.8, loudness: loud, confidence: 0.8}
+  - {cue: раздражённо, emotion: angry, intensity: 0.55, confidence: 0.75}
+  - {cue: яростно, emotion: angry, intensity: 0.9, loudness: loud, confidence: 0.8}
+  - {cue: свирепо, emotion: angry, intensity: 0.85, loudness: loud, confidence: 0.75}
+  - {cue: разъярённо, emotion: angry, intensity: 0.9, loudness: loud, confidence: 0.8}
+  - {cue: возмущённо, emotion: angry, intensity: 0.65, confidence: 0.75}
+  - {cue: с вызовом, emotion: angry, intensity: 0.6, confidence: 0.7}
+  - {cue: сквозь зубы, emotion: angry, intensity: 0.65, tempo: slow, notes: "through gritted teeth", confidence: 0.8}
+  - {cue: холодно, emotion: neutral, intensity: 0.3, notes: "cold, flat", confidence: 0.7}
+  - {cue: равнодушно, emotion: neutral, intensity: 0.2, notes: flat, confidence: 0.75}
+  - {cue: безразлично, emotion: neutral, intensity: 0.2, notes: flat, confidence: 0.75}
+  - {cue: бесстрастно, emotion: neutral, intensity: 0.2, notes: flat, confidence: 0.75}
+  - {cue: язвительно, emotion: other, intensity: 0.5, notes: sarcastic, confidence: 0.7}
+  - {cue: саркастично, emotion: other, intensity: 0.5, notes: sarcastic, confidence: 0.7}
+  - {cue: ехидно, emotion: other, intensity: 0.5, notes: sarcastic, confidence: 0.7}
+  - {cue: насмешливо, emotion: other, intensity: 0.5, notes: mocking, confidence: 0.7}
+  - {cue: строго, intensity: 0.6, notes: stern, confidence: 0.7}
+  - {cue: сурово, intensity: 0.6, notes: stern, confidence: 0.7}
+  - {cue: твёрдо, intensity: 0.6, notes: firm, confidence: 0.7}
+  # --- fear, surprise ------------------------------------------------------------------------------------------------
+  - {cue: испуганно, emotion: fearful, intensity: 0.7, confidence: 0.8}
+  - {cue: со страхом, emotion: fearful, intensity: 0.7, confidence: 0.8}
+  - {cue: в ужасе, emotion: fearful, intensity: 0.85, loudness: loud, confidence: 0.8}
+  - {cue: встревоженно, emotion: fearful, intensity: 0.55, confidence: 0.75}
+  - {cue: нервно, emotion: fearful, intensity: 0.5, confidence: 0.65}
+  - {cue: дрожащим голосом, emotion: fearful, intensity: 0.6, notes: trembling voice, confidence: 0.65}
+  - {cue: дрожащим, emotion: fearful, intensity: 0.6, notes: trembling voice, confidence: 0.6}
+  - {cue: взволнованно, emotion: other, intensity: 0.65, confidence: 0.7}
+  - {cue: возбуждённо, emotion: other, intensity: 0.7, tempo: fast, confidence: 0.7}
+  - {cue: удивлённо, emotion: surprised, intensity: 0.65, confidence: 0.8}
+  - {cue: изумлённо, emotion: surprised, intensity: 0.7, confidence: 0.8}
+  - {cue: ошеломлённо, emotion: surprised, intensity: 0.75, confidence: 0.8}
+  - {cue: поражённо, emotion: surprised, intensity: 0.7, confidence: 0.75}
+  - {cue: недоумённо, emotion: surprised, intensity: 0.5, confidence: 0.7}
+  # --- embarrassment, sadness, hesitation ------------------------------------------------------------------------------
+  - {cue: смущённо, emotion: embarrassed, intensity: 0.55, confidence: 0.8}
+  - {cue: застенчиво, emotion: embarrassed, intensity: 0.5, loudness: soft, confidence: 0.8}
+  - {cue: краснея, emotion: embarrassed, intensity: 0.6, confidence: 0.75}
+  - {cue: покраснев, emotion: embarrassed, intensity: 0.6, confidence: 0.75}
+  - {cue: стесняясь, emotion: embarrassed, intensity: 0.5, loudness: soft, confidence: 0.75}
+  - {cue: робко, emotion: embarrassed, intensity: 0.45, loudness: soft, tempo: slow, confidence: 0.75}
+  - {cue: грустно, emotion: sad, intensity: 0.5, confidence: 0.8}
+  - {cue: печально, emotion: sad, intensity: 0.5, confidence: 0.8}
+  - {cue: тоскливо, emotion: sad, intensity: 0.5, confidence: 0.75}
+  - {cue: жалобно, emotion: sad, intensity: 0.6, confidence: 0.75}
+  - {cue: уныло, emotion: sad, intensity: 0.4, tempo: slow, confidence: 0.75}
+  - {cue: подавленно, emotion: sad, intensity: 0.4, loudness: soft, tempo: slow, confidence: 0.75}
+  - {cue: устало, emotion: sad, intensity: 0.3, loudness: soft, tempo: slow, confidence: 0.7}
+  - {cue: в отчаянии, emotion: sad, intensity: 0.8, loudness: loud, confidence: 0.75}
+  - {cue: умоляюще, emotion: sad, intensity: 0.6, confidence: 0.7}
+  - {cue: задумчиво, emotion: neutral, intensity: 0.25, tempo: slow, notes: thoughtful, confidence: 0.7}
+  - {cue: мечтательно, emotion: neutral, intensity: 0.3, tempo: slow, notes: dreamy, confidence: 0.7}
+  - {cue: нерешительно, tempo: slow, notes: hesitant, confidence: 0.75}
+  - {cue: неуверенно, tempo: slow, notes: hesitant, confidence: 0.75}
+  - {cue: запинаясь, emotion: embarrassed, intensity: 0.4, tempo: slow, notes: hesitant, confidence: 0.8}
+  - {cue: заикаясь, emotion: embarrassed, intensity: 0.4, tempo: slow, notes: hesitant, confidence: 0.8}
+  - {cue: замялся, emotion: embarrassed, intensity: 0.4, tempo: slow, notes: hesitant, position: after, confidence: 0.75}
+  - {cue: помолчав, tempo: slow, position: before, confidence: 0.65}
+  - {cue: помедлив, tempo: slow, position: before, confidence: 0.7}
+  - {cue: собравшись с духом, intensity: 0.5, position: before, confidence: 0.65}
+  # --- pace --------------------------------------------------------------------------------------------------------------
+  - {cue: торопливо, tempo: fast, confidence: 0.75}
+  - {cue: быстро, tempo: fast, confidence: 0.55}
+  - {cue: скороговоркой, tempo: fast, confidence: 0.8}
+  - {cue: затараторил, tempo: fast, intensity: 0.65, position: after, confidence: 0.8}
+  - {cue: тараторя, tempo: fast, intensity: 0.65, confidence: 0.8}
+  - {cue: медленно, tempo: slow, confidence: 0.6}
+  - {cue: нараспев, tempo: slow, emotion: happy, intensity: 0.5, notes: sing-song, confidence: 0.7}

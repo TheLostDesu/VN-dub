@@ -1,0 +1,213 @@
+# Golden set for the text_emotion rule / cue / merge logic (tests/test_text_emotion.py::test_golden).
+#
+# characters: speaker id -> source / target name. `hero` is the unvoiced protagonist; every other speaker is voiced.
+# case.lines: one scene in script order (add `scene: 2` to start another one). A line is
+#   {sp: <speaker id>, text, tgt?: translation, scene?}            an unvoiced speaker line (the target when it is alone)
+#   {sp: <speaker id>, voiced: true, text, ...}                    a line with original audio (context only)
+#   {n: true, text, tgt?}                                          a narration line (context only)
+#   add `target: true` to pick the line to check when several lines are unvoiced.
+# case.cfg: min_confidence / narration_window overrides.   case.llm: the `delivery` object translate stored for the target.
+# case.expect: layer, emotion, tempo, loudness, events (exact list), arc, intensity: [min, max],
+#   confidence: [min, max], cues (all must be present), notes (substrings).
+
+characters:
+  hero: {src: 勇太, tgt: Юта}
+  sakura: {src: さくら, tgt: Сакура}
+  yui: {src: ゆい, tgt: Юи}
+  ren: {src: 蓮, tgt: Рэн}
+
+cases:
+  # ------------------------------------------------------------------ rule pass: punctuation and markers (ja)
+  - id: plain_period_is_neutral
+    lines: [{sp: hero, text: "そうですか。"}]
+    expect: {layer: neutral, emotion: neutral, tempo: normal, loudness: normal, events: [], arc: flat, intensity: [0.3, 0.3], confidence: [0.0, 0.3]}
+
+  - id: nothing_indicates_delivery_even_with_narration
+    lines: [{n: true, text: "放課後の教室。窓の外は夕焼けだった。"}, {sp: hero, text: "そうだね。"}]
+    expect: {layer: neutral, emotion: neutral, loudness: normal, intensity: [0.3, 0.3]}
+
+  - id: single_exclamation_raises_intensity
+    lines: [{sp: hero, text: "待って！"}]
+    expect: {layer: rule, emotion: other, loudness: normal, intensity: [0.5, 0.6], confidence: [0.6, 0.7], cues: ["！"]}
+
+  - id: double_exclamation_is_loud
+    lines: [{sp: hero, text: "待て！！"}]
+    expect: {layer: rule, emotion: other, loudness: loud, intensity: [0.65, 0.8], cues: ["！！"]}
+
+  - id: question_gives_rising_arc
+    lines: [{sp: hero, text: "本当ですか？"}]
+    expect: {layer: rule, emotion: neutral, arc: rising_end, intensity: [0.3, 0.4]}
+
+  - id: interrobang_is_surprise
+    lines: [{sp: hero, text: "何だって！？"}]
+    expect: {layer: rule, emotion: surprised, arc: rising_end, intensity: [0.7, 0.9]}
+
+  - id: ellipsis_slows_down
+    lines: [{sp: hero, text: "うーん……"}]
+    expect: {layer: rule, emotion: neutral, tempo: slow, intensity: [0.2, 0.3], notes: [pauses]}
+
+  - id: single_ellipsis_is_too_weak
+    lines: [{sp: hero, text: "そう…"}]
+    expect: {layer: neutral, tempo: normal}
+
+  - id: music_note_is_cheerful
+    lines: [{sp: hero, text: "ららら♪"}]
+    expect: {layer: rule, emotion: happy, intensity: [0.4, 0.6], notes: [sing-song]}
+
+  - id: elongation_alone_is_too_weak
+    lines: [{sp: hero, text: "えー"}]
+    expect: {layer: neutral}
+
+  - id: laughter_token
+    lines: [{sp: hero, text: "あはは、おかしい！"}]
+    expect: {layer: rule, emotion: happy, events: [laugh], intensity: [0.7, 0.85]}
+
+  - id: laughter_in_katakana
+    lines: [{sp: hero, text: "ハハハ、そうか。"}]
+    expect: {layer: rule, emotion: happy, events: [laugh]}
+
+  - id: sobbing_tokens
+    lines: [{sp: hero, text: "うう……ひっく……ひどいよ"}]
+    expect: {layer: rule, emotion: sad, events: [cry], tempo: slow}
+
+  - id: whisper_marker
+    lines: [{sp: hero, text: "（小声）ここだけの話だけど。"}]
+    expect: {layer: rule, events: [whisper], loudness: soft, intensity: [0.1, 0.25]}
+
+  - id: parenthesised_inner_voice_is_soft
+    lines: [{sp: hero, text: "（まずいな……）"}]
+    expect: {layer: rule, loudness: soft, events: []}
+
+  - id: stammering
+    lines: [{sp: hero, text: "わ、わたしは……"}]
+    expect: {layer: rule, emotion: embarrassed, notes: [stammering]}
+
+  - id: interjection_surprise
+    lines: [{sp: hero, text: "えっ、本当に？"}]
+    expect: {layer: rule, emotion: surprised, arc: rising_end}
+
+  - id: sigh_interjection
+    lines: [{sp: hero, text: "はあ……疲れた。"}]
+    expect: {layer: rule, events: [sigh], loudness: soft}
+
+  # ------------------------------------------------------------------ rule pass: target text (ru)
+  - id: russian_laughter_in_translation
+    lines: [{sp: hero, text: "そうだね。", tgt: "Ха-ха-ха, конечно!"}]
+    expect: {layer: rule, emotion: happy, events: [laugh]}
+
+  - id: russian_interrobang_in_translation
+    lines: [{sp: hero, text: "そうなの。", tgt: "Что?!"}]
+    expect: {layer: rule, emotion: surprised}
+
+  - id: russian_single_ellipsis_is_too_weak
+    lines: [{sp: hero, text: "そう。", tgt: "Ну..."}]
+    expect: {layer: neutral}
+
+  # ------------------------------------------------------------------ narration cues: ja
+  - id: cue_after_by_name_previous_line
+    lines: [{sp: hero, text: "そんなはずない。"}, {n: true, text: "勇太は叫んだ。"}]
+    expect: {layer: cue, emotion: other, loudness: loud, intensity: [0.8, 0.9], confidence: [0.85, 0.95], cues: [叫んだ]}
+
+  - id: cue_before_applies_to_next_line
+    lines: [{n: true, text: "ためらいがちに口を開いた。"}, {sp: hero, text: "実はね、話があるんだ。"}]
+    expect: {layer: cue, tempo: slow, notes: [hesitant], cues: [ためらいがちに]}
+
+  - id: cue_about_a_voiced_neighbour_does_not_leak
+    lines: [{sp: hero, text: "もういい。"}, {n: true, text: "さくらはささやいた。"}, {sp: sakura, voiced: true, text: "ごめんね。"}]
+    expect: {layer: neutral, events: []}
+
+  - id: cue_name_beats_proximity
+    lines: [{sp: hero, text: "もういい。"}, {sp: yui, voiced: true, text: "え？"}, {n: true, text: "勇太は小声で言った。"}]
+    expect: {layer: cue, loudness: soft, events: [whisper], confidence: [0.8, 0.9]}
+
+  - id: cue_about_somebody_not_around_is_ignored
+    lines: [{sp: hero, text: "もういい。"}, {n: true, text: "ゆいは泣きながら叫んだ。"}]
+    expect: {layer: neutral}
+
+  - id: cue_tie_goes_to_the_preceding_line
+    lines: [{sp: sakura, voiced: true, text: "うん。"}, {n: true, text: "小声で言った。"}, {sp: hero, text: "そうだね。"}]
+    expect: {layer: neutral}
+
+  - id: cue_without_preceding_line_uses_the_next
+    lines: [{n: true, text: "元気よく言った。"}, {sp: hero, text: "こんにちは。"}]
+    expect: {layer: cue, emotion: happy, loudness: loud, confidence: [0.7, 0.8]}
+
+  - id: cue_outside_the_window_is_ignored
+    lines: [{n: true, text: "彼は叫んだ。"}, {sp: sakura, voiced: true, text: "あ。"}, {sp: sakura, voiced: true, text: "い。"}, {sp: sakura, voiced: true, text: "う。"}, {sp: hero, text: "そう。"}]
+    expect: {layer: neutral}
+
+  - id: cue_in_another_scene_is_ignored
+    lines: [{n: true, text: "彼は叫んだ。"}, {sp: hero, text: "そう。", scene: 2}]
+    expect: {layer: neutral}
+
+  - id: cue_single_kanji_name_is_a_name
+    lines: [{sp: ren, text: "もういい。"}, {sp: yui, voiced: true, text: "え？"}, {n: true, text: "蓮は叫んだ。"}]
+    expect: {layer: cue, loudness: loud, confidence: [0.8, 0.9]}
+
+  - id: cue_nearer_line_beats_the_position_hint
+    lines: [{sp: hero, text: "待って。"}, {n: true, text: "別の描写。"}, {n: true, text: "勇太は怒鳴った。"}, {sp: hero, text: "もういい。", target: true}]
+    expect: {layer: cue, emotion: angry, loudness: loud, confidence: [0.8, 0.9]}
+
+  - id: cue_position_breaks_a_tie
+    lines: [{sp: sakura, voiced: true, text: "うん。"}, {n: true, text: "ためらいがちに口を開いた。"}, {sp: hero, text: "あのね。"}]
+    expect: {layer: cue, tempo: slow, notes: [hesitant], confidence: [0.7, 0.8]}
+
+  - id: cue_after_hint_on_a_tie_goes_to_the_preceding_line
+    lines: [{sp: sakura, voiced: true, text: "うん。"}, {n: true, text: "ささやいた。"}, {sp: hero, text: "そうだね。"}]
+    expect: {layer: neutral, events: []}
+
+  - id: cue_confidence_drops_with_distance
+    lines: [{n: true, text: "ゆっくりと言った。"}, {n: true, text: "窓の外は暗い。"}, {sp: hero, text: "寒いね。"}]
+    expect: {layer: neutral, tempo: normal}
+
+  - id: cue_overrides_the_rule_layer
+    lines: [{sp: hero, text: "いい加減にして！"}, {n: true, text: "勇太はささやいた。"}]
+    expect: {layer: cue, emotion: other, loudness: soft, events: [whisper], intensity: [0.2, 0.3]}
+
+  # ------------------------------------------------------------------ narration cues: ru (translated narration)
+  - id: cue_in_translated_narration
+    lines: [{sp: hero, text: "ごめん。"}, {n: true, text: "彼女は言った。", tgt: "— сказала она сквозь слёзы."}]
+    expect: {layer: cue, emotion: sad, events: [cry], cues: ["сквозь слёзы"]}
+
+  - id: ru_stem_matches_masculine_form
+    lines: [{sp: hero, text: "やった。"}, {n: true, text: "彼は言った。", tgt: "Он воскликнул."}]
+    expect: {layer: cue, loudness: loud, cues: [воскликнул]}
+
+  - id: ru_stem_matches_feminine_form
+    lines: [{sp: hero, text: "やった。"}, {n: true, text: "彼女は言った。", tgt: "Она воскликнула."}]
+    expect: {layer: cue, loudness: loud, cues: [воскликнул]}
+
+  # ------------------------------------------------------------------ merge rules
+  - id: merge_min_confidence_blocks_the_rule_layer
+    cfg: {min_confidence: 0.9}
+    lines: [{sp: hero, text: "待て！！"}]
+    expect: {layer: neutral, loudness: normal, intensity: [0.3, 0.3]}
+
+  - id: merge_weak_cue_is_ignored
+    lines: [{sp: hero, text: "そうか。"}, {n: true, text: "笑った。"}]
+    expect: {layer: neutral, emotion: neutral}
+
+  - id: merge_llm_overrides_rule_when_confident
+    lines: [{sp: hero, text: "待て！！"}]
+    llm: {emotion: sad, intensity: 0.6, tempo: slow, loudness: soft, events: [], confidence: 0.8}
+    expect: {layer: llm, emotion: sad, tempo: slow, loudness: soft, intensity: [0.6, 0.6], confidence: [0.8, 0.8]}
+
+  - id: merge_llm_below_threshold_keeps_the_rule_layer
+    lines: [{sp: hero, text: "待て！！"}]
+    llm: {emotion: sad, intensity: 0.6, tempo: slow, loudness: soft, events: [], confidence: 0.5}
+    expect: {layer: rule, loudness: loud, emotion: other}
+
+  - id: merge_llm_neutral_answer_is_not_drama
+    lines: [{sp: hero, text: "そうですか。"}]
+    llm: {emotion: neutral, intensity: 0.3, tempo: normal, loudness: normal, events: [], confidence: 0.2}
+    expect: {layer: neutral, emotion: neutral}
+
+  - id: merge_llm_overrides_cue
+    lines: [{sp: hero, text: "もういい。"}, {n: true, text: "勇太は怒鳴った。"}]
+    llm: {emotion: sad, intensity: 0.4, tempo: slow, loudness: soft, events: [cry], confidence: 0.7}
+    expect: {layer: llm, emotion: sad, loudness: soft, events: [cry]}
+
+  - id: merge_events_accumulate_across_layers
+    lines: [{sp: hero, text: "あはは。"}]
+    llm: {emotion: happy, intensity: 0.7, tempo: normal, loudness: normal, events: [breath], confidence: 0.9}
+    expect: {layer: llm, emotion: happy, events: [laugh, breath]}

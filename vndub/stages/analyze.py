@@ -13,10 +13,17 @@ StyleSpec of every passport (it needs the character medians).
 
 A part whose backend is unavailable is recorded in ``passport.missing`` with
 the reason and the stage continues (the style builder degrades gracefully).
+
+analyze never recognises speech: the forced aligner gets the *known* script text (alignment,
+not recognition) and only backends of role ``align`` are accepted as aligner / fallback; a
+configured name of another role (an ASR model) is refused and the line's timing falls back to
+VAD speech time (``passport.backends["timing"] = "vad_only"``, reason in ``passport.missing["align"]``).
+SenseVoice is used as an event tagger only; its recognised text is dropped before caching.
 """
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
@@ -24,6 +31,7 @@ from typing import Any, Callable
 import numpy as np
 
 from vndub.audio import features, loudness, vad
+from vndub.backends import registry
 from vndub.backends.base import BackendUnavailable
 from vndub.backends.caption.qwen2_audio import CAPTION_PROMPT
 from vndub.manifest.io import Character, CharacterStats, LineRecord, Passport, load_characters, read_json, save_characters, write_json
@@ -38,6 +46,36 @@ VERSION = "1"
 CONFIG_SECTIONS = ("analyze",)
 
 CHUNK = 32
+
+_TAG = re.compile(r"<\|[^|]+\|>")
+
+
+def event_tags(raw: str | None) -> str:
+    """SenseVoice raw output reduced to its ``<|tag|>`` markers (the recognised text is dropped)."""
+    return "".join(_TAG.findall(raw or ""))
+
+
+def alignment_backends(names: list[str]) -> tuple[list[str], list[str]]:
+    """(names usable for forced alignment, notes for names refused because they would transcribe).
+
+    Only role ``align`` backends align text that is already known; anything else (an ASR model set
+    as aligner or fallback) is refused so that analyze can never run speech recognition.
+    """
+    ok: list[str] = []
+    notes: list[str] = []
+    for n in names:
+        if not n:
+            continue
+        try:
+            role = registry.get(n).role
+        except KeyError:
+            ok.append(n)  # unknown names are reported by the registry when resolved
+            continue
+        if role == "align":
+            ok.append(n)
+        else:
+            notes.append(f"{n}: role '{role}' would transcribe, analyze only aligns known text")
+    return ok, notes
 
 
 # ----------------------------------------------------------------------------
@@ -64,6 +102,7 @@ def run_part(
     outputs: Callable[[LineRecord], list[Path]] | None = None,
     value_of: Callable[[LineRecord, dict[str, Any]], Any] | None = None,
     stop_on: Callable[[str], bool] | None = None,
+    on_items: Callable[[int, str | None], None] | None = None,
 ) -> PartResult:
     """Run ``op`` for every line with the first usable backend in ``names``.
 
@@ -91,6 +130,8 @@ def run_part(
                 res.values[l.line_id] = hit
             else:
                 todo.append((l, item, key))
+        if on_items is not None and len(lines) > len(todo):
+            on_items(len(lines) - len(todo), None)
         try:
             if todo:
                 backend = ctx.models.acquire(name)
@@ -111,6 +152,8 @@ def run_part(
                         res.values[l.line_id] = val
                         store.put(l.line_id, key, val)
                     store.save()
+                    if on_items is not None:
+                        on_items(len(chunk), chunk[-1][0].line_id)
                     if stopped:
                         res.reason = f"stopped after error: {next(iter(res.errors.values()))}"
                         break
@@ -232,6 +275,8 @@ def build_passport(
     al = get("align")
     chars = list((al or {}).get("chars") or [])
     p.align = {"chars": chars, "backend": backends.get("align", "")} if chars else {}
+    if not chars:
+        backends["timing"] = "vad_only"  # mora rate over the VAD speech time (no forced alignment for this line)
     span = (float(chars[-1]["t1"]) - float(chars[0]["t0"])) if len(chars) >= 2 else 0.0
     speech_s = span if span > 0.2 else (prof["speech_s"] or max(0.1, p.duration_s - prof["leading_silence_s"] - prof["trailing_silence_s"]))
     morae = ja.count_morae(text)
@@ -337,38 +382,55 @@ def run(ctx: StageContext) -> dict[str, Any]:
     lines = [l for l in lines if (l.src_wav16 or l.src_wav) and Path(wav16(l)).exists()]
     parts: dict[str, PartResult] = {}
 
+    # progress: one unit per line and model pass, then one per passport
+    n_parts = 1 + sum(1 for x in (a.anime_ser, a.adv, a.events, a.aligner, a.f0, a.vad, a.caption) if x)
+    total = max(1, (n_parts + 1) * len(lines))
+    done = 0
+
+    def step(n: int, item: str | None) -> None:
+        nonlocal done
+        done = min(total, done + n)
+        ctx.progress(done, total, item)
+
     parts["e2v"] = run_part(
         ctx, "e2v", [a.e2v], lines,
         lambda l: {"id": l.line_id, "wav": wav16(l), "out": str(ctx.paths.e2v_emb(l.line_id))},
         "emotion",
+        on_items=step,
         outputs=lambda l: [ctx.paths.e2v_emb(l.line_id)],
         value_of=lambda l, r: {"probs": r.get("probs", {}), "label": r.get("label"), "embedding_path": ctx.paths.rel(ctx.paths.e2v_emb(l.line_id)) if ctx.paths.e2v_emb(l.line_id).exists() else _rel(ctx, r.get("embedding_path"))},
     )
     if a.anime_ser:
-        parts["anime"] = run_part(ctx, "anime", [a.anime_ser], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "emotion",
+        parts["anime"] = run_part(ctx, "anime", [a.anime_ser], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "emotion", on_items=step,
                                   value_of=lambda l, r: {"label": r.get("label"), "probs": r.get("probs", {})})
     if a.adv:
-        parts["adv"] = run_part(ctx, "adv", [a.adv], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "adv",
+        parts["adv"] = run_part(ctx, "adv", [a.adv], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "adv", on_items=step,
                                 value_of=lambda l, r: {k: r.get(k) for k in ("arousal", "dominance", "valence")})
     if a.events:
-        parts["events"] = run_part(ctx, "events", [a.events], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "events",
-                                   value_of=lambda l, r: {"events": list(r.get("events") or []), "raw": r.get("raw", "")})
+        parts["events"] = run_part(ctx, "events", [a.events], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "events", on_items=step,
+                                   value_of=lambda l, r: {"events": list(r.get("events") or []), "raw": event_tags(r.get("raw", ""))})
     if a.aligner:
-        parts["align"] = run_part(ctx, "align", [a.aligner, a.aligner_fallback], lines,
-                                  lambda l: {"id": l.line_id, "wav": wav16(l), "text": texts.get(l.line_id, l.text_src), "lang": src_lang}, "align",
+        # forced alignment of the KNOWN text; a backend that would transcribe is refused (VAD-only timing instead)
+        align_names, align_notes = alignment_backends([a.aligner, a.aligner_fallback])
+        for note in align_notes:
+            ctx.log.warning("aligner refused: %s", note)
+        parts["align"] = run_part(ctx, "align", align_names, lines,
+                                  lambda l: {"id": l.line_id, "wav": wav16(l), "text": texts.get(l.line_id, l.text_src), "lang": src_lang}, "align", on_items=step,
                                   value_of=lambda l, r: {"chars": list(r.get("chars") or [])})
+        if align_notes and not parts["align"].backend:
+            parts["align"].reason = "; ".join(align_notes) + "; timing from VAD speech time"
     if a.f0:
         parts["f0"] = run_part(ctx, "f0", [a.f0, "librosa_f0"], lines,
-                               lambda l: {"id": l.line_id, "wav": wav16(l), "out": str(ctx.paths.feat(l.line_id, "f0"))}, "f0",
+                               lambda l: {"id": l.line_id, "wav": wav16(l), "out": str(ctx.paths.feat(l.line_id, "f0"))}, "f0", on_items=step,
                                outputs=lambda l: [ctx.paths.feat(l.line_id, "f0")],
                                value_of=lambda l, r: {"path": ctx.paths.rel(ctx.paths.feat(l.line_id, "f0")) if ctx.paths.feat(l.line_id, "f0").exists() else _rel(ctx, r.get("path")), "hop_s": r.get("hop_s", features.HOP_S)})
     if a.vad:
-        parts["vad"] = run_part(ctx, "vad", [a.vad, "energy_vad"], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "vad",
+        parts["vad"] = run_part(ctx, "vad", [a.vad, "energy_vad"], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "vad", on_items=step,
                                 value_of=lambda l, r: {"segments": r.get("segments") or [], "duration": r.get("duration")})
     caption_note = ""
     if a.caption:
         parts["caption"] = run_part(ctx, "caption", [a.caption_backend], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "caption",
-                                    op_kwargs={"prompt": CAPTION_PROMPT},
+                                    op_kwargs={"prompt": CAPTION_PROMPT}, on_items=step,
                                     value_of=lambda l, r: {"caption": r.get("caption", "")},
                                     stop_on=lambda err: "out of memory" in err.lower())
         if parts["caption"].reason:
@@ -387,7 +449,9 @@ def run(ctx: StageContext) -> dict[str, Any]:
             p.style = prev["style"]
         write_json(ctx.paths.passport(l.line_id), p)
         written += 1
+        step(1, l.line_id)
     core_store.save()
+    ctx.progress(total, total, None)
 
     # per-character aggregation over every passport on disk
     refs_cfg = ctx.cfg.voicebank.refs

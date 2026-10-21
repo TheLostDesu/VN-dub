@@ -1,0 +1,195 @@
+import { useEffect, useState } from "react";
+import { NavLink, useLocation, useNavigate } from "react-router-dom";
+import { api } from "../api/endpoints";
+import { toErrorInfo } from "../api/client";
+import { STEP_IDS, type ErrorInfo, type StepId } from "../api/types";
+import { useI18n } from "../i18n";
+import { useActiveJob, ingestJob } from "../state/progress";
+import { useProject } from "../state/project";
+import { furthestStep, STEP_NUMBER, stepForJobKind, stepPath, useWizard } from "../state/wizard";
+import { ErrorPanel } from "./ErrorPanel";
+import { Button, Dialog, ProgressBar } from "./ui";
+
+export function TopBar() {
+  const t = useI18n().t;
+  const { project, step } = useProject();
+  const loc = useLocation();
+  const inWizard = loc.pathname.startsWith("/step/");
+  return (
+    <header className="topbar">
+      <div className="topbar-left">
+        <NavLink to={project ? stepPath(step) : "/step/game"} className="brand" data-testid="nav-home" aria-label={t("app.home")}>
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <path d="M4 14v-4m4 8V6m4 12V4m4 14V8m4 6v-4" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" fill="none" />
+          </svg>
+          <span>{t("app.name")}</span>
+        </NavLink>
+        {project ? (
+          <span className="project-name" data-testid="project-name" title={project.game_dir}>
+            {project.name}
+          </span>
+        ) : null}
+      </div>
+      <nav className="topbar-nav" aria-label={t("app.menu")}>
+        {!inWizard && project ? (
+          <NavLink to={stepPath(step)} data-testid="nav-wizard">
+            {t("nav.wizard")}
+          </NavLink>
+        ) : null}
+        <NavLink to="/models" data-testid="nav-models">
+          {t("nav.models")}
+        </NavLink>
+        <NavLink to="/settings" data-testid="nav-settings">
+          {t("nav.settings")}
+        </NavLink>
+        <NavLink to="/help" data-testid="nav-help">
+          {t("nav.help")}
+        </NavLink>
+        <NavLink to="/step/doctor" data-testid="nav-doctor">
+          {t("nav.doctor")}
+        </NavLink>
+      </nav>
+    </header>
+  );
+}
+
+export function Stepper({ current }: { current: StepId }) {
+  const t = useI18n().t;
+  const wiz = useWizard();
+  const { project, completed, step } = useProject();
+  const reach = project ? furthestStep(step, completed) : 1;
+  return (
+    <nav className="stepper" aria-label={t("stepper.label")} data-testid="stepper">
+      <ol>
+        {STEP_IDS.map((id) => {
+          const n = STEP_NUMBER[id];
+          const done = completed.includes(id);
+          const isCurrentStep = id === current;
+          const reachable = isCurrentStep || id === "doctor" || (project !== null && n <= reach);
+          const isCurrent = id === current;
+          return (
+            <li key={id} className={`${isCurrent ? "is-current" : ""} ${done ? "is-done" : ""}`}>
+              <button
+                type="button"
+                className="step-btn"
+                aria-current={isCurrent ? "step" : undefined}
+                aria-disabled={!reachable}
+                disabled={!reachable}
+                onClick={() => wiz.goto(id)}
+                data-testid={`step-${id}`}
+              >
+                <span className="step-num" aria-hidden="true">
+                  {done && !isCurrent ? (
+                    <svg viewBox="0 0 24 24" width="14" height="14">
+                      <path d="M5 12.5l4.5 4.5L19 7.5" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+                    </svg>
+                  ) : (
+                    n
+                  )}
+                </span>
+                <span className="step-title">{t(`steps.${id}`)}</span>
+                {done ? <span className="sr-only">{t("stepper.done")}</span> : null}
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+    </nav>
+  );
+}
+
+/** Slim banner for a job that is running while the user looks at another screen. */
+export function ActiveJobBar({ currentStep }: { currentStep: StepId | null }) {
+  const { t, tOr } = useI18n();
+  const nav = useNavigate();
+  const job = useActiveJob();
+  if (!job) return null;
+  const target = stepForJobKind(job.kind);
+  if (target && target === currentStep) return null;
+  const frac = job.total > 0 ? job.done / job.total : null;
+  const label = tOr(job.title_key, t(`jobs.${job.kind}`));
+  const dest = target ? stepPath(target) : job.kind.startsWith("models") ? "/models" : job.kind.startsWith("tools") || job.kind.startsWith("envs") ? "/tools" : null;
+  return (
+    <div className="active-job-bar" role="status" data-testid="active-job-bar">
+      <span className="active-job-title">{t("job.running_now", { title: label })}</span>
+      <div className="active-job-progress">
+        <ProgressBar value={frac} label={label} size="sm" />
+      </div>
+      {dest ? (
+        <Button small onClick={() => nav(dest)} data-testid="active-job-show">
+          {t("job.show")}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+let resumeDismissed = false;
+
+/** "Продолжить с того места, где остановились?" when the last job was interrupted. */
+export function ResumePrompt() {
+  const { t, tOr } = useI18n();
+  const { project, reload } = useProject();
+  const wiz = useWizard();
+  const active = useActiveJob();
+  const [dismissed, setDismissed] = useState(resumeDismissed);
+  const [error, setError] = useState<ErrorInfo | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const available = !!project?.resume?.available && !dismissed && !active;
+  useEffect(() => {
+    setError(null);
+  }, [available]);
+  if (!available || !project) return null;
+  const kind = project.resume.job?.kind ?? "";
+  const label = project.resume.job ? tOr(project.resume.job.title_key, t(`jobs.${kind}`)) : "";
+
+  const dismiss = () => {
+    resumeDismissed = true;
+    setDismissed(true);
+  };
+  const go = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const job = await api.resume();
+      ingestJob(job);
+      await reload();
+      resumeDismissed = true;
+      setDismissed(true);
+      const target = stepForJobKind(job.kind) ?? stepForJobKind(kind);
+      if (target) wiz.goto(target);
+    } catch (e) {
+      setError(toErrorInfo(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog
+      open
+      onClose={dismiss}
+      title={t("resume.title")}
+      testid="resume-dialog"
+      actions={
+        <>
+          <Button onClick={dismiss} data-testid="resume-dismiss">
+            {t("resume.later")}
+          </Button>
+          <Button variant="primary" busy={busy} onClick={() => void go()} data-testid="resume-continue" data-autofocus>
+            {t("resume.continue")}
+          </Button>
+        </>
+      }
+    >
+      <p>{t("resume.text")}</p>
+      {label ? (
+        <p className="hint">
+          {t("resume.was_doing")}: {label}
+        </p>
+      ) : null}
+      {error ? <ErrorPanel error={error} /> : null}
+    </Dialog>
+  );
+}

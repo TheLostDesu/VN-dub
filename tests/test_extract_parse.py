@@ -37,7 +37,9 @@ def test_renpy_mini_stages(make_ctx, fixtures_dir: Path) -> None:
     lines = load_lines(ctx.paths.lines)
     assert all(l.src_wav and ctx.paths.abs(l.src_wav).exists() for l in lines if l.has_voice)
     chars = load_characters(ctx.paths.characters)
-    assert set(chars) == {"sakura", "haruto", "yui"}
+    assert set(chars) == {"sakura", "haruto", "yui", "hero"}
+    assert chars["hero"].names["src"] == "蓮" and chars["hero"].stats.n_lines == 0  # the unvoiced protagonist is a character too
+    assert p["unvoiced"] == 21 and p["lines"] == 41
     proj = ctx.require_project()
     assert proj.engine == "renpy" and proj.voice_codec.codec == "vorbis" and proj.voice_codec.sr == 22050
     # second run hits the cache

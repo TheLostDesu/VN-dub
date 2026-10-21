@@ -76,8 +76,8 @@ def find_gguf(models_dir: Path, spec: BackendSpec) -> Path:
             continue
         pats = w.allow or ("*.gguf",)
         hits = sorted(p for p in d.rglob("*.gguf") if any(fnmatch.fnmatch(p.name, pat) for pat in pats))
-        # multi-part GGUFs: llama.cpp wants the first shard
-        hits = [p for p in hits if "-of-" not in p.name or "-00001-of-" in p.name]
+        # multi-part GGUFs: llama.cpp wants the first shard; a vision projector (mmproj) is never the language model
+        hits = [p for p in hits if ("-of-" not in p.name or "-00001-of-" in p.name) and "mmproj" not in p.name.lower()]
         if hits:
             return hits[0]
     raise WeightsMissing(spec.name, f"no GGUF matching {[w.allow for w in spec.weights]} under {models_dir}")

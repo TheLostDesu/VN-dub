@@ -73,6 +73,13 @@ link:
   speaker_embedder: ecapa
   cluster_distance: 0.35         # agglomerative clustering cut (cosine distance)
   outlier_consistency: 0.50      # cosine to the speaker centroid below this -> review
+  mode: asr                      # asr = verify every clip by speech recognition; no_asr = cheap signals only (the app default)
+  recover_text: false            # mode C: transcribe ONLY voiced lines whose script text is empty (works with mode no_asr too)
+  recover_asr: anime_whisper     # backend for mode C (falls back to asr_fallback)
+  rate_min: 3.0                  # no_asr: slowest / fastest plausible speech (mora per second) for the line's text
+  rate_max: 13.0
+  silence_tolerance_s: 1.0       # no_asr: seconds of leading/trailing silence and pauses allowed on top of the slow bound
+  suggest_asr_share: 0.2         # no_asr: flagged share of lines (>= 5 lines) from which summary.suggest_asr_check is true
 
 analyze:
   e2v: emotion2vec_plus_large    # 9 classes + 768-d embedding (also used by score.emotion)
@@ -110,6 +117,21 @@ translate:
     format: auto                 # auto = per backend ('+' marks for f5_ru, plain otherwise)
   interjections: "configs/interjections.yaml"
   mock_dictionary: ""
+  # include_unvoiced: auto       # auto = when synth.voice_unvoiced is on (the app) | on | off: also translate speaker lines WITHOUT original audio (mode B: the unvoiced protagonist; narration never).
+                                 # off = voiced lines only (the old behaviour); auto = on only when synth.voice_unvoiced is on.
+                                 # These lines also get an LLM `delivery` (see text_emotion.llm).
+
+# text_emotion: delivery from text for lines without original audio (stage `text_emotion`, `vndub text-emotion`).
+# Everything below is the default; uncomment a key to change it.
+# text_emotion:
+#   enabled: true
+#   cues: "configs/delivery_cues.yaml"  # bilingual table: narration speech verbs / manner adverbs -> emotion, intensity, tempo, loudness, events
+#   narration_window: 3          # narration lines scanned before and after a dialogue line (same scene)
+#   llm: auto                    # auto = use the `delivery` the translate LLM returned (never loads a model itself); on = also ask for it
+#                                # when translation is imported; off = rule + cue layers only
+#   llm_context_lines: 5         # script lines around a line shown to the LLM for its delivery
+#   min_confidence: 0.6          # a later layer (rule -> cue -> llm) overrides an earlier one only at >= this; else neutral
+#   only_unvoiced: true          # lines with original audio keep their audio passport (false: voiced lines without a passport get a text one)
 
 voicebank:
   refs:
@@ -126,6 +148,8 @@ voicebank:
     test_sentences: 5
     max_f0_delta_semitones: 3
     reference_dir: ""
+    sample_lines: 2              # casting: clips of a design that are the character's own translated lines (the rest of test_sentences: generic)
+    offer_clone: false           # casting: also render a "clone" design (route A) in the stage; the app's propose_designs always offers it
   rvc:
     enabled: true
     backend: rvc
@@ -183,6 +207,10 @@ synth:
   interjection_max_syllables: 2
   high_arousal: 0.75
   seed_base: 1234
+  voice_unvoiced: false          # also dub speaker lines WITHOUT original audio (route P: performer voice only; narration never); the app sets true
+  # routes: P is not in the default dict on purpose: it is picked per line for characters without original audio / with
+  # characters.yaml route: P. Tuning: characters.yaml <sid>.performer.tuning (pitch_st, speed, expressiveness, energy,
+  # timbre_preset, character_note) and per-line "tuning" overrides; see docs/PIPELINE.md (synth).
 
 score:
   weights: {utmos: 0.25, pq: 0.10, spk_sim: 0.20, emo_sim: 0.20, cer: 0.15, dur: 0.05, prosody: 0.05}
@@ -215,11 +243,12 @@ master:
     true_peak_dbtp: -1.0
     default_lufs: -20.0
   match_silence_profile: true
+  # voice tuning (characters.yaml performer.tuning): pitch / tempo for backends without a native knob and the energy -> loudness offset (+-3 dB) are applied here
   include_review_lines: skip     # skip | provisional (use the best candidate of review lines)
 
 pack:
   kirikiri: {mode: patch_xp3, patch_name: "", subdir: ""}   # patch_xp3 | unencrypted_dir
-  renpy: {mode: loose}
+  renpy: {mode: loose}           # + unvoiced_dir: voice_dub (lines without original voice, config.auto_voice) | auto_voice: "voice/{id}.ogg" (override of the game's own pattern)
   nscripter: {mode: loose}
   unity: {mode: unitypy_script}
   other: {}
