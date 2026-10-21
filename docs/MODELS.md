@@ -107,20 +107,22 @@ Environments created with `scripts/make_envs.ps1 -Cpu`:
 | score | 2.8.0+cpu | 11.1 min | incl. the `+utmosv2` extra (UTMOSv2 from git, timm, audiobox_aesthetics) |
 | funasr | 2.3.1+cpu | 2.3 min base + 1.1 min `+cosyvoice` extra | CosyVoice repo cloned at the pinned commit; `openai-whisper` needs `envs/build.constraints.txt` (setuptools<70) |
 
-Selftests that passed (2 s synthetic clip; CPU):
+Selftests that passed (2 s synthetic clip; CPU). First runs used librosa's `soxr_hq` resampler,
+which took ~1.2 s per clip on this machine; after switching to scipy polyphase resampling the
+same selftests were re-run ("after" column, `vndub models selftest ...`, 2026-10-21):
 
-| Backend | Load s | Run s | Output |
-|---|---|---|---|
-| whisper_tiny | 4-11 | 0.4-0.9 | transcript (empty on the synthetic tone) |
-| gigaam_v3 | 35 | 1.6-2.0 | transcript |
-| silero | 5-11 | 0.1-0.2 | speech segments |
-| ruaccent | 21-56 | 0.1-0.3 | `На двер+и вис+ит зам+ок, а вдал+и виден ст+арый з+амок.` (homographs замок/замок resolved) |
-| ecapa | 5-18 | 0.2-1.7 | 192-d embedding |
-| utmos22 | 3-17 | 5-10 | MOS |
-| utmosv2 | 20-52 | 36-39 | MOS (slow on CPU: multi-crop SSL + spectrogram branches) |
-| audiobox | 7-17 | 3-9 | CE/CU/PC/PQ |
-| torchcrepe | 8-16 | 20-24 | F0 at 10 ms (`full` model is slow on CPU) |
-| emotion2vec_plus_seed | 43-47 | 0.6-1.3 | 9 probs + 768-d embedding |
+| Backend | Load s | Run s (before) | Run s (after fix) | Output |
+|---|---|---|---|---|
+| whisper_tiny | 4-11 | 0.4-0.9 | 0.25 | transcript (empty on the synthetic tone) |
+| gigaam_v3 | 35 | 1.6-2.0 | 0.25 | transcript |
+| silero | 5-11 | 0.1-0.2 | 0.27 | speech segments |
+| ruaccent | 21-56 | 0.1-0.3 | 0.08 | `На двер+и вис+ит зам+ок, а вдал+и виден ст+арый з+амок.` (homographs замок/замок resolved) |
+| ecapa | 5-18 | 0.2-1.7 | 0.16 | 192-d embedding |
+| utmos22 | 3-17 | 5-10 | 1.5 | MOS |
+| utmosv2 | 20-52 | 36-39 | 7.44 | MOS (slow on CPU: multi-crop SSL + spectrogram branches) |
+| audiobox | 7-17 | 3-9 | 2.1 | CE/CU/PC/PQ |
+| torchcrepe | 8-16 | 20-24 | 5.56 | F0 at 10 ms (`full` model is slow on CPU) |
+| emotion2vec_plus_seed | 43-47 | 0.6-1.3 | 0.28 | 9 probs + 768-d embedding |
 
 Real-speech check through the JSON-RPC path (Windows SAPI voices as the source, script in the build log):
 
