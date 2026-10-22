@@ -8,7 +8,7 @@ import { useActiveJob, ingestJob } from "../state/progress";
 import { useProject } from "../state/project";
 import { furthestStep, pathForJobKind, STEP_NUMBER, stepForJobKind, stepPath, useWizard } from "../state/wizard";
 import { ErrorPanel } from "./ErrorPanel";
-import { Button, Dialog, ProgressBar } from "./ui";
+import { Button, Checkbox, Dialog, ProgressBar } from "./ui";
 
 /** The running job as a chip in the top bar: title, stage, percentage; a click opens the page that shows the job. */
 function TopBarJob() {
@@ -171,6 +171,7 @@ export function ResumePrompt() {
   const [dismissed, setDismissed] = useState(resumeDismissed);
   const [error, setError] = useState<ErrorInfo | null>(null);
   const [busy, setBusy] = useState(false);
+  const [keepShutdown, setKeepShutdown] = useState(false);
 
   const available = !!project?.resume?.available && !dismissed && !active;
   useEffect(() => {
@@ -179,6 +180,10 @@ export function ResumePrompt() {
   if (!available || !project) return null;
   const kind = project.resume.job?.kind ?? "";
   const label = project.resume.job ? tOr(project.resume.job.title_key, t(`jobs.${kind}`)) : "";
+  // "turn the computer off when done" of the interrupted run is dropped on a continue unless the user ticks it again
+  const hadShutdown = project.resume.job?.params?.shutdown_when_done === true;
+  // the other interrupted jobs stay interrupted and are offered next time; one title per kind
+  const others = Array.from(new Set((project.resume.candidates ?? []).map((j) => tOr(j.title_key, t(`jobs.${j.kind}`)))));
 
   const dismiss = () => {
     resumeDismissed = true;
@@ -188,7 +193,7 @@ export function ResumePrompt() {
     setBusy(true);
     setError(null);
     try {
-      const job = await api.resume();
+      const job = await api.resumeProject({ keep_shutdown: hadShutdown && keepShutdown });
       ingestJob(job);
       await reload();
       resumeDismissed = true;
@@ -224,6 +229,14 @@ export function ResumePrompt() {
         <p className="hint">
           {t("resume.was_doing")}: {label}
         </p>
+      ) : null}
+      {others.length > 0 ? (
+        <p className="hint" data-testid="resume-candidates">
+          {t("resume.others", { titles: others.join(", ") })}
+        </p>
+      ) : null}
+      {hadShutdown ? (
+        <Checkbox checked={keepShutdown} onChange={setKeepShutdown} label={t("resume.keep_shutdown")} hint={t("resume.keep_shutdown_hint")} testid="resume-keep-shutdown" />
       ) : null}
       {error ? <ErrorPanel error={error} /> : null}
     </Dialog>

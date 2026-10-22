@@ -50,3 +50,46 @@ def add_unvoiced(ctx: Any, speaker: str = "hero", n: int = 3, gender: str = "m",
         style = StyleSpec(emotion="angry", intensity=0.8, tempo="fast", loudness="loud")
         write_json(ctx.paths.passport(hero[0]), {"line_id": hero[0], "source": "text", "style": style.to_dict(), "delivery": {"emotion": "angry", "layer": "rule", "confidence": 0.9}})
     return {"hero": hero, "narrator": narr, "sustain": sus, "menu": menu}
+
+
+# ----------------------------------------------------------------------------
+# watching the backends a stage uses (round 8: unavailable backends, resume, call counts)
+# ----------------------------------------------------------------------------
+
+
+class _Counted:
+    """A backend handle that counts the items each op is asked for and lets a test hook into every call."""
+
+    def __init__(self, backend: Any, counts: Any, hook: Any) -> None:
+        self._b, self._counts, self._hook = backend, counts, hook
+
+    def call(self, op: str, items: Any = None, **kw: Any) -> Any:
+        if self._hook is not None:
+            self._hook(op, items)
+        self._counts[op] += len(items) if items is not None else 1
+        return self._b.call(op, items, **kw)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._b, name)
+
+
+def watch_models(ctx: Any, unavailable: dict[str, Exception] | None = None, on_call: Any = None) -> Any:
+    """Wrap ``ctx.models.acquire``: ``counts[op]`` = items sent per op; a name in ``unavailable`` raises that exception when it
+    is acquired (a BackendUnavailable / VramBudgetExceeded for an orphan-held GPU); ``on_call(op, items)`` runs before each call
+    and may raise (``KeyboardInterrupt`` is a kill: ``run_batched`` turns ordinary exceptions into per-item errors).
+    ``counts.acquired`` lists the names asked for. Returns the counter; ``counts.restore()`` puts the registry back."""
+    from collections import Counter
+
+    counts: Any = Counter()
+    counts.acquired = []
+    real = ctx.models.acquire
+
+    def acquire(name: str, options: Any = None, **kw: Any) -> Any:
+        counts.acquired.append(name)
+        if unavailable and name in unavailable:
+            raise unavailable[name]
+        return _Counted(real(name, options, **kw), counts, on_call)
+
+    ctx.models.acquire = acquire
+    counts.restore = lambda: setattr(ctx.models, "acquire", real)
+    return counts

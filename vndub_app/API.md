@@ -11,7 +11,7 @@ change a shape below, keep it backward compatible and note it in your final repo
 |---|---|
 | `vndub_app/appdirs.py` | data folder, `Settings`, `ProjectHandle` (`work`, `out`, `config_file`, `glossary_file`, `state_file`, `game_dir`), `create_project`, `list_projects`, `read_app_state` / `write_app_state`, `write_project_config` (generates `<project>/pipeline.yaml` that `extends` the bundled profile; sets `link.mode: no_asr` unless Advanced `asr_check`), `resource()` for bundled files |
 | `vndub_app/errors.py` | `AppError(code, params=, action=, details=, status=)`, `error_from_exception`, `install_handlers(app)`; action vocabulary `ACTIONS` |
-| `vndub_app/jobs.py` | `runner()` (process-wide `JobRunner`; `JobRunner(state_file, throughput_file, log_dir)` writes the per-job log files into `log_dir`), `JobContext` (`set_stages`, `begin_stage`, `progress`, `message`, `log`, `set_result`, `checkpoint`, `stage_progress_cb()`), `EtaEstimator`, `ThroughputStore`, `JobCancelled` |
+| `vndub_app/jobs.py` | `runner()` (process-wide `JobRunner`; `JobRunner(state_file, throughput_file, log_dir)` writes the per-job log files into `log_dir`), `JobContext` (`set_stages`, `begin_stage`, `progress`, `message`, `log`, `set_result`, `add_warnings`, `checkpoint`, `stage_progress_cb()`), `EtaEstimator`, `ThroughputStore`, `JobCancelled` |
 | `vndub/stages/common.py` | `StageContext.progress(done, total, item=None)` — calls `ctx.extra["progress_cb"](stage, done, total, item)` when set (may block = pause, may raise = cancel) |
 | `vndub/config.py` | new keys: `link.mode` (`asr` \| `no_asr`, CLI default `asr`), `link.recover_text` (bool), `link.recover_asr`; section `text_emotion` (`enabled`, `cues`, `narration_window`, `llm` auto/on/off, `llm_context_lines`, `min_confidence`, `only_unvoiced`) |
 | `configs/pipeline.apptest.yaml` | all-mock profile (seconds per full run on `tests/fixtures/renpy_mini`); select with `VNDUB_APP_PROFILE=apptest` |
@@ -29,12 +29,14 @@ from vndub.cli import make_ctx            # existing
 from vndub.stages.common import run_stage  # existing
 h = appdirs.project_handle(slug); appdirs.write_project_config(h)
 ctx = make_ctx(h.game_dir, h.config_file, only="id1,id2" | None, limit=None, force=False,
-               sets=["synth.n_candidates=1"], extra={"progress_cb": job_ctx.stage_progress_cb()})
+               sets=["synth.n_candidates=1"],
+               extra={"progress_cb": job_ctx.stage_progress_cb(), "cancel_check": job_ctx.checkpoint})
 try:
     for st in stages: job_ctx.begin_stage(st); run_stage(st, ctx)   # score -> cli._regen_loop(ctx)
 finally:
     ctx.models.close()
 ```
+`extra["cancel_check"]` is what `StageContext.check_cancel()` calls: code that swallows exceptions (a failed model call that is retried) calls it so a Cancel is never swallowed (no-op from the CLI). Before `ctx.models.close()` the app writes the registry's `substitutions` and `unavailable` lists to `job.result["warnings"]` (section 4).
 Stage log lines: attach a `logging.Handler` to logger `vndub` (stage loggers are children,
 `vndub.<stage>`) that forwards records to `job_ctx.log()`.
 
@@ -132,9 +134,9 @@ the job's `result` when `state == "done"`. Audio URLs are always produced by the
 |---|---|---|
 | GET | `/api/projects` | `[ProjectInfo-lite {slug, name, game_dir, engine, step, updated}]` |
 | POST | `/api/project/open` | `{game_dir}` or `{slug}` → `ProjectInfo` (creates if new, becomes current) |
-| GET | `/api/project` | `ProjectInfo {slug, name, game_dir, engine, project_yaml|null, state (app_state), stage_status, active_job: JobInfo|null, resume: {available, job: JobInfo|null, next_stage|null}}` (404 `no_project`) |
+| GET | `/api/project` | `ProjectInfo {slug, name, game_dir, engine, project_yaml|null, state (app_state), stage_status, active_job: JobInfo|null, resume: {available, job: JobInfo|null, next_stage|null, candidates: [JobInfo]}}` (404 `no_project`). `resume.job` is the interrupted job `POST /api/project/resume` would continue: the newest among the heavy kinds (`import recover_text asr_check translate stage preview full review_apply`), else the newest of the rest; `candidates` are the other interrupted jobs of a different kind (they stay interrupted and are offered next time). Interrupted records older than 14 days are forgotten when the app starts |
 | PUT | `/api/project/state` | partial app_state (deep-merged) → app_state; regenerates pipeline.yaml |
-| POST | `/api/project/resume` | → Job (re-submits the interrupted job's kind+params) |
+| POST | `/api/project/resume` | `{keep_shutdown?: bool}` → Job: re-submits `resume.job` (same kind + params) and forgets the interrupted jobs of that kind only. `shutdown_when_done` is dropped from the params unless `keep_shutdown` is `true`. The new job runs with the settings of now; when the old record's `settings` differ, the new job's `result.warnings` carries a `settings_changed` item. No interrupted job → 404 `nothing_to_resume` |
 | POST | `/api/project/import` | Step 1 → Job (detect, extract, parse, link no_asr, analyze, text_emotion) |
 | POST | `/api/project/recover-text` | mode C → Job (link with `recover_text`) |
 | POST | `/api/project/asr-check` | → Job (link with `mode: asr`) |
@@ -204,8 +206,12 @@ Mapping lives in `vndub_app/verdicts.py` (unit-tested) and uses the same thresho
 
 ## 4. Jobs and progress
 
-`JobInfo` = `JobRecord.info()`: `{id, kind, title_key, params, project, gpu, state: queued|running|paused|done|failed|cancelled|interrupted, created, started, finished, stages[], stage, stage_index, stage_count, done, total, item, eta_s, stage_eta_s, rate_per_min, message_key, message_params, error: ErrorInfo|null, result, log_path: str|null}`.
+`JobInfo` = `JobRecord.info()`: `{id, kind, title_key, params, project, gpu, state: queued|running|paused|done|failed|cancelled|interrupted, created, started, finished, stages[], stage, stage_index, stage_count, done, total, item, eta_s, stage_eta_s, rate_per_min, message_key, message_params, error: ErrorInfo|null, result, log_path: str|null, settings}`. `settings` = the app settings at submit time (`{gpu_budget_gb, translation_llm, license_policy, models_dir, envs_dir, profile, src_lang?, tgt_lang?}`, the models / envs folders as effective absolute paths, `translation_llm` the effective model; `{}` on records written by an older version); a resume compares it with the current values.
 `GET /api/jobs?project=&active=1`, `GET /api/jobs/{id}` (+ `log_tail`), `POST /api/jobs/{id}/pause|resume|cancel`.
+`result.warnings` (optional, list; appended to as the run goes, also when it fails or is cancelled; every item is `{kind, ...}` with string values, `reason` cut to 200 characters; identical items appear once): `{kind: "substitution", requested, used, reason}` (the registry loaded `used` instead of `requested`; while the job is active `message_key` is `jobs.msg.substituted` with `requested` / `used` after the first one), `{kind: "unavailable", stage, group, reason}` (a stage skipped a part because no backend could be acquired: a score metric group, an analyze part, a synth route), `{kind: "mixed_models", models: "gemma4_12b: 812, qwen35_9b: 140"}` (translate summary `models_used` names more than one real model; `same_lang` and `import` do not count), `{kind: "settings_changed", keys: "gpu_budget_gb, translation_llm"}` (a resumed job; keys of the old snapshot whose value differs now). The SPA shows them in one warn callout (`job-warnings`, i18n `job.warn.*`).
+
+ETA and throughput: the speed is the average since the stage began, pauses excluded; items that report faster than 0.05 s each are cached results and are not measured. The per-line speed of each stage is kept in `<data>/throughput_v3.json` (the older `throughput_v2.json` is not read) and is recorded only for a stage that measured at least 20 items or 20 % of its total with real work, not for a stage entered a second time in the same job (regen rounds), not for jobs of fewer than 10 lines (listen, tuning), and a new value moves at most 3x up or down per run.
+
 `GET /api/jobs/{id}/log` -> `{path: str|null, lines: [str]}`: the whole log file of the job (`log_path`; the newest 5 MB when it is bigger, so the first line can be missing), flushed first so a running job's latest lines are in it; when the file is gone (pruned, folder cleaned, never written) `path` is `null` and `lines` is the in-memory `log_tail` (last 300). 404 `job_not_found`.
 
 Job log lines: the server prefixes every line with the local time, `HH:MM:SS text` (8 characters and a space), in `log_tail`, in the `log` events and in the file; pipeline records forwarded from the `vndub*` loggers keep their own shape after the time (`12:03:44 INFO vndub.link: ...`), and a failure adds `ERROR: <first line of the error details>`. The file is `<data>/logs/jobs/<YYYYMMDD-HHMMSS>-<kind>-<id>.log` (UTF-8), opened when the job starts running, closed on its final state, and the newest 30 are kept. It holds every line the UI log shows plus a header (`=== job <id> kind=<kind> project=<slug|-> created=<iso> params=<compact json>`; values of keys that look like secrets are masked), stage and pause / resume / cancel events (`--- stage synth begin (2/6)`, `--- stage synth done in 41.3s (38/38)`, `=== cancel requested`) and a footer (`=== done after 52.0s`, `=== failed after 3.1s error=tool_missing`). The problem report zip carries the newest 5 under `logs/jobs/`.

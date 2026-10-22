@@ -41,10 +41,12 @@ import csv
 import json
 import re
 import threading
+import urllib.error
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import yaml
 
@@ -379,6 +381,7 @@ class LlmTranslator:
         self.calls = 0
         self.failures = 0
         self.truncated = 0
+        self.delivery_errors = 0  # delivery requests that raised (not: answers without a valid delivery)
         self._lock = threading.Lock()  # the counters are shared by the scene threads
 
     def _count(self, name: str) -> None:
@@ -436,6 +439,30 @@ class LlmTranslator:
         msgs.append({"role": "user", "content": "Translate these lines and answer with JSON only:\n" + json.dumps(visible, ensure_ascii=False)})
         return msgs
 
+    def _dead_reason(self, exc: BaseException) -> str:
+        """Why the model server cannot answer any more ("" while it may still answer the next request).
+
+        A request that failed because the server is gone (llama-server exited, was killed by a Cancel or by the
+        driver, refuses connections) fails the same way for every retry and every half of the halving below: the
+        stage stops instead of making dozens of calls that cannot succeed. An HTTP error status or a timeout is
+        an answer of a living server and keeps the usual retry path.
+        """
+        if isinstance(exc, urllib.error.HTTPError):
+            return ""
+        poll = getattr(getattr(self.backend, "proc", None), "poll", None)
+        if callable(poll):
+            try:
+                code = poll()
+            except Exception:  # noqa: BLE001 - a probe of the process must never be the error
+                code = None
+            if code is not None:
+                return f"the server process exited with code {code}"
+        if isinstance(exc, ConnectionError):
+            return f"connection lost ({exc})"
+        if isinstance(exc, urllib.error.URLError) and not isinstance(exc.reason, TimeoutError):
+            return f"connection failed ({exc.reason})"
+        return ""
+
     def attempt(
         self, batch: list[dict[str, Any]], context: list[dict[str, Any]], summary: str, temperature: float, scene_context: list[dict[str, Any]] | None = None
     ) -> dict[str, dict[str, Any]]:
@@ -452,12 +479,21 @@ class LlmTranslator:
                 **self._extra(),
             )
         except BackendUnavailable:
+            self.ctx.check_cancel()
             raise
-        except Exception as e:  # adapter/http errors count as an invalid answer
+        except Exception as e:  # adapter/http errors count as an invalid answer ...
+            # ... unless the job was cancelled: Cancel kills the server, so the failure that follows is not an answer
+            # and must not start the retry / halving below (that is dozens of calls to a dead server)
+            self.ctx.check_cancel()
             self.ctx.log.warning("llm call failed (%s): %s", self.name, e)
+            dead = self._dead_reason(e)
+            if dead:
+                raise StageError(f"the translation model {self.name} stopped answering: {dead}. See work/logs/llama_server.log; the lines already translated are kept") from e
             return {}
         ids = [b["id"] for b in batch]
         got = parse_response(content, ids, self.tgt, want)
+        for entry in got.values():  # every entry says which model wrote it, whatever happens to the batch later
+            entry["source"] = f"llm:{self.name}"
         if len(got) < len(batch):
             self._count("failures")
             self._log_answer("translate", ids, len(got), temperature, content)
@@ -496,8 +532,11 @@ class LlmTranslator:
             try:
                 content = self.backend.chat(msgs, temperature=0.0, max_tokens=max(1024, 160 * len(todo)), json_mode=True, seed=1234, **self._extra())
             except BackendUnavailable:
+                self.ctx.check_cancel()
                 raise
             except Exception as e:
+                self.ctx.check_cancel()  # a Cancel is not "no llm delivery"
+                self._count("delivery_errors")
                 self.ctx.log.warning("llm delivery call failed (%s): %s", self.name, e)
                 break
             ids = [b["id"] for b in todo]
@@ -507,9 +546,15 @@ class LlmTranslator:
             got.update(part)
         return got
 
-    def summarize(self, scene: str, rows: list[dict[str, Any]]) -> str:
+    def summarize_checked(self, scene: str, rows: list[dict[str, Any]]) -> tuple[str, bool]:
+        """``(summary, from_model)``: the model's scene summary, or the derived fallback with ``from_model`` False.
+
+        Only a summary the model wrote is worth keeping: the fallback is built from the lines in a moment, and a
+        failed call (a server that is down, a Cancel) must not be remembered as "the summary of this scene".
+        The mock translator's summary is derived by definition (nothing to keep).
+        """
         if self.name.startswith("mock"):
-            return derived_summary(scene, rows)
+            return derived_summary(scene, rows), False
         msgs = [
             {"role": "system", "content": "Summarize a visual novel scene in two short English sentences. Answer with JSON only: {\"summary\": \"...\"}."},
             {"role": "user", "content": "\n".join(f"{r['speaker']}: {r['text']}" for r in rows[:80])},
@@ -520,14 +565,19 @@ class LlmTranslator:
             data = _json_object(content)
             s = data.get("summary") if isinstance(data, dict) else None
             if isinstance(s, str) and s.strip():
-                return s.strip()
+                return s.strip(), True
             self.ctx.log.info("scene summary unusable for %s", scene)
         except BackendUnavailable:
+            self.ctx.check_cancel()
             raise
         except Exception as e:
+            self.ctx.check_cancel()  # a Cancel lands here as a failed call; it must not turn into a cached fallback
             self.ctx.log.info("scene summary failed for %s: %s", scene, e)
         self._log_answer("summary", [scene], 0, 0.0, content)
-        return derived_summary(scene, rows)
+        return derived_summary(scene, rows), False
+
+    def summarize(self, scene: str, rows: list[dict[str, Any]]) -> str:
+        return self.summarize_checked(scene, rows)[0]
 
 
 def derived_summary(scene: str, rows: list[dict[str, Any]]) -> str:
@@ -781,7 +831,14 @@ def delivery_target_ids(ctx: StageContext, lines: list[LineRecord]) -> set[str]:
     return {l.line_id for l in lines if l.line_id in unvoiced}
 
 
-def _acquire_llm(ctx: StageContext) -> tuple[Any, str]:
+@dataclass
+class _LlmPlan:
+    primary: str  # the model the user asked for (the real one when ``--real`` replaces the test profile's mock)
+    chain: list[str]  # primary first, then ``translate.llm.fallbacks``
+    options: dict[str, Any]  # what ``acquire`` is given; the VRAM estimate is costed for exactly these
+
+
+def _llm_plan(ctx: StageContext) -> _LlmPlan:
     llm = ctx.cfg.translate.llm
     primary = llm.backend
     if ctx.extra.get("real") and primary.startswith("mock"):
@@ -791,17 +848,37 @@ def _acquire_llm(ctx: StageContext) -> tuple[Any, str]:
         options["extra_args"] = [str(a) for a in llm.extra_args]
     if ctx.cfg.translate.mock_dictionary:
         options["dictionary"] = str(ctx.cfg.resolve(ctx.cfg.translate.mock_dictionary))
+    return _LlmPlan(primary, list(dict.fromkeys([primary, *llm.fallbacks])), options)
+
+
+def _llm_candidates(ctx: StageContext, plan: _LlmPlan, reasons: list[str]) -> Iterator[tuple[str, Any]]:
+    """The models of the plan that would load right now, best first: ``(name, resolved spec)``.
+
+    The one place that decides which model the stage works with. :func:`_acquire_llm` loads the first of them (the
+    next one when a load fails) and :func:`_llm_key_backend` names the first one for the cache key, so the key
+    can never name a model other than the one that runs. Why a model was skipped is appended to ``reasons``.
+    """
+    for name in plan.chain:
+        spec, why = ctx.models.would_fit(name, plan.options)
+        if why is None:
+            yield name, spec
+        else:
+            reasons.append(why)
+
+
+def _acquire_llm(ctx: StageContext) -> tuple[Any, str]:
+    plan = _llm_plan(ctx)
     reasons: list[str] = []
-    for name in [primary, *llm.fallbacks]:
+    for name, spec in _llm_candidates(ctx, plan, reasons):
+        reason = "; ".join(reasons)
+        if name != plan.primary:
+            # loud, and recorded as a substitution (report, gpu_events, the app's job warnings): before, the default
+            # model could be skipped on every run (VRAM budget, an orphan holding the card) without a trace
+            ctx.log.warning("translation LLM %s is not usable (%s): using %s", plan.primary, reason, spec.name)
         try:
-            spec, _ = ctx.models.resolve(name)
-            reason = "; ".join(reasons)
-            if name != primary:
-                # loud, and recorded as a substitution (report, gpu_events): before, the default model could be
-                # skipped on every run (VRAM budget) without a trace
-                ctx.log.warning("translation LLM %s is not usable (%s): using %s", primary, reason, spec.name)
-            return ctx.models.acquire(name, options, substituted_for=primary if name != primary else None, reason=reason), spec.name
+            return ctx.models.acquire(name, plan.options, substituted_for=plan.primary if name != plan.primary else None, reason=reason), spec.name
         except BackendUnavailable as e:
+            ctx.check_cancel()  # a Cancel that killed the server during the load is not "this model failed": no next model
             reasons.append(str(e))
     raise StageError("no translation backend usable: " + "; ".join(reasons))
 
@@ -910,6 +987,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
         "tgt_lang": tgt,
         "sources": dict(src_counts),
         "backend": backend_name or "-",
+        "models_used": models_used(recs),
         "interjections": sum(1 for r in recs if "interjection" in r.flags),
         "failed": sum(1 for r in recs if "translate_failed" in r.flags),
         "missing": sum(1 for r in recs if "translate_missing" in r.flags),
@@ -920,6 +998,27 @@ def run(ctx: StageContext) -> dict[str, Any]:
         "out": str(out_path),
     }
 
+
+
+def models_used(recs: list[TranslationRecord]) -> dict[str, int]:
+    """``{model: lines}`` of this run's records, whatever their origin (translated now or read from the cache).
+
+    A model line counts under the model named in the record's ``source`` (``llm:<model>``: the model that wrote it,
+    stored with the cache entry), an imported translation under ``"import"``, a script that already was in the
+    target language under ``"same_lang"``. Lexicon interjections are not model output and failed or missing lines
+    have no translation: neither is counted. More than one entry means the project was translated by more than one
+    model (a fallback after the first one did not fit, a resume with a different model). Largest first.
+    """
+    n: Counter[str] = Counter()
+    for r in recs:
+        if "translate_failed" in r.flags or "translate_missing" in r.flags:
+            continue
+        kind, _, model = r.source.partition(":")
+        if kind == "llm":
+            n[model or "unknown"] += 1
+        elif kind in ("import", "same_lang"):
+            n[kind] += 1
+    return dict(sorted(n.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def _scene_lines(ctx: StageContext) -> dict[str, list[LineRecord]]:
@@ -953,13 +1052,33 @@ def _delivery_scene_context(
 
 
 def _llm_key_backend(ctx: StageContext) -> str:
-    """The backend name decides the cache key: resolve without loading."""
-    llm = ctx.cfg.translate.llm
-    primary = llm.real_backend if (ctx.extra.get("real") and llm.backend.startswith("mock")) else llm.backend
+    """The model name that decides the cache key: the first model of the plan that fits now, i.e. the one
+    :func:`_acquire_llm` will load (nothing is loaded here). When none fits it is the primary: the stage raises
+    when it needs a model, and a run that is served from the cache alone keeps the primary's entries."""
+    plan = _llm_plan(ctx)
+    first = next(_llm_candidates(ctx, plan, []), None)
+    if first is not None:
+        return first[1].name
     try:
-        return ctx.models.resolve(primary)[0].name
+        return ctx.models.resolve(plan.primary)[0].name
     except BackendUnavailable:
-        return primary
+        return plan.primary
+
+
+def _llm_preferred(ctx: StageContext, key_backend: str) -> list[str]:
+    """Models the user prefers over ``key_backend`` (they come before it in the plan but do not fit now).
+
+    Work they did earlier is still read from the cache, labelled with their name: a restart with the card
+    briefly full must not throw a good translation away for a smaller model's. The cache is written under the
+    model that really runs, so once the preferred model fits again its own entries win.
+    """
+    names: list[str] = []
+    for n in _llm_plan(ctx).chain:
+        try:
+            names.append(ctx.models.resolve(n)[0].name)
+        except BackendUnavailable:
+            names.append(n)
+    return names[: names.index(key_backend)] if key_backend in names else []
 
 
 def translate_llm(
@@ -1008,6 +1127,10 @@ def translate_llm(
         with tr_lock:  # the model is loaded once, whichever scene thread misses the cache first
             if translator is None:
                 backend, backend_name = _acquire_llm(ctx)
+                if backend_name != key_backend:
+                    # the model the key walk named did not load after all (or the card changed in between): what this
+                    # run writes goes under the key of the model that really answers, never under the other's
+                    ctx.log.warning("the cache was keyed for %s but %s was loaded", key_backend, backend_name)
                 translator = LlmTranslator(ctx, backend, backend_name, tgt, gloss, chars, src)
             return translator
 
@@ -1023,6 +1146,8 @@ def translate_llm(
 
     llm = t.llm
     key_backend = _llm_key_backend(ctx)
+    # cache entries of a model the user prefers over the one that runs now stay readable (labelled with their own model)
+    readable = [key_backend, *_llm_preferred(ctx, key_backend)]
     lock = threading.Lock()  # ``entries`` is shared by the scene threads when llm.parallel > 1
     total = len(todo)
     n_done = 0
@@ -1034,39 +1159,55 @@ def translate_llm(
             n_done += n
             ctx.progress(min(n_done, total), total, item)
 
+    def cached(item_id: str, key_of: Any) -> Any:
+        """The stored value of ``item_id`` under the key of the model that runs, else of a preferred one."""
+        for model in readable:
+            hit = store.get(item_id, key_of(model))
+            if hit is not None:
+                return hit
+        return None
+
     def do_scene(scene: str, scene_lines: list[LineRecord]) -> None:
         rows = [row(l) for l in scene_lines if l.line_id not in delivery_ids]
         t_rows = [row(l, True) for l in scene_lines if l.line_id in delivery_ids]
         summary_rows = rows or t_rows
-        summary_key = store.key("summary", key_backend, scene, [r["text"] for r in summary_rows])
-        summary = store.get(f"summary:{scene}", summary_key)
+
+        def summary_key(model: str) -> str:
+            return store.key("summary", model, scene, [r["text"] for r in summary_rows])
+
+        summary = cached(f"summary:{scene}", summary_key)
         history: list[dict[str, Any]] = []
 
         def ensure_summary(tr: LlmTranslator) -> str:
             nonlocal summary
             if summary is None:
-                summary = tr.summarize(scene, summary_rows)
-                store.put(f"summary:{scene}", summary_key, summary)
+                text, from_model = tr.summarize_checked(scene, summary_rows)
+                summary = text
+                if from_model:  # the derived fallback serves this scene's batches now and is never stored
+                    store.put(f"summary:{scene}", summary_key(tr.name), text)  # under the key of the model that wrote it
             return summary
 
         for i in range(0, len(rows), max(1, t.batch_lines)):
             batch = rows[i : i + t.batch_lines]
             context = history[-t.context_window_lines :] if t.context_window_lines else []
-            bkey = store.key(key_backend, src, tgt, gloss_hash, batch, context, llm.temperature)
+            def bkey(model: str, batch: list[dict[str, Any]] = batch, context: list[dict[str, Any]] = context) -> str:
+                return store.key(model, src, tgt, gloss_hash, batch, context, llm.temperature)
+
             item_id = f"batch:{scene}:{batch[0]['id']}:{len(batch)}"
-            got = store.get(item_id, bkey)
+            got = cached(item_id, bkey)
             if got is None:
                 tr = get_translator()
                 got = tr.translate(batch, context, ensure_summary(tr))
                 if len(got) == len(batch):
-                    store.put(item_id, bkey, got)
+                    store.put(item_id, bkey(tr.name), got)  # under the key of the model that wrote it
                 store.save()
             with lock:
                 for b in batch:
                     e = got.get(b["id"])
                     if e is None:
                         continue
-                    entries[b["id"]] = {**e, "source": f"llm:{backend_name or key_backend}"}
+                    # the entry names the model that wrote it (cache entries of older runs: the model of their key)
+                    entries[b["id"]] = {**e, "source": e.get("source") or f"llm:{key_backend}"}
                     history.append({"speaker": b["speaker"], "text": b["text"], tgt: e["text_tgt"]})
             tick(len(batch), batch[-1]["id"])
         # delivery stream: lines nobody voices, translated with the surrounding script as context
@@ -1075,20 +1216,22 @@ def translate_llm(
             with lock:
                 context = context_before(scene, batch[0]["id"])
             sc = _delivery_scene_context(scene_all.get(scene, []), [b["id"] for b in batch], ctx.cfg.text_emotion.llm_context_lines, chars, gloss)
-            bkey = store.key(DELIVERY_PROTOCOL, key_backend, src, tgt, gloss_hash, batch, context, sc, llm.temperature)
+            def dkey(model: str, batch: list[dict[str, Any]] = batch, context: list[dict[str, Any]] = context, sc: list[dict[str, Any]] = sc) -> str:
+                return store.key(DELIVERY_PROTOCOL, model, src, tgt, gloss_hash, batch, context, sc, llm.temperature)
+
             item_id = f"batch:{scene}:{batch[0]['id']}:{len(batch)}:delivery"
-            got = store.get(item_id, bkey)
+            got = cached(item_id, dkey)
             if got is None:
                 tr = get_translator()
                 got = tr.translate(batch, context, ensure_summary(tr), sc)
                 if len(got) == len(batch):
-                    store.put(item_id, bkey, got)
+                    store.put(item_id, dkey(tr.name), got)
                 store.save()
             with lock:
                 for b in batch:
                     e = got.get(b["id"])
                     if e is not None:
-                        entries[b["id"]] = {**e, "source": f"llm:{backend_name or key_backend}"}
+                        entries[b["id"]] = {**e, "source": e.get("source") or f"llm:{key_backend}"}
             tick(len(batch), batch[-1]["id"])
 
     ctx.progress(0, total, None)
@@ -1127,6 +1270,7 @@ def translate_deliveries(
     store = OpCache(ctx, "translate_delivery")
     gloss_hash = hash_obj(gloss)
     key_backend = _llm_key_backend(ctx)
+    readable = [key_backend, *_llm_preferred(ctx, key_backend)]
     scene_all = _scene_lines(ctx)
     translator: LlmTranslator | None = None
     scenes: dict[str, list[LineRecord]] = {}
@@ -1146,15 +1290,19 @@ def translate_deliveries(
         for i in range(0, len(rows), max(1, t.batch_lines)):
             batch = rows[i : i + t.batch_lines]
             sc = _delivery_scene_context(scene_all.get(scene, []), [b["id"] for b in batch], ctx.cfg.text_emotion.llm_context_lines, chars, gloss)
-            bkey = store.key(DELIVERY_PROTOCOL, "delivery_only", key_backend, src, tgt, gloss_hash, batch, sc)
+            def dkey(model: str, batch: list[dict[str, Any]] = batch, sc: list[dict[str, Any]] = sc) -> str:
+                return store.key(DELIVERY_PROTOCOL, "delivery_only", model, src, tgt, gloss_hash, batch, sc)
+
             item_id = f"batch:{scene}:{batch[0]['id']}:{len(batch)}"
-            got = store.get(item_id, bkey)
+            got = next((hit for model in readable if (hit := store.get(item_id, dkey(model))) is not None), None)
             if got is None:
                 if translator is None:
                     backend, name = _acquire_llm(ctx)
                     translator = LlmTranslator(ctx, backend, name, tgt, gloss, chars, src)
+                errors = translator.delivery_errors
                 got = translator.deliver(batch, sc)
-                store.put(item_id, bkey, got)
+                if translator.delivery_errors == errors:  # a request that failed is retried next run, not remembered as "no delivery"
+                    store.put(item_id, dkey(translator.name), got)
                 store.save()
             for b in batch:
                 if b["id"] in got:

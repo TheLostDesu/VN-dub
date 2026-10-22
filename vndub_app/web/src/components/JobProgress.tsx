@@ -1,12 +1,12 @@
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { api } from "../api/endpoints";
 import { toErrorInfo } from "../api/client";
-import { ACTIVE_STATES, type ErrorInfo, type JobInfo } from "../api/types";
+import { ACTIVE_STATES, type ErrorInfo, type JobInfo, type JobWarning } from "../api/types";
 import { useI18n } from "../i18n";
 import { ingestJob, useJobLog } from "../state/progress";
-import { fmtBytes, fmtDuration, fmtNumber, normalizeFiles } from "../util/format";
+import { fmtBytes, fmtDuration, fmtNumber, jobWarnings, normalizeFiles } from "../util/format";
 import { ErrorPanel } from "./ErrorPanel";
-import { Button, Chip, Collapsible, ProgressBar, copyText } from "./ui";
+import { Button, Callout, Chip, Collapsible, ProgressBar, copyText } from "./ui";
 
 /** Every server log line starts with the local time `HH:MM:SS `; a line without it is shown as it is. */
 const LOG_TS = /^(\d{2}:\d{2}:\d{2}) /;
@@ -87,6 +87,53 @@ export function LogViewer({ jobId, fallback }: { jobId: string; fallback?: strin
             ))}
       </pre>
     </div>
+  );
+}
+
+/** One line of the warnings callout: what the run skipped or substituted, in plain words. */
+function WarningLine({ w }: { w: JobWarning }) {
+  const { t, tOr, has } = useI18n();
+  if (w.kind === "substitution") {
+    return (
+      <li data-kind={w.kind}>
+        {t("job.warn.substitution", { requested: w.requested ?? "?", used: w.used ?? "?" })}
+        {w.reason ? <span className="hint">{w.reason}</span> : null}
+      </li>
+    );
+  }
+  if (w.kind === "unavailable") {
+    const stage = w.stage ? (has(`stages.${w.stage}`) ? t(`stages.${w.stage}`) : w.stage) : "?";
+    const group = w.group ? tOr(`job.warn.group.${w.group}`, w.group) : "?";
+    return <li data-kind={w.kind}>{t("job.warn.unavailable", { stage, group, reason: w.reason ?? "?" })}</li>;
+  }
+  if (w.kind === "mixed_models") {
+    return <li data-kind={w.kind}>{t("job.warn.mixed_models", { models: w.models ?? "?" })}</li>;
+  }
+  if (w.kind === "settings_changed") {
+    const keys = (w.keys ?? "")
+      .split(",")
+      .map((k) => k.trim())
+      .filter(Boolean)
+      .map((k) => tOr(`job.warn.key.${k}`, k))
+      .join(", ");
+    return <li data-kind={w.kind}>{t("job.warn.settings_changed", { keys })}</li>;
+  }
+  return w.reason ? <li data-kind={w.kind}>{w.reason}</li> : null;
+}
+
+/** The warn callout of a run that skipped or substituted something (`result.warnings`); nothing when there are none. */
+export function JobWarnings({ job }: { job: JobInfo }) {
+  const t = useI18n().t;
+  const warnings = jobWarnings(job.result);
+  if (warnings.length === 0) return null;
+  return (
+    <Callout tone="warn" title={t("job.warn.title")} testid="job-warnings">
+      <ul className="job-warnings-list">
+        {warnings.map((w, i) => (
+          <WarningLine key={i} w={w} />
+        ))}
+      </ul>
+    </Callout>
   );
 }
 
@@ -294,6 +341,7 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
         </div>
       ) : null}
 
+      <JobWarnings job={job} />
       {footer}
       {showLog && !compact ? (
         <Collapsible title={t("job.show_log")} testid="job-log-toggle">

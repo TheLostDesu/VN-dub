@@ -127,3 +127,79 @@ def test_index_rebuild_and_query(tmp_path: Path) -> None:
     rows = index.query(paths, "SELECT l.line_id, k.match_score, s.scores_composite FROM lines l JOIN link k USING(line_id) JOIN selection s USING(line_id)")
     assert rows == [{"line_id": "s_1", "match_score": 0.91, "scores_composite": 0.8}]
     assert index.table_exists(paths, "lines") and not index.table_exists(paths, "translation_ru")
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def test_put_checkpoints_by_time_and_save_is_cheap_when_clean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vndub.manifest import cache as cache_mod
+
+    clock = _Clock()
+    c = StageCache(tmp_path / "cache", "synth", "1", "cfg")
+    c._clock = clock
+    c._last_save = clock()
+    c.put("a", "k1")
+    assert not c.path.exists()  # fewer than 50 entries and the last save is recent: nothing written yet
+    clock.t += 5
+    c.put("b", "k2")
+    assert not c.path.exists()
+    clock.t += 6  # 11 s since the last save: the next put is a checkpoint, a kill now loses nothing
+    c.put("c", "k3")
+    assert StageCache(tmp_path / "cache", "synth", "1", "cfg")._items == {"a": "k1", "b": "k2", "c": "k3"}
+    # the clock restarts at every save
+    clock.t += 3
+    c.put("d", "k4")
+    assert StageCache(tmp_path / "cache", "synth", "1", "cfg")._items == {"a": "k1", "b": "k2", "c": "k3"}
+    # the count threshold still works on its own
+    for i in range(cache_mod.CHECKPOINT_ITEMS):
+        c.put(f"n{i}", "k")
+    assert "n0" in StageCache(tmp_path / "cache", "synth", "1", "cfg")._items
+    # save() with nothing dirty writes nothing
+    c.save()
+    writes: list[Path] = []
+    real = cache_mod.write_json
+    monkeypatch.setattr(cache_mod, "write_json", lambda p, *a, **k: (writes.append(Path(p)), real(p, *a, **k))[1])
+    c.save()
+    c.save()
+    assert writes == []
+    c.drop("a")
+    c.save()
+    assert writes == [c.path]
+
+
+def test_rekey_accepts_and_migrates_legacy_entries(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    out = tmp_path / "out.wav"
+    out.write_bytes(b"x")
+    old = StageCache(cache_dir, "synth", "1", "cfg-with-dirs")
+    old_key = old.key("cand", {"text": "t"})
+    old.put("l1|a", old_key)
+    old.save()
+
+    new = StageCache(cache_dir, "synth", "1", "cfg-with-dirs")
+    new.rekey("cfg-without-dirs")
+    key = new.key("cand", {"text": "t"})
+    assert key != old_key
+    assert new.fresh("l1|a", key, [out])  # the entry of the old key still counts ...
+    assert new._items["l1|a"] == key  # ... and is migrated to the new one
+    assert not new.fresh("l1|a", new.key("cand", {"text": "changed"}), [out])  # other inputs are not fresh
+    new.save()
+    # after the migration the new hash alone is enough
+    again = StageCache(cache_dir, "synth", "1", "cfg-without-dirs")
+    assert again.fresh("l1|a", again.key("cand", {"text": "t"}), [out])
+    # a missing output is still stale, and nothing is migrated for it
+    old2 = StageCache(tmp_path / "c2", "synth", "1", "A")
+    old2.put("x", old2.key("i"))
+    old2.save()
+    new2 = StageCache(tmp_path / "c2", "synth", "1", "A")
+    new2.rekey("B")
+    assert not new2.fresh("x", new2.key("i"), [tmp_path / "missing.wav"])
+    assert new2._items["x"] == old2.key("i")
+    new2.rekey("B")  # idempotent
+    assert new2.legacy_config_hashes == ["A"]

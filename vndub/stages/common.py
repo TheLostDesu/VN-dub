@@ -170,6 +170,14 @@ class StageContext:
         if cb is not None:
             cb(self.stage, done, total, item)
 
+    def check_cancel(self) -> None:
+        """Raise the job runner's cancel (``extra["cancel_check"]``, installed by the desktop app) without reporting
+        progress: for code that swallows exceptions (a failed model call that is retried) and must not swallow a Cancel.
+        No-op from the CLI."""
+        cb = self.extra.get("cancel_check")
+        if cb is not None:
+            cb()
+
     # -- caching -------------------------------------------------------------
     @property
     def hasher(self) -> FileHasher:

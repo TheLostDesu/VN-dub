@@ -13,10 +13,15 @@
   kills the whole process tree at once instead of waiting for its next line of output.
 * ETA: :class:`EtaEstimator` (average seconds per item since the current stage began) plus
   :class:`ThroughputStore` (measured seconds per line for every stage, persisted in
-  ``<data>/throughput_v2.json``) for the stages still ahead.
+  ``<data>/throughput_v3.json``) for the stages still ahead. Only a stage that did real work is remembered: items
+  that "finish" faster than ``INSTANT_S_PER_ITEM`` are cached results, a stage entered a second time (regen round)
+  or a job of fewer than ``MIN_RECORD_ITEMS`` lines is not recorded, and a new value moves at most 3x per run.
 * Records are persisted to ``<data>/jobs.json``; jobs that were active when the app
   stopped come back as ``interrupted`` and the UI offers to continue (the pipeline resumes
-  from ``work/stage_status.json`` + its caches).
+  from ``work/stage_status.json`` + its caches); an interrupted record nobody continued is forgotten after
+  ``INTERRUPTED_KEEP_DAYS`` days. A record keeps the ``settings`` it was submitted with (``pipeline.submit``), so a
+  resume can tell that the budget, the translation model or the folders changed in between.
+* ``result["warnings"]``: what a run skipped or substituted (``JobContext.add_warnings``; shapes in API.md section 4).
 * Every change is published to subscribers (the ``/api/progress`` WebSocket) as
   ``{"type": "job", "job": JobInfo}`` and ``{"type": "log", "job_id", "line"}``.
 * Logging: every job log line carries the local time (``HH:MM:SS text``); with a ``log_dir`` the runner also keeps one
@@ -35,6 +40,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -52,6 +58,11 @@ EMIT_INTERVAL_S = 0.25
 JOB_LOG_KEEP = 30  # per-job log files kept in <data>/logs/jobs (the newest by name = by start time)
 JOB_LOG_FLUSH_S = 2.0  # the flusher thread writes buffered job log lines to disk at least this often
 JOB_LOG_READ_MAX = 5 * 1024 * 1024  # GET /api/jobs/{id}/log returns at most this much (newest lines)
+INTERRUPTED_KEEP_DAYS = 14  # an interrupted record nobody continued is forgotten at the next start after this long
+MIN_RECORD_ITEMS = 10  # a job that processes fewer lines (listen, tuning) does not feed the throughput store
+MIN_RECORD_MEASURED = 20  # a stage is recorded when it measured this many items ...
+MIN_RECORD_SHARE = 0.2  # ... or this share of its total with real work (the rest was cached)
+THROUGHPUT_MAX_STEP = 3.0  # a recorded value moves at most this factor up or down per run
 _PARAMS_LOG_MAX = 2000
 _SECRET_KEY_RE = re.compile(r"token|secret|passw|api_?key", re.IGNORECASE)
 
@@ -67,6 +78,19 @@ def _first_line(text: str | None, limit: int = 200) -> str:
             line = line.strip()
             return line if len(line) <= limit else line[: limit - 3] + "..."
     return ""
+
+
+def _age_days(stamp: str | None) -> float:
+    """Days since an ISO timestamp (naive ones are local time); 0 for a missing or unreadable one, so nothing is dropped by mistake."""
+    if not stamp:
+        return 0.0
+    try:
+        t = datetime.fromisoformat(stamp)
+        if t.tzinfo is None:
+            t = t.astimezone()
+        return (datetime.now(timezone.utc) - t).total_seconds() / 86400.0
+    except (ValueError, OverflowError):
+        return 0.0
 
 
 def _params_json(params: dict[str, Any]) -> str:
@@ -99,10 +123,13 @@ class EtaEstimator:
 
     Not counted: the time the job was paused (:meth:`rebase`), and items that "finish" at once
     (cached results found by a scan): those are not throughput, and the time the scan took goes
-    to the next real items. Returns ``None`` until ``min_items`` items were measured.
+    to the next real items. "At once" is a wall time per item below ``INSTANT_S_PER_ITEM``, whether the scan reports
+    one item at a time or in a jump (after a restart every cached item is reported, and a thousand of them one by
+    one would otherwise look like a thousand lines in a few seconds). Returns ``None`` until ``min_items`` items were
+    measured.
     """
 
-    INSTANT_S_PER_ITEM = 0.01
+    INSTANT_S_PER_ITEM = 0.05
 
     def __init__(self, min_items: int = 2) -> None:
         self.min_items = min_items
@@ -110,7 +137,8 @@ class EtaEstimator:
 
     def reset(self, now: float | None = None) -> None:
         """Start over; with ``now`` the clock starts at once (the stage began), else at the first update."""
-        self._t_last: float | None = now
+        self._t_last: float | None = now  # where the work time counted so far ends (cached items do not move it)
+        self._t_report = now  # when the count last changed: a cached item is judged by the gap to the one before it
         self._done_last = 0
         self._measured = 0
         self._work_s = 0.0
@@ -118,7 +146,12 @@ class EtaEstimator:
     def rebase(self, now: float | None = None) -> None:
         """Forget the time since the last update (the job was paused): it was not work."""
         if self._t_last is not None:
-            self._t_last = time.monotonic() if now is None else now
+            self._t_last = self._t_report = time.monotonic() if now is None else now
+
+    @property
+    def measured(self) -> int:
+        """Items that counted as work (cached results found at once are not among them)."""
+        return self._measured
 
     @property
     def sec_per_item(self) -> float | None:
@@ -129,18 +162,22 @@ class EtaEstimator:
     def update(self, done: int, total: int, now: float | None = None) -> float | None:
         now = time.monotonic() if now is None else now
         if self._t_last is None:
-            self._t_last, self._done_last = now, done
+            self._t_last = self._t_report = now
+            self._done_last = done
             return self.eta(done, total)
         if done < self._done_last:  # a new pass (regen round): the clock keeps running, the count restarts
             self._done_last = done
             return self.eta(done, total)
         delta = done - self._done_last
         if delta > 0:
-            dt = now - self._t_last
-            if delta > 1 and dt / delta < self.INSTANT_S_PER_ITEM:
-                self._done_last = done  # cached: not measured, the clock is not moved
+            # Cached or real is decided by the gap to the previous report, not to the last measured item: a thousand
+            # cached items reported one by one each look instant, however long the scan took in all.
+            gap = now - (self._t_report if self._t_report is not None else self._t_last)
+            self._t_report = now
+            if gap / delta < self.INSTANT_S_PER_ITEM:
+                self._done_last = done  # cached: not measured, the work clock is not moved (the scan's time goes to the next real item)
             else:
-                self._work_s += dt
+                self._work_s += now - self._t_last
                 self._measured += delta
                 self._t_last, self._done_last = now, done
         return self.eta(done, total)
@@ -181,6 +218,8 @@ class ThroughputStore:
     def record(self, stage: str, sec_per_item: float, alpha: float = 0.5) -> None:
         with self._lock:
             old = self.data.get(stage)
+            if old is not None and old > 0:  # one odd run (a resume, a stalled disk) must not rewrite the history
+                sec_per_item = min(max(sec_per_item, old / THROUGHPUT_MAX_STEP), old * THROUGHPUT_MAX_STEP)
             self.data[stage] = sec_per_item if old is None else alpha * sec_per_item + (1 - alpha) * old
             if self.path:
                 from vndub_app.appdirs import write_json_atomic
@@ -227,6 +266,9 @@ class JobRecord:
     error: dict[str, Any] | None = None
     result: dict[str, Any] = field(default_factory=dict)
     log_path: str | None = None  # the per-job log file (set when the job starts running; None without a log folder)
+    # what the app was set to when the job was submitted (gpu_budget_gb, translation_llm, license_policy, models_dir,
+    # envs_dir, profile, src_lang, tgt_lang); a resume compares it with the settings of the moment. Old records: {}.
+    settings: dict[str, Any] = field(default_factory=dict)
     log_tail: list[str] = field(default_factory=list)
 
     def info(self, with_log: bool = False) -> dict[str, Any]:
@@ -317,6 +359,8 @@ class JobContext:
         self.t_queued = time.monotonic()
         self.t_started: float | None = None  # set by the runner when the job starts running
         self._stage_t0: float | None = None
+        self._begun: set[str] = set()  # stages this job has started at least once (a second entry is a regen round)
+        self._stage_recordable = True  # the current stage's first entry: its speed may go to the throughput store
         self.n_items_hint: int = 0  # lines the job will process (for future-stage ETA)
         self._procs: list["subprocess.Popen[Any]"] = []
         self._procs_lock = threading.Lock()
@@ -406,6 +450,8 @@ class JobContext:
 
     def begin_stage(self, name: str) -> None:
         self._finish_stage()
+        self._stage_recordable = name not in self._begun  # a stage entered again (regen round) re-does a few items only
+        self._begun.add(name)
         stages = self.job.stages or [name]
         idx = stages.index(name) + 1 if name in stages else self.job.stage_index + 1
         self._stage_t0 = time.monotonic()
@@ -417,10 +463,20 @@ class JobContext:
         self.checkpoint()
 
     def _finish_stage(self) -> None:
-        """The current stage ended normally: remember its throughput and log it."""
-        if self.job.stage and self.eta.sec_per_item is not None and self.n_items_hint > 0 and self.job.total > 0:
-            self.runner.throughput.record(self.job.stage, self.eta.sec_per_item * self.job.total / self.n_items_hint)
+        """The current stage ended normally: remember its throughput (when it measured enough real work) and log it."""
+        if self._records_throughput():
+            self.runner.throughput.record(self.job.stage or "", (self.eta.sec_per_item or 0.0) * self.job.total / self.n_items_hint)
         self._end_stage_log("done")
+
+    def _records_throughput(self) -> bool:
+        """Is what the current stage measured a fair speed? Not after a resume that found most of the work done, not
+        for a stage entered again, not for a handful of lines (a listen job's 3 lines carry the model's load time)."""
+        if not self.job.stage or not self._stage_recordable or self.n_items_hint < MIN_RECORD_ITEMS or self.job.total <= 0:
+            return False
+        n = self.eta.measured
+        if self.eta.sec_per_item is None or n < self.eta.min_items:
+            return False
+        return n >= MIN_RECORD_MEASURED or n >= MIN_RECORD_SHARE * self.job.total
 
     def _end_stage_log(self, outcome: str) -> None:
         """Log the end of the current stage once (``done`` / ``failed`` / ``cancelled``), with its duration and item count."""
@@ -468,6 +524,10 @@ class JobContext:
         self.job.result.update(kv)
         self.runner._update(self.job, force=True)
 
+    def add_warnings(self, items: list[dict[str, Any]]) -> int:
+        """Append ``result["warnings"]`` items the job does not have yet (what a run skipped or substituted); returns how many were new."""
+        return self.runner.add_warnings(self.job, items)
+
 
 # ----------------------------------------------------------------------------
 # runner
@@ -501,6 +561,7 @@ class JobRunner:
             return
         from vndub_app.appdirs import read_json
 
+        expired = 0
         for d in read_json(self.state_file, []) or []:
             try:
                 rec = JobRecord(**{k: v for k, v in d.items() if k in JobRecord.__dataclass_fields__})
@@ -509,7 +570,13 @@ class JobRunner:
             if rec.state in ACTIVE:
                 rec.state = "interrupted"
                 rec.finished = rec.finished or now_iso()
+            elif rec.state == "interrupted" and _age_days(rec.finished or rec.created) > INTERRUPTED_KEEP_DAYS:
+                expired += 1  # offered for two weeks and never continued: it is not coming back
+                log.info("job %s (%s): interrupted since %s, forgotten", rec.id, rec.kind, rec.finished or rec.created)
+                continue
             self._jobs[rec.id] = rec
+        if expired:
+            self._save(force=True)
 
     def _save(self, force: bool = False) -> None:
         if not self.state_file:
@@ -687,10 +754,11 @@ class JobRunner:
         params: dict[str, Any] | None = None,
         project: str | None = None,
         gpu: bool = True,
+        settings: dict[str, Any] | None = None,
     ) -> JobRecord:
         job = JobRecord(
             id=uuid.uuid4().hex[:12], kind=kind, title_key=title_key or f"jobs.{kind}", params=params or {},
-            project=project, gpu=gpu, created=now_iso(),
+            project=project, gpu=gpu, created=now_iso(), settings=dict(settings or {}),
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -704,6 +772,21 @@ class JobRunner:
         else:
             threading.Thread(target=self._execute, args=(job.id,), name=f"vndub-job-{job.id}", daemon=True).start()
         return job
+
+    def add_warnings(self, job: JobRecord, items: list[dict[str, Any]]) -> int:
+        """Append the ``result["warnings"]`` items the job does not have yet (never overwrites); returns how many were new."""
+        with self._lock:
+            have = list(job.result.get("warnings") or [])
+            added = 0
+            for it in items:
+                if it not in have:
+                    have.append(dict(it))
+                    added += 1
+            if not added:
+                return 0
+            job.result["warnings"] = have
+        self._update(job, force=True)
+        return added
 
     def get(self, job_id: str) -> JobRecord:
         with self._lock:
@@ -846,7 +929,7 @@ def runner() -> JobRunner:
             from vndub_app import appdirs
 
             d = appdirs.data_dir()
-            _RUNNER = JobRunner(d / "jobs.json", d / "throughput_v2.json", d / "logs" / "jobs")
+            _RUNNER = JobRunner(d / "jobs.json", d / "throughput_v3.json", d / "logs" / "jobs")  # v2 held numbers a resume had poisoned
         return _RUNNER
 
 

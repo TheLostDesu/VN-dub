@@ -230,8 +230,16 @@ def collect(ctx: Any) -> dict[str, Any]:
     data["substitutions"] = [{"requested": a, "used": b, "loads": n} for (a, b), n in sorted(subs.items())]
     data["analysis_missing"] = sorted(missing.items(), key=lambda kv: -kv[1])
     data["analysis_backends"] = sorted(passport_backends.items(), key=lambda kv: -kv[1])
+    unavailable: dict[tuple[str, str, str], int] = {}  # a stage that went on without a part (VRAM, env, weights)
+    for e in events:
+        if e.get("event") == "unavailable":
+            key = (str(e.get("stage", "")), str(e.get("group", "")), str(e.get("reason", ""))[:120])
+            unavailable[key] = unavailable.get(key, 0) + 1
+    data["unavailable"] = [{"stage": s, "group": g, "reason": r, "count": n} for (s, g, r), n in sorted(unavailable.items())]
     vram: dict[str, dict[str, Any]] = {}
     for e in events:
+        if e.get("event") == "unavailable":  # no model behind it: not a row of the VRAM table
+            continue
         m = vram.setdefault(e.get("model", "?"), {"loads": 0, "load_s": 0.0, "peak_vram_gb": None, "role": e.get("role", ""), "estimate": e.get("vram_estimate_gb"), "device": ""})
         if e.get("event") == "load":
             m["loads"] += 1

@@ -83,7 +83,8 @@ export const api = {
   openProject: (target: { game_dir: string } | { slug: string }) => http.post<ProjectInfo>("/api/project/open", target),
   project: () => http.get<ProjectInfo>("/api/project"),
   putState: (patch: Partial<AppState> | JsonObject) => http.put<AppState>("/api/project/state", patch),
-  resume: () => http.post<JobInfo>("/api/project/resume"),
+  /** continue the interrupted job; `keep_shutdown` keeps its "turn the computer off when done" (dropped otherwise) */
+  resumeProject: (opts: { keep_shutdown?: boolean } = {}) => http.post<JobInfo>("/api/project/resume", opts.keep_shutdown ? { keep_shutdown: true } : {}),
   importGame: () => http.post<JobInfo>("/api/project/import"),
   recoverText: () => http.post<JobInfo>("/api/project/recover-text"),
   asrCheck: () => http.post<JobInfo>("/api/project/asr-check"),

@@ -299,7 +299,7 @@ def test_problem_report_zip(client: Any, project: dict[str, Any], app_env: Path)
 def test_open_list_state(client: Any, game_dir: Path, project: dict[str, Any]) -> None:
     assert project["slug"] == "renpy-mini" and project["game_dir"] == str(game_dir.resolve())
     assert project["engine"] is None and project["project_yaml"] is None and project["stage_status"] == {}
-    assert project["active_job"] is None and project["resume"] == {"available": False, "job": None, "next_stage": None}
+    assert project["active_job"] is None and project["resume"] == {"available": False, "job": None, "next_stage": None, "candidates": []}
     assert project["state"]["step"] == "game" and project["state"]["translation"]["tgt_lang"] == "ru"
     # opening the same folder again returns the same project
     again = client.post("/api/project/open", json={"game_dir": str(game_dir)}).json()

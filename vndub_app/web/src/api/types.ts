@@ -75,8 +75,26 @@ export interface JobInfo {
   message_key: string | null;
   message_params: Record<string, unknown>;
   error: ErrorInfo | null;
+  /** may hold `warnings` (see JobWarning): what the run skipped or substituted */
   result: Record<string, unknown>;
+  /** app settings at submit time (gpu_budget_gb, translation_llm, license_policy, models_dir, envs_dir, profile, src_lang, tgt_lang); {} on old records */
+  settings?: Record<string, unknown>;
   log_tail?: string[];
+}
+
+/**
+ * One entry of `JobInfo.result.warnings`. `kind`: `substitution` (requested, used, reason), `unavailable` (stage, group,
+ * reason), `mixed_models` (models: "a: 812, b: 140"), `settings_changed` (keys: "gpu_budget_gb, translation_llm").
+ */
+export interface JobWarning {
+  kind: string;
+  requested?: string;
+  used?: string;
+  stage?: string;
+  group?: string;
+  reason?: string;
+  models?: string;
+  keys?: string;
 }
 
 /** GET /api/jobs/{id}/log: the whole per-job log file (or the tail the server keeps when the file is gone). */
@@ -127,8 +145,11 @@ export interface StageRecord {
 
 export interface ResumeInfo {
   available: boolean;
+  /** the job a resume continues: the newest interrupted one among the heavy kinds, else the newest */
   job: JobInfo | null;
   next_stage: string | null;
+  /** the other interrupted jobs (they stay interrupted and are offered next time); absent on an older server */
+  candidates?: JobInfo[];
 }
 
 export interface ProjectInfo {

@@ -56,8 +56,7 @@ def _stage_status(h: appdirs.ProjectHandle) -> dict[str, Any]:
 def project_info(h: appdirs.ProjectHandle) -> dict[str, Any]:
     runner = jobs.runner()
     active = runner.active(h.slug)
-    inter = runner.interrupted(h.slug)
-    job = inter[-1] if inter else None
+    job, others = pipeline.resume_candidates(h.slug)  # the job POST /api/project/resume would continue, and what stays interrupted
     st = appdirs.read_app_state(h)
     py = _project_yaml(h)
     return {
@@ -67,6 +66,7 @@ def project_info(h: appdirs.ProjectHandle) -> dict[str, Any]:
         "resume": {
             "available": job is not None, "job": job.info() if job else None,
             "next_stage": (job.stage or (job.stages[0] if job.stages else None)) if job else None,
+            "candidates": [j.info() for j in others],
         },
     }
 
@@ -133,9 +133,10 @@ def put_state(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
 
 @router.post("/project/resume")
-def resume() -> dict[str, Any]:
+def resume(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    """Continue the interrupted job ``project.resume.job``; ``{"keep_shutdown": true}`` keeps its "turn the computer off when done"."""
     h = session.current_handle()
-    return pipeline.resume_interrupted(h.slug).info()
+    return pipeline.resume_interrupted(h.slug, keep_shutdown=body.get("keep_shutdown") is True).info()
 
 
 @router.post("/project/import")

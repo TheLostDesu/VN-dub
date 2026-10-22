@@ -1210,6 +1210,17 @@ fieldset.radio-group.is-inline legend {
 .job-progress > .collapsible {
   margin-top: var(--space-1);
 }
+.job-progress > .callout {
+  margin: var(--space-1) 0 0;
+}
+.job-warnings-list {
+  margin: var(--space-1) 0 0;
+  padding-left: 1.2rem;
+  overflow-wrap: anywhere;
+}
+.job-warnings-list li {
+  margin: 0.2rem 0;
+}
 .job-head {
   display: flex;
   align-items: center;

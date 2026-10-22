@@ -73,6 +73,7 @@ def fake_specs(monkeypatch: pytest.MonkeyPatch) -> dict[str, BackendSpec]:
 
 def make_reg(tmp_path: Path, cuda: Any, **kw: Any) -> tuple[ModelRegistry, list]:
     log: list = []
+    kw.setdefault("vram_retry_s", 0.0)  # the second look at the free memory without the 3 s wait
     reg = ModelRegistry(
         cuda=cuda,
         check_usable=kw.pop("check_usable", False),
@@ -279,3 +280,131 @@ def test_stage_level_substitution_is_recorded(tmp_path: Path, fake_specs) -> Non
     assert [(s.requested, s.used) for s in reg.substitutions] == [("huge", "big_b")]
     ev = [json.loads(l) for l in (tmp_path / "gpu_events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert ev[-1]["substituted_for"] == "huge" and ev[-1]["device_actual"] == "cuda:0"
+
+
+# -- would_fit: the answer acquire will give, without loading (2026-10-22, round 8) ----------------------------
+
+
+def test_would_fit_answers_without_loading(tmp_path: Path, fake_specs) -> None:
+    reg, log = make_reg(tmp_path, FakeCuda(total_gb=8.0, other_gb=0.3), budget_gb=7.5, safety_margin_gb=0.5)
+    s, why = reg.would_fit("big_a")
+    assert s.name == "big_a" and why is None
+    s, why = reg.would_fit("huge")  # 7.9 GB against a 7.5 - 0.5 budget: the estimate says no
+    assert s.name == "huge" and why is not None and "budget 7.5" in why and "huge" in why
+    # nothing was loaded, nothing recorded, nothing touched
+    assert log == [] and reg.heavy is None and reg.light == {} and reg.resident == [] and reg.substitutions == []
+    assert not (tmp_path / "gpu_events.jsonl").exists()
+    # and it is the message acquire raises
+    with pytest.raises(VramBudgetExceeded) as ei:
+        reg.acquire("huge")
+    assert str(ei.value) == why
+    reg.close()
+
+
+def test_would_fit_checks_the_live_free_memory(tmp_path: Path, fake_specs) -> None:
+    cuda = FakeCuda(total_gb=8.0, other_gb=5.0)  # another application holds 5 GB
+    reg, log = make_reg(tmp_path, cuda, vram_retry_s=0.0)
+    s, why = reg.would_fit("big_a")
+    assert s.name == "big_a" and why is not None and "only 3.00 GB free" in why and log == []
+    cuda.used = int(0.3 * GB)
+    assert reg.would_fit("big_a") == (s, None)
+
+
+def test_would_fit_credits_the_resident_heavy_model_acquire_would_unload(tmp_path: Path, fake_specs) -> None:
+    cuda = FakeCuda(total_gb=8.0, other_gb=0.3)
+    reg, log = make_reg(tmp_path, cuda, vram_retry_s=0.0)
+    first = reg.acquire("big_a")  # 4.5 GB resident: only 3.2 GB are free now, big_b wants 3.8
+    assert cuda.mem_get_info()[0] / GB < 3.8 + 0.5
+    s, why = reg.would_fit("big_b")
+    assert why is None  # acquire unloads big_a first, so it loads
+    assert reg.resident == ["big_a"] and first.loaded  # ... but asking changed nothing
+    assert reg.would_fit("big_a") == (registry.get("big_a"), None)  # the resident one needs no check at all
+    assert reg.acquire("big_b").loaded and reg.resident == ["big_b"]
+    reg.close()
+
+
+def test_would_fit_cpu_and_light_rules(tmp_path: Path, fake_specs) -> None:
+    reg, _ = make_reg(tmp_path, NoCuda(), allow_cpu_fallback=False)
+    s, why = reg.would_fit("big_a")
+    assert why is not None and "CUDA not available" in why
+    assert reg.would_fit("small")[1] is None  # a light backend runs on the CPU by design
+    reg2, _ = make_reg(tmp_path, NoCuda(), allow_cpu_fallback=True)
+    assert reg2.would_fit("big_a")[1] is None
+    assert "CUDA not available" in (reg2.would_fit("gpu_only")[1] or "")  # cpu_ok=False: never
+
+
+def test_would_fit_reports_an_unusable_backend_instead_of_raising(tmp_path: Path) -> None:
+    reg, _ = make_reg(tmp_path, NoCuda(), check_usable=True, root=tmp_path / "empty_root")
+    s, why = reg.would_fit("anime_whisper")
+    assert s.name == "anime_whisper" and why is not None and "env 'main' not created" in why
+    root = tmp_path / "root"
+    _fake_env(root, "main")
+    _fake_weights(tmp_path / "models", "audeering_adv")
+    commercial, _ = make_reg(tmp_path, NoCuda(), check_usable=True, root=root, license_policy="commercial", allow_cpu_fallback=True)
+    assert "license_policy=commercial" in (commercial.would_fit("audeering_adv")[1] or "")
+    research, _ = make_reg(tmp_path, NoCuda(), check_usable=True, root=root, license_policy="research", allow_cpu_fallback=True)
+    assert research.would_fit("audeering_adv")[1] is None
+
+
+# -- the second look at the live free memory ----------------------------------------------------------------
+
+
+class GrowingCuda(FakeCuda):
+    """Free memory as the driver reports it right after an unload: low at first, the real number a moment later."""
+
+    def __init__(self, readings_gb: list[float], total_gb: float = 8.0) -> None:
+        super().__init__(total_gb=total_gb, other_gb=0.0)
+        self.readings = list(readings_gb)
+        self.reads = 0
+
+    def mem_get_info(self) -> tuple[int, int]:
+        free = self.readings[min(self.reads, len(self.readings) - 1)]
+        self.reads += 1
+        return int(free * GB), self.total
+
+
+def test_acquire_looks_again_once_when_the_live_reading_is_low(tmp_path: Path, fake_specs) -> None:
+    cuda = GrowingCuda([3.0, 7.5])  # big_a needs 4.5: the first reading is the VRAM that is still being handed back
+    reg, _ = make_reg(tmp_path, cuda, vram_retry_s=0.0)
+    assert reg.acquire("big_a").loaded
+    assert cuda.reads == 2 and cuda.empty_calls >= 1  # the probe's cached reading was dropped before the second look
+    assert "looking again" in (tmp_path / "logs" / "gpu.log").read_text(encoding="utf-8")
+    reg.close()
+
+
+def test_acquire_gives_up_after_the_second_look(tmp_path: Path, fake_specs) -> None:
+    cuda = GrowingCuda([3.0, 3.1])
+    reg, log = make_reg(tmp_path, cuda, vram_retry_s=0.0)
+    with pytest.raises(VramBudgetExceeded, match=r"only 3\.10 GB free"):
+        reg.acquire("big_a")
+    assert cuda.reads == 2 and log == []
+
+
+def test_the_static_estimate_is_not_retried(tmp_path: Path, fake_specs, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vndub import gpu
+
+    slept: list[float] = []
+    monkeypatch.setattr(gpu.time, "sleep", lambda s: slept.append(s))
+    cuda = GrowingCuda([8.0])
+    reg, _ = make_reg(tmp_path, cuda, budget_gb=7.5, vram_retry_s=3.0)
+    with pytest.raises(VramBudgetExceeded):
+        reg.acquire("huge")  # 7.9 > 7.5 - 0.5 whatever the GPU is doing
+    assert cuda.reads == 0 and slept == []
+    low = GrowingCuda([3.0, 7.5])
+    reg2, _ = make_reg(tmp_path, low, vram_retry_s=3.0)
+    reg2.acquire("big_a")
+    assert slept == [3.0]  # the configured wait, once
+    reg2.close()
+
+
+def test_retry_default_and_from_config(tmp_path: Path) -> None:
+    from vndub.config import load_config
+    from vndub.gpu import from_config
+    from vndub.paths import WorkPaths
+    from vndub.tools import Tools
+
+    assert ModelRegistry().vram_retry_s == 3.0
+    cfg = load_config(Path(__file__).resolve().parent.parent / "configs" / "pipeline.test.yaml", {})
+    paths = WorkPaths.create(tmp_path / "work", tmp_path / "out")
+    reg = from_config(cfg, paths, Tools.load(cfg.resolve(cfg.tools_file), cfg.tools), cuda=NoCuda())
+    assert reg.vram_retry_s == 3.0

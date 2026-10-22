@@ -854,7 +854,7 @@ def test_28_jobs_overview_and_project_status(flow: Flow) -> None:
     assert flow.get("/api/jobs", params={"project": flow.slug, "active": 1}) == []
     one = flow.get(f"/api/jobs/{jobs_[0]['id']}")
     assert "log_tail" in one and one["id"] == jobs_[0]["id"]
-    assert flow.get("/api/project")["resume"] == {"available": False, "job": None, "next_stage": None}
+    assert flow.get("/api/project")["resume"] == {"available": False, "job": None, "next_stage": None, "candidates": []}
     ps = flow.get("/api/projects")
     assert [p["slug"] for p in ps] == [flow.slug] and ps[0]["engine"] == "renpy"
 

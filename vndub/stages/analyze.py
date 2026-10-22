@@ -12,7 +12,9 @@ mora rate, emotion histogram) and reference-clip candidates; finally the
 StyleSpec of every passport (it needs the character medians).
 
 A part whose backend is unavailable is recorded in ``passport.missing`` with
-the reason and the stage continues (the style builder degrades gracefully).
+the reason and the stage continues (the style builder degrades gracefully); it is also reported through
+``ctx.models.record_unavailable("analyze", part, reason)`` (the job's warnings), and so is a part that fell back to a
+later name of its list because the first backend could not be acquired, or that stopped on an out-of-memory error.
 
 analyze never recognises speech: the forced aligner gets the *known* script text (alignment,
 not recognition) and only backends of role ``align`` are accepted as aligner / fallback; a
@@ -35,6 +37,7 @@ from vndub.backends import registry
 from vndub.backends.base import BackendUnavailable
 from vndub.backends.caption.qwen2_audio import CAPTION_PROMPT
 from vndub.manifest.io import Character, CharacterStats, LineRecord, Passport, load_characters, read_json, save_characters, write_json
+from vndub.stages import genutil as gu
 from vndub.stages._opcache import OpCache
 from vndub.stages.common import StageContext
 from vndub.stages.link import expected_texts
@@ -116,6 +119,7 @@ def run_part(
     """
     op_kwargs = op_kwargs or {}
     reasons: list[str] = []
+    first = next((n for n in names if n), "")
     for name in [n for n in names if n]:
         res = PartResult()
         try:
@@ -149,6 +153,8 @@ def run_part(
                         if r.get("error"):
                             res.errors[l.line_id] = str(r["error"])
                             ctx.log.warning("%s failed for %s: %s", part, l.line_id, r["error"])
+                            if gu.is_vram_error(str(r["error"])):  # the card is full: told once per part, not per line
+                                gu.record_unavailable(ctx, NAME, part, f"out of memory: {str(r['error'])[:160]}")
                             if stop_on and stop_on(str(r["error"])):
                                 stopped = True
                             continue
@@ -160,6 +166,7 @@ def run_part(
                         on_items(len(chunk), chunk[-1][0].line_id)
                     if stopped:
                         res.reason = f"stopped after error: {next(iter(res.errors.values()))}"
+                        gu.record_unavailable(ctx, NAME, part, res.reason)
                         break
         except BackendUnavailable as e:
             store.save()
@@ -167,9 +174,12 @@ def run_part(
             continue
         store.save()
         res.backend = spec.name
+        if reasons:  # a later name of the list did the part: its configured first choice could not be acquired
+            gu.record_unavailable(ctx, NAME, part, f"{first} unavailable ({'; '.join(reasons)[:300]}); {spec.name} was used instead")
         return res
     res = PartResult()
     res.reason = "; ".join(reasons) or "not configured"
+    gu.record_unavailable(ctx, NAME, part, res.reason)
     return res
 
 

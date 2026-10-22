@@ -93,3 +93,37 @@ def test_voicebank_cached_rerun(vb):
     assert s2["performers"] == 2 and s2["rvc"] == 2
     loads = [e for e in ctx.models.events[events:] if e["event"] == "load" and e["model"] in ("mock_tts", "mock_vc")]
     assert not loads  # designs and RVC were cached
+
+
+# ---- round 8 ------------------------------------------------------------------------------------------------------------------
+
+
+def test_voicebank_cache_ignores_the_project_folders(make_ctx, tmp_path, monkeypatch):
+    from vndub.stages import genutil as gu
+
+    ctx = make_ctx(tmp_path / "game")
+    build(ctx, n_per=3)
+    with monkeypatch.context() as m:  # the cache as the previous version built it: the folders were part of every key
+        m.setattr(gu, "stage_cache", lambda c, stage, version, *sections: c.cache(stage, version, *sections))
+        voicebank.run(ctx)
+    ctx.save_caches()
+    events = len(ctx.models.events)
+    ctx.cfg.project.models_dir = "D:/elsewhere/models"  # the install folder moved
+    ctx.cfg.project.game_dir = "E:/moved/game"
+    s = voicebank.run(ctx)
+    assert s["performers"] == 2 and s["rvc"] == 2
+    loads = [e for e in ctx.models.events[events:] if e["event"] == "load" and e["model"] in ("mock_tts", "mock_vc")]
+    assert not loads  # neither the designs nor the RVC training were redone for a moved folder
+
+
+def test_voicebank_reports_a_missing_embedder(make_ctx, tmp_path):
+    from tests.p3_helpers import watch_models
+    from vndub.gpu import VramBudgetExceeded
+
+    ctx = make_ctx(tmp_path / "game")
+    build(ctx, n_per=3)
+    watch_models(ctx, unavailable={"ecapa": VramBudgetExceeded("ecapa", "an orphan process holds the card")})
+    s = voicebank.run(ctx)
+    assert "unavailable" in str(s["calibration"])
+    got = {(u.stage, u.group): u.reason for u in ctx.models.unavailable}
+    assert "orphan process" in got[("voicebank", "speaker embedder")]

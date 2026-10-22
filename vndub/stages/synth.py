@@ -20,9 +20,19 @@ candidate's cache key, so changing it regenerates only that character's (or that
 candidates of an older tuning that are no longer planned are removed.
 
 Every candidate gets ``synth/<line_id>/<backend>_<route>_<k>.wav`` and a sidecar
-``.json`` (:class:`SynthSidecar`); failures get a sidecar with ``error`` and
-never stop the stage. Regen rounds number candidates ``k = round*100 + i`` so
+``.json`` (:class:`SynthSidecar`); an item that fails on its own gets a sidecar with ``error`` and
+never stops the stage. Regen rounds number candidates ``k = round*100 + i`` so
 earlier candidates stay available to the scorer.
+
+A backend that cannot be acquired (``BackendUnavailable`` incl. ``VramBudgetExceeded``: an orphan process holds the
+VRAM, a thin margin, the env or the weights are gone) is not an item failure: the registry is told
+(``record_unavailable("synth", "route R backend B", reason)``), no wav and no sidecar of its jobs is touched (a
+candidate generated earlier stays), the other backends still run, and the stage ends with a ``StageError`` naming the
+backend and the reason, so the job is not reported as done with lines that have no candidates. An adapter error that
+says the GPU ran out of memory is treated the same way (``Job.keep``), whether it hit every item or a few.
+
+Resume: a route-B candidate stores ``<cid>:tts`` in the stage cache when its pre-VC wav is complete; a rerun whose TTS
+request is unchanged skips the TTS and converts the kept ``.prevc.wav``.
 """
 
 from __future__ import annotations
@@ -69,9 +79,11 @@ class Job:
     plan: dict[str, Any] | None = None  # tuning_plan(): what master / score still need to know
     options: dict[str, Any] = field(default_factory=dict)
     error: str = ""
+    keep: bool = False  # the failure is about the machine (backend unavailable, out of memory): leave wav and sidecar alone
     elapsed: float = 0.0
     peak_vram: float | None = None
     cache_key: str = ""
+    tts_key: str = ""  # route B: key of the TTS request alone (the VC plan is not part of it)
 
     @property
     def cid(self) -> str:
@@ -148,9 +160,11 @@ def run(ctx: Any) -> dict[str, Any]:
         except BackendUnavailable as e:
             unavailable[name] = e.reason
             ctx.log.warning("synth backend %s unavailable: %s", name, e)
+            gu.record_unavailable(ctx, NAME, f"backend {name}", e.reason)
             continue
         except KeyError as e:
             unavailable[name] = str(e)
+            gu.record_unavailable(ctx, NAME, f"backend {name}", str(e))
             continue
         if spec.name in seen:
             ctx.log.info("backend %s resolves to %s which is already scheduled; skipped", name, spec.name)
@@ -190,7 +204,7 @@ def run(ctx: Any) -> dict[str, Any]:
         return spk_info[sid]
 
     enabled_routes = [r for r, on in sc.routes.items() if on]
-    cache = ctx.cache(NAME, VERSION, "synth", "project")
+    cache = gu.stage_cache(ctx, NAME, VERSION, "synth", "project")  # the project folders are not part of a candidate's key
     jobs: list[Job] = []
     orig_jobs: list[tuple[LineRecord, int]] = []
     interjection_lex = _interjections(ctx)
@@ -274,6 +288,7 @@ def run(ctx: Any) -> dict[str, Any]:
                         requested.setdefault(lspec.name, lname)
                     except (BackendUnavailable, KeyError) as e:
                         skipped_routes[f"{sid}:C"] = f"LoRA backend {lname} unavailable: {e}"
+                        gu.record_unavailable(ctx, NAME, f"route C backend {lname}", str(e))
                         continue
             for bname, bspec, bopts in route_backends:
                 caps = bspec.caps or {}
@@ -353,31 +368,61 @@ def run(ctx: Any) -> dict[str, Any]:
                     if tkey:  # default tuning keeps the pre-tuning key
                         parts.append({"tuning": tkey, "plan": plan})
                     job.cache_key = cache.key(*parts, files=ref_paths)
+                    if route == "B":
+                        job.tts_key = cache.key("tts", {k2: v2 for k2, v2 in item.items() if k2 not in ("id", "out")}, bname, options, files=ref_paths)
                     planned.add(out)
                     jobs.append(job)
         _purge_stale(ctx, line.line_id, tkey, planned)
 
     # ---- execute ------------------------------------------------------------
     todo = [j for j in jobs if not cache.fresh(j.cid, j.cache_key, [j.out])]
+    todo_ids = {j.cid for j in todo}
     summary["cached"] = len(jobs) - len(todo)
-    progress = _Progress(ctx, len(jobs) + sum(1 for j in todo if j.route == "B"), len(jobs) - len(todo))
+    # route B: the pre-VC audio of an interrupted run is complete (its ``:tts`` entry is written when the file was) and
+    # still describes the same TTS request: the rerun goes straight to voice conversion
+    tts_done = {j.cid for j in todo if j.route == "B" and cache.fresh(f"{j.cid}:tts", j.tts_key, [j.prevc])}
+    summary["tts_reused"] = len(tts_done)
+    # every unit of the stage, cached ones included (they count as done from the start; the total never shrinks to the
+    # remaining work): a candidate is one unit, a route-B candidate that still has to be generated two (TTS, then VC)
+    progress = _Progress(
+        ctx, len(jobs) + sum(1 for j in jobs if j.route == "B" and j.cid in todo_ids),
+        (len(jobs) - len(todo)) + len(tts_done),  # cached candidates, and the TTS unit of the kept pre-VC audio
+    )
+    blocked: dict[str, str] = {}  # "backend (routes)" -> why the stage cannot finish: raised once everything else is done
+
+    def block(label: str, js: list[Job], reason: str) -> None:
+        """A backend of a planned route cannot be used (VRAM taken, env or weights gone): loud, and nothing is deleted."""
+        routes = sorted({j.route for j in js})
+        for route in routes:
+            gu.record_unavailable(ctx, NAME, f"route {route} backend {label}", reason)
+        for j in js:
+            if not j.error:
+                j.error, j.keep = f"backend unavailable: {reason}", True
+        blocked[f"{label} (route {', '.join(routes)})"] = reason
+        unavailable[label] = reason
+        ctx.log.error("synth: backend %s (route %s) cannot be used: %s", label, ", ".join(routes), reason)
+
     groups: dict[tuple[str, str], list[Job]] = {}
     for j in todo:
-        groups.setdefault((j.backend, j.options.get("lora", "")), []).append(j)
+        if j.cid not in tts_done:
+            groups.setdefault((j.backend, j.options.get("lora", "")), []).append(j)
+            if j.route == "B":
+                cache.drop(f"{j.cid}:tts")  # the pre-VC wav is about to be rewritten: an old entry must not vouch for a half-written file
     for (bname, lora), js in groups.items():
         try:
             backend = ctx.models.acquire(requested.get(bname, bname), js[0].options or None)
         except BackendUnavailable as e:
-            for j in js:
-                j.error = f"backend unavailable: {e}"
-                if j.route != "B":
-                    _finish(ctx, cache, j)
-            unavailable[bname] = str(e)
+            block(bname, js, e.reason or str(e))
             continue
+        vram_failed: list[Job] = []
         for i in range(0, len(js), 16):
             part = js[i : i + 16]
             t0 = time.perf_counter()
-            res = gu.run_batched(backend, "synthesize", [j.item for j in part], chunk=16)
+            try:
+                res = gu.run_batched(backend, "synthesize", [j.item for j in part], chunk=16)
+            except BackendUnavailable as e:  # the adapter lost its backend mid-run
+                block(bname, js[i:], e.reason or str(e))
+                break
             el = (time.perf_counter() - t0) / max(1, len(part))
             peak = None
             try:
@@ -390,22 +435,38 @@ def run(ctx: Any) -> dict[str, Any]:
                 target = Path(j.item["out"])
                 if r.get("error"):
                     j.error = str(r["error"])
+                    if gu.is_vram_error(j.error):  # the machine, not the item: keep whatever is on disk
+                        j.keep = True
+                        vram_failed.append(j)
                 elif not target.exists():
                     j.error = "backend returned no audio"
                 j.elapsed, j.peak_vram = el, peak
-                if j.route != "B":
+                if j.route == "B":
+                    if not j.error:
+                        cache.put(f"{j.cid}:tts", j.tts_key)  # the pre-VC wav is complete: a kill during VC does not redo it
+                else:
                     _finish(ctx, cache, j)
                 progress(j.line_id)
+        if vram_failed:
+            reason = f"out of memory on {len(vram_failed)} of {len(js)} item(s): {vram_failed[0].error[:160]}"
+            if len(vram_failed) == len(js):
+                block(bname, vram_failed, reason)
+            else:  # a long line that does not fit: loud, but the backend works
+                for route in sorted({j.route for j in vram_failed}):
+                    gu.record_unavailable(ctx, NAME, f"route {route} backend {bname}", reason)
 
     # ---- VC for route B -------------------------------------------------------
     vc_groups: dict[str, list[Job]] = {}
     for j in todo:
-        if j.route != "B" or j.error:
-            if j.route == "B" and j.error:
-                _finish(ctx, cache, j)
+        if j.route != "B":
+            continue
+        if j.error:  # TTS failed or the backend was unavailable (``keep``: nothing is touched)
+            _finish(ctx, cache, j)
             continue
         if not j.vc or not j.vc.get("backend"):
             j.error = (j.vc or {}).get("reason") or "no voice conversion available"
+            j.keep = j.out.exists()  # an earlier converted candidate is better than none
+            gu.record_unavailable(ctx, NAME, "route B voice conversion", j.error)
             _finish(ctx, cache, j)
             continue
         vc_groups.setdefault(j.vc.get("request") or j.vc["backend"], []).append(j)
@@ -413,11 +474,9 @@ def run(ctx: Any) -> dict[str, Any]:
         try:
             vb = ctx.models.acquire(vname)
         except BackendUnavailable as e:
-            for j in js:
-                j.error = f"VC backend unavailable: {e}"
-                _finish(ctx, cache, j)
-            unavailable[vname] = str(e)
+            block(vname, js, e.reason or str(e))
             continue
+        vram_failed = []
         for i in range(0, len(js), 16):  # chunks of 16: progress between them
             part = js[i : i + 16]
             items = []
@@ -428,17 +487,30 @@ def run(ctx: Any) -> dict[str, Any]:
                     "model": v.get("model"), "index": v.get("index"), "f0_transpose": v.get("f0_transpose", 0), "params": v.get("params", {}),
                 })
             t0 = time.perf_counter()
-            res = {r.get("id"): r for r in gu.run_batched(vb, "convert", items, chunk=16)}
+            try:
+                res = {r.get("id"): r for r in gu.run_batched(vb, "convert", items, chunk=16)}
+            except BackendUnavailable as e:
+                block(vname, js[i:], e.reason or str(e))
+                break
             el = (time.perf_counter() - t0) / max(1, len(items))
             for j in part:
                 r = res.get(j.cid, {})
                 if r.get("error"):
                     j.error = f"vc: {r['error']}"
+                    if gu.is_vram_error(j.error):
+                        j.keep = True
+                        vram_failed.append(j)
                 elif not j.out.exists():
                     j.error = "vc returned no audio"
                 j.elapsed += el
                 _finish(ctx, cache, j)
                 progress(j.line_id)
+        if vram_failed:
+            reason = f"out of memory on {len(vram_failed)} of {len(js)} item(s): {vram_failed[0].error[:160]}"
+            if len(vram_failed) == len(js):
+                block(vname, vram_failed, reason)
+            else:
+                gu.record_unavailable(ctx, NAME, f"route B backend {vname}", reason)
 
     # ---- original audio candidates (interjections) ------------------------------
     for line, r in orig_jobs:
@@ -466,6 +538,15 @@ def run(ctx: Any) -> dict[str, Any]:
             errs[key] = errs.get(key, 0) + 1
         summary["errors"] = errs
     cache.save()
+    if blocked:
+        # Everything that could be generated is on disk and in the cache; the rest waits for the backend. The job must not end
+        # `done` with lines that have no candidates (it used to, and the old wavs of those lines were deleted).
+        why = "; ".join(f"{k}: {v[:200]}" for k, v in blocked.items())
+        raise StageError(
+            f"synth stopped: {why}. The candidates that were already generated are kept; free the GPU memory / fix the backend and run synth again "
+            f"({len(failed)} candidate(s) are still missing)"
+        )
+    progress.finish()
     summary["backends"] = [b for b, _, _ in backends]
     summary["round"] = max(rounds, default=0)
     if unavailable:
@@ -479,17 +560,25 @@ def run(ctx: Any) -> dict[str, Any]:
 
 
 class _Progress:
-    """``ctx.progress`` over the planned candidates (a route-B candidate counts twice: TTS, then VC);
-    candidates that are already cached count as done from the start (a fully cached run reports n / n)."""
+    """``ctx.progress`` over the units of the stage: a candidate is one unit, a route-B candidate that is generated in this run
+    two (TTS, then VC). Units that are already done (cached candidates, TTS audio kept from an interrupted run) are part of
+    ``total`` and count as done from the start: a fully cached run reports n / n at once, a resumed one never reports only
+    the remaining work."""
 
     def __init__(self, ctx: Any, total: int, done: int = 0) -> None:
-        self.ctx, self.total, self.done = ctx, total, min(done, total)
-        if total:
-            ctx.progress(self.done, total, None)
+        self.ctx, self.total, self.done = ctx, max(0, int(total)), min(max(0, int(done)), max(0, int(total)))
+        if self.total:
+            ctx.progress(self.done, self.total, None)
 
     def __call__(self, item: str | None = None) -> None:
         self.done = min(self.total, self.done + 1)
         self.ctx.progress(self.done, self.total, item)
+
+    def finish(self) -> None:
+        """Units that were skipped (a failed TTS never reaches its VC unit) are done too."""
+        if self.total and self.done < self.total:
+            self.done = self.total
+            self.ctx.progress(self.done, self.total, None)
 
 
 def _base_style(passport: dict[str, Any], stats: dict[str, Any], notes: str, cfg: Any) -> StyleSpec:
@@ -605,6 +694,11 @@ def _write_sidecar(ctx: Any, wav: Path, data: dict[str, Any]) -> None:
 
 
 def _finish(ctx: Any, cache: Any, j: Job) -> None:
+    if j.error and j.keep:
+        # the machine failed, not the item: the wav and the sidecar of an earlier run stay as they are (and the cache entry
+        # is not updated, so the next run tries again)
+        ctx.log.warning("%s kept as is: %s", j.cid, j.error[:200])
+        return
     data = {
         "line_id": j.line_id, "backend": j.backend, "route": j.route, "k": j.k, "seed": j.seed,
         "params": {
@@ -619,6 +713,7 @@ def _finish(ctx: Any, cache: Any, j: Job) -> None:
     if j.route == "B" and j.prevc.exists():
         data["pre_vc_wav"] = ctx.paths.rel(j.prevc)
     if j.error:
+        # this run tried to generate this very item and it failed on its own: a wav of an earlier request would be stale
         data["error"] = j.error
         if j.out.exists():
             j.out.unlink()

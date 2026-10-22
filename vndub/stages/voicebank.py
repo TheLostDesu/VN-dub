@@ -390,7 +390,7 @@ def _tts_backend(ctx: Any) -> tuple[Any, str, dict[str, Any]] | None:
     """The first usable synth TTS backend (the one that clones a reference): (handle, name, options)."""
     for name in ctx.cfg.enabled_backends():
         opts = gu.backend_options(ctx.cfg, name)
-        b, used, _ = gu.acquire_first(ctx, [name], opts or None)
+        b, used, _ = gu.acquire_first(ctx, [name], opts or None, group=f"TTS backend {name}", stage=NAME)
         if b is not None:
             return b, used or name, opts
     return None
@@ -505,7 +505,7 @@ def _score_designs(
 
 def _measure_new_designs(ctx: Any, sid: str, char: Character, new: list[dict[str, Any]], has_audio: bool) -> None:
     """API path (casting screen): embed + F0 + rank the designs just created for one character."""
-    emb_backend, emb_name, emb_reason = gu.acquire_first(ctx, [ctx.cfg.score.speaker]) if has_audio else (None, None, "no original audio")
+    emb_backend, emb_name, emb_reason = gu.acquire_first(ctx, [ctx.cfg.score.speaker], group="speaker embedder", stage=NAME) if has_audio else (None, None, "no original audio")
     centroid_vec = None
     vecs: dict[str, np.ndarray] = {}
     char_f0 = char.stats.f0_median_hz
@@ -517,7 +517,7 @@ def _measure_new_designs(ctx: Any, sid: str, char: Character, new: list[dict[str
             passports = {l.line_id: p for l in ls if (p := gu.load_passport(ctx, l.line_id))}
             refs = gu.load_refs(ctx, sid)
             if not refs and ls:
-                cache = ctx.cache(NAME, VERSION, "voicebank", "score", "project")
+                cache = gu.stage_cache(ctx, NAME, VERSION, "voicebank", "score", "project")
                 chars = {sid: char}
                 refs = _ensure_refs(ctx, cache, sid, ls, passports, chars)
                 cache.save()
@@ -531,7 +531,7 @@ def _measure_new_designs(ctx: Any, sid: str, char: Character, new: list[dict[str
     elif has_audio:
         ctx.log.warning("speaker embedder unavailable (%s): designs are ranked by F0 only", emb_reason)
     # the F0 of a design only matters against a character's F0: without original audio the cheap core pYIN is enough
-    f0_backend = gu.acquire_first(ctx, [ctx.cfg.analyze.f0])[0] if has_audio else None
+    f0_backend = gu.acquire_first(ctx, [ctx.cfg.analyze.f0], group="f0 backend", stage=NAME)[0] if has_audio else None
     _score_designs(ctx, sid, new, char, char_f0 if has_audio else None, vecs, centroid_vec, emb_name, f0_backend)
 
 
@@ -670,7 +670,7 @@ def run(ctx: Any) -> dict[str, Any]:
     if not passports and by_spk:
         ctx.log.warning("no passports found: refs use durations only (run analyze for emotion/SNR-aware selection)")
 
-    cache = ctx.cache(NAME, VERSION, "voicebank", "score", "project")
+    cache = gu.stage_cache(ctx, NAME, VERSION, "voicebank", "score", "project")
     summary: dict[str, Any] = {"characters": 0, "refs": 0, "performers": 0, "rvc": 0, "lora": 0, "skipped": {}}
     eligible: dict[str, list[LineRecord]] = {}
     minutes: dict[str, float] = {}
@@ -725,7 +725,7 @@ def run(ctx: Any) -> dict[str, Any]:
                 dz.remove_design_files(ctx, sid, d["design_id"])
         new[sid] = []
     if perf_kind == "voice_design" and regen:
-        backend, design_backend_name, reason = gu.acquire_first(ctx, [vb.performer.backend])
+        backend, design_backend_name, reason = gu.acquire_first(ctx, [vb.performer.backend], group="performer design backend", stage=NAME)
         if backend is None:
             for sid in regen:
                 performer_reason[sid] = f"design backend unavailable: {reason}"
@@ -768,7 +768,7 @@ def run(ctx: Any) -> dict[str, Any]:
 
     # 3. embeddings: refs + clean clips (centroid, calibration) + design clips ------
     # (characters without original audio have nothing to compare with: no embedder for them)
-    emb_backend, emb_name, emb_reason = gu.acquire_first(ctx, [ctx.cfg.score.speaker]) if eligible else (None, None, "no character with original audio")
+    emb_backend, emb_name, emb_reason = gu.acquire_first(ctx, [ctx.cfg.score.speaker], group="speaker embedder", stage=NAME) if eligible else (None, None, "no character with original audio")
     centroids: dict[str, np.ndarray] = {}
     ref_vecs: dict[str, list[np.ndarray]] = {}
     design_vecs: dict[str, dict[str, np.ndarray]] = {}
@@ -792,7 +792,7 @@ def run(ctx: Any) -> dict[str, Any]:
     # 4. F0 + ranking + choice --------------------------------------------------
     f0_backend = None
     if any(new.get(sid) for sid in eligible):  # characters without audio use the cheap core pYIN
-        f0_backend, _, _ = gu.acquire_first(ctx, [ctx.cfg.analyze.f0])
+        f0_backend, _, _ = gu.acquire_first(ctx, [ctx.cfg.analyze.f0], group="f0 backend", stage=NAME)
     picked: dict[str, dict[str, Any]] = {}  # sid -> design the performer is written from
     for sid in regen:
         ds = new[sid]
@@ -830,7 +830,7 @@ def run(ctx: Any) -> dict[str, Any]:
     variant_ids = [sid for sid, d in picked.items() if d["kind"] == "voice_design" and "variants" not in d]
     if variant_ids:
         if not design_caps:
-            vb_backend, design_backend_name, _ = gu.acquire_first(ctx, [vb.performer.backend])
+            vb_backend, design_backend_name, _ = gu.acquire_first(ctx, [vb.performer.backend], group="performer design backend", stage=NAME)
             design_caps = dict(vb_backend.spec.caps) if vb_backend is not None else {}
         can_vary = design_caps.get("instruct", "none") != "none" or design_caps.get("knobs", "none") != "none"
         variant_items: list[dict[str, Any]] = []
@@ -1011,7 +1011,7 @@ def _rvc_train_character(
         chars[sid].rvc = meta
         return "cached"
     if holder.get("backend") is None:
-        backend, _, reason = gu.acquire_first(ctx, [rv.backend])
+        backend, _, reason = gu.acquire_first(ctx, [rv.backend], group="RVC training backend", stage=NAME)
         if backend is None:
             holder["unavailable"] = reason
             reasons[sid] = f"rvc backend unavailable: {reason}"
@@ -1145,7 +1145,7 @@ def _train_lora(ctx: Any, cache: Any, eligible: dict[str, list[LineRecord]], cha
             n += 1
             continue
         if backend is None:
-            backend, _, reason = gu.acquire_first(ctx, [rc.backend])
+            backend, _, reason = gu.acquire_first(ctx, [rc.backend], group="route C training backend", stage=NAME)
             if backend is None:
                 for s in eligible:
                     reasons.setdefault(s, f"route-C backend unavailable: {reason}")
@@ -1248,7 +1248,7 @@ def propose_designs(
     ls = [l for l in ctx.voiced_lines(apply_only=False) if l.speaker_id == speaker_id] if has_audio else []
     if has_audio and not refs and ls:
         passports = {l.line_id: p for l in ls if (p := gu.load_passport(ctx, l.line_id))}
-        cache = ctx.cache(NAME, VERSION, "voicebank", "score", "project")
+        cache = gu.stage_cache(ctx, NAME, VERSION, "voicebank", "score", "project")
         refs = _ensure_refs(ctx, cache, speaker_id, ls, passports, chars)
         cache.save()
         save_characters(ctx.paths.characters, chars)
@@ -1256,7 +1256,7 @@ def propose_designs(
     want_clone = has_audio and bool(refs) and not any(d["design_id"] == "clone" for d in existing)
     tick = _Ticker(ctx, n + (1 if want_clone else 0) + 1)
     ctx.progress(0, tick.total, speaker_id)
-    backend, _, reason = gu.acquire_first(ctx, [vb.performer.backend])
+    backend, _, reason = gu.acquire_first(ctx, [vb.performer.backend], group="performer design backend", stage=NAME)
     if backend is None:
         raise BackendUnavailable(vb.performer.backend, reason)
     jobs = _plan_designs(ctx, speaker_id, char, existing, n, char_f0, description, sample_line_ids, origin="user", audition_only=not has_audio)
@@ -1477,7 +1477,7 @@ def train_rvc(ctx: Any, speaker_id: str) -> dict[str, Any]:
         ctx.progress(3, 3, speaker_id)
         return result("skipped", "not_enough_audio", why)
     char_f0 = _char_f0(ctx, chars, speaker_id, gu.load_refs(ctx, speaker_id))
-    cache = ctx.cache(NAME, VERSION, "voicebank", "score", "project")
+    cache = gu.stage_cache(ctx, NAME, VERSION, "voicebank", "score", "project")
     reasons: dict[str, str] = {}
     holder: dict[str, Any] = {}
     outcome = _rvc_train_character(ctx, cache, speaker_id, clips, chars, char_f0, holder, reasons, progress=ctx.progress)

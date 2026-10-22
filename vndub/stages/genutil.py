@@ -16,6 +16,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from vndub.backends.base import Backend, BackendUnavailable
+from vndub.manifest.cache import StageCache
 from vndub.manifest.io import (
     AudioIndexRecord,
     CandidateScore,
@@ -28,6 +29,7 @@ from vndub.manifest.io import (
     read_jsonl,
     read_yaml,
 )
+from vndub.util import hash_obj
 
 # ----------------------------------------------------------------------------
 # text helpers (fork C owns vndub.text.ru / ja; keep working without them)
@@ -174,10 +176,29 @@ def char_stats(ctx: Any, characters: dict[str, Any], speaker_id: str) -> dict[st
 # ----------------------------------------------------------------------------
 
 
-def acquire_first(ctx: Any, names: Iterable[str], options: dict[str, Any] | None = None) -> tuple[Backend | None, str | None, str]:
+def record_unavailable(ctx: Any, stage: str, group: str, reason: str) -> None:
+    """Tell the model registry that ``stage`` goes on without ``group`` (no backend could be acquired).
+
+    The registry de-duplicates per stage + group, logs it and writes it to ``gpu_events.jsonl``; the desktop app turns the
+    list into the job's warnings. A silent skip is how a bad candidate passes or a part of the work is missing unnoticed.
+    A registry without the hook (a test double) is tolerated.
+    """
+    fn = getattr(getattr(ctx, "models", None), "record_unavailable", None)
+    if fn is None:
+        return
+    try:
+        fn(stage, group, reason)
+    except Exception as e:  # reporting must never break the stage
+        ctx.log.warning("could not record %s/%s as unavailable: %s", stage, group, e)
+
+
+def acquire_first(
+    ctx: Any, names: Iterable[str], options: dict[str, Any] | None = None, *, group: str | None = None, stage: str | None = None,
+) -> tuple[Backend | None, str | None, str]:
     """Acquire the first usable backend among ``names`` (empty names skipped).
 
-    Returns (backend, name used, reason-if-none). Never raises for unavailability.
+    Returns (backend, name used, reason-if-none). Never raises for unavailability. With ``group`` the miss is also
+    reported through :func:`record_unavailable` (``stage`` defaults to the running stage).
     """
     reasons = []
     for n in names:
@@ -191,13 +212,58 @@ def acquire_first(ctx: Any, names: Iterable[str], options: dict[str, Any] | None
             ctx.log.warning("backend %s unavailable: %s", n, e)
         except KeyError as e:
             reasons.append(f"{n}: {e}")
-    return None, None, "; ".join(reasons) or "no backend configured"
+    reason = "; ".join(reasons) or "no backend configured"
+    if group:
+        record_unavailable(ctx, stage or getattr(ctx, "stage", "") or "stage", group, reason)
+    return None, None, reason
 
 
-def run_batched(backend: Backend, op: str, items: list[dict[str, Any]], chunk: int = 16, on_chunk: Any = None, **kw: Any) -> list[dict[str, Any]]:
+_VRAM_MARKERS = ("out of memory", "cuda oom", "cublas_status_alloc_failed", "cudnn_status_alloc_failed", "vram")
+
+
+def is_vram_error(message: str | None) -> bool:
+    """Does an adapter's per-item error text say the GPU ran out of memory (the card is shared with an orphan process
+    or the margin is thin)? Such a failure is about the machine, not about the item: nothing may be deleted for it."""
+    m = (message or "").lower()
+    return any(t in m for t in _VRAM_MARKERS)
+
+
+# ----------------------------------------------------------------------------
+# stage cache that survives a change of the project folders
+# ----------------------------------------------------------------------------
+
+PROJECT_PATH_KEYS = ("game_dir", "work_dir", "out_dir", "models_dir")
+
+
+def stable_section_hash(cfg: Any, *names: str) -> str:
+    """``cfg.section_hash`` without the folder paths of ``project``: where the game, the work folder, the output or the
+    models live does not change what a candidate or a voicebank looks like, but moving a folder used to change every key."""
+    dump = cfg.model_dump(mode="json", by_alias=True)
+    parts: dict[str, Any] = {}
+    for n in names:
+        v = dump.get(n)
+        if n == "project" and isinstance(v, dict):
+            v = {k: x for k, x in v.items() if k not in PROJECT_PATH_KEYS}
+        parts[n] = v
+    return hash_obj(parts)
+
+
+def stage_cache(ctx: Any, stage: str, version: str, *sections: str) -> StageCache:
+    """``ctx.cache`` for a stage whose sections include ``project``: the folders are left out of the key, and entries stored
+    under the old key (folders included) are still honoured and migrated, so the upgrade does not regenerate a project."""
+    cache = ctx.cache(stage, version, *sections)
+    if "project" in sections:
+        cache.rekey(stable_section_hash(ctx.cfg, *sections))
+    return cache
+
+
+def run_batched(
+    backend: Backend, op: str, items: list[dict[str, Any]], chunk: int = 16, on_chunk: Any = None, on_results: Any = None, **kw: Any,
+) -> list[dict[str, Any]]:
     """Call ``op`` in chunks; a failing chunk yields per-item errors instead of raising.
 
-    ``on_chunk(part)`` (optional) runs after each chunk: progress reporting between chunks.
+    ``on_chunk(part)`` (optional) runs after each chunk: progress reporting between chunks. ``on_results(part, results)``
+    (optional) also gets that chunk's results, so a caller can keep them (a checkpoint) before the next chunk starts.
     """
     out: list[dict[str, Any]] = []
     for i in range(0, len(items), chunk):
@@ -209,8 +275,10 @@ def run_batched(backend: Backend, op: str, items: list[dict[str, Any]], chunk: i
         except Exception as e:  # adapter crash / timeout: record and continue
             res = [{"id": it.get("id"), "error": f"{type(e).__name__}: {e}"} for it in part]
         by_id = {r.get("id"): r for r in res if isinstance(r, dict)}
-        for it in part:
-            out.append(by_id.get(it.get("id"), {"id": it.get("id"), "error": "no result"}))
+        got = [by_id.get(it.get("id"), {"id": it.get("id"), "error": "no result"}) for it in part]
+        out.extend(got)
+        if on_results is not None:
+            on_results(part, got)
         if on_chunk is not None:
             on_chunk(part)
     return out

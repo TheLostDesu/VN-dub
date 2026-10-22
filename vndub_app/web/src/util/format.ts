@@ -1,4 +1,4 @@
-import type { StageRecord } from "../api/types";
+import type { JobWarning, StageRecord } from "../api/types";
 import type { TFunc } from "../i18n";
 
 export function clamp(v: number, lo: number, hi: number): number {
@@ -143,6 +143,21 @@ export function normalizeFiles(files: unknown): FileProgress[] {
       error: typeof o.error === "string" && o.error ? o.error : null,
     };
   });
+}
+
+/** `result.warnings` of a job as a clean list: only objects with a string `kind`, every other field kept when it is a string. */
+export function jobWarnings(result: unknown): JobWarning[] {
+  const raw = result && typeof result === "object" ? (result as Record<string, unknown>).warnings : null;
+  if (!Array.isArray(raw)) return [];
+  const out: JobWarning[] = [];
+  for (const w of raw) {
+    if (!w || typeof w !== "object" || typeof (w as Record<string, unknown>).kind !== "string") continue;
+    const o = w as Record<string, unknown>;
+    const item: Record<string, string> = {};
+    for (const [k, v] of Object.entries(o)) if (typeof v === "string") item[k] = v;
+    out.push(item as unknown as JobWarning);
+  }
+  return out;
 }
 
 /** "12.3 MB", "1.4 GB" from bytes. */

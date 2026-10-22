@@ -12,6 +12,10 @@ A flow follows API.md section 1: ``write_project_config`` -> ``make_ctx`` with
 ``job_ctx.log`` (see :class:`JobLogBridge`).
 
 Flows never send display text: messages are i18n keys, errors are ``AppError`` codes.
+
+What a run skipped or substituted is not silent: :func:`pipeline_ctx` collects the registry's ``substitutions`` and
+``unavailable`` lists into ``job.result["warnings"]`` (:func:`collect_warnings`), the translate flows add
+``mixed_models`` (:func:`models_used_warning`), and a resume with changed settings adds ``settings_changed``.
 """
 
 from __future__ import annotations
@@ -66,7 +70,8 @@ def _same_params(a: dict[str, Any], b: dict[str, Any]) -> bool:
 
 def submit(kind: str, slug: str | None, params: dict[str, Any] | None = None) -> JobRecord:
     """Queue a flow. Heavy flows are refused while another heavy job of the project is active
-    (``job_busy``); a light duplicate (same kind + params) returns the existing job."""
+    (``job_busy``); a light duplicate (same kind + params) returns the existing job. The record keeps the app settings
+    of this moment (:func:`appdirs.settings_snapshot`), see :func:`resume_interrupted`."""
     fl = FLOWS.get(kind)
     if fl is None:
         raise AppError("bad_request", params={"field": "kind", "value": kind}, status=422)
@@ -83,20 +88,63 @@ def submit(kind: str, slug: str | None, params: dict[str, Any] | None = None) ->
             if dup is not None:
                 return dup
     fn = fl.build(slug or "", params)
-    return runner.submit(kind, fn, params=params, project=slug if fl.project else None, gpu=fl.gpu)
+    return runner.submit(kind, fn, params=params, project=slug if fl.project else None, gpu=fl.gpu, settings=_snapshot(slug if fl.project else None))
 
 
-def resume_interrupted(slug: str) -> JobRecord:
-    """Re-submit the latest interrupted job of the project (same kind + params)."""
-    runner = jobs.runner()
-    inter = runner.interrupted(slug)
+def _snapshot(slug: str | None) -> dict[str, Any]:
+    try:
+        return appdirs.settings_snapshot(slug)
+    except Exception as e:  # bookkeeping: a job without a snapshot is still a job
+        log.warning("cannot take the settings snapshot: %s", e)
+        return {}
+
+
+def resume_candidates(slug: str) -> tuple[JobRecord | None, list[JobRecord]]:
+    """The interrupted job :func:`resume_interrupted` would continue, and the interrupted jobs that stay interrupted.
+
+    The newest one among the heavy kinds (import, translate, full ... the work the user waited for; a later 3-line
+    voice listen must not push it aside), else the newest of the rest. Jobs of the same kind as the pick are
+    superseded by it (they are forgotten when it is continued) and are not listed; a kind this version no longer
+    has cannot be continued and is ignored.
+    """
+    inter = [j for j in jobs.runner().interrupted(slug) if j.kind in FLOWS]
     if not inter:
+        return None, []
+    pool = [j for j in inter if FLOWS[j.kind].heavy] or inter
+    pick = pool[-1]  # interrupted() is oldest first
+    return pick, [j for j in inter if j.kind != pick.kind]
+
+
+def resume_interrupted(slug: str, *, keep_shutdown: bool = False) -> JobRecord:
+    """Re-submit the interrupted job the project should continue (:func:`resume_candidates`): same kind + params.
+
+    * Only the interrupted jobs of the same kind are forgotten; the others stay interrupted and are offered next time.
+    * ``shutdown_when_done`` is dropped from the params unless ``keep_shutdown``: a "turn the computer off" chosen
+      for a run started days ago must not fire on a continuation the user never asked it for.
+    * The new job runs with the settings of NOW. When the old record's snapshot differs (GPU budget, translation model,
+      folders ...), the new job carries a ``settings_changed`` warning naming the keys.
+    """
+    runner = jobs.runner()
+    old, _ = resume_candidates(slug)
+    if old is None:
         raise AppError("nothing_to_resume", action="none", status=404)
-    old = inter[-1]
-    new = submit(old.kind, slug, old.params)
-    for j in inter:
-        runner.forget(j.id)
+    params = dict(old.params)
+    if not keep_shutdown:
+        params.pop("shutdown_when_done", None)
+    new = submit(old.kind, slug, params)
+    for j in runner.interrupted(slug):
+        if j.kind == old.kind and j.id != new.id:
+            runner.forget(j.id)
+    changed = changed_settings(old.settings, new.settings)
+    if changed:
+        log.info("resume of job %s: settings changed since it was submitted: %s", old.id, ", ".join(changed))
+        runner.add_warnings(new, [{"kind": "settings_changed", "keys": ", ".join(changed)}])
     return new
+
+
+def changed_settings(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    """Keys of the old snapshot whose value differs in the new one (an old record without a snapshot has none)."""
+    return [k for k in old if k in new and old[k] != new[k]]
 
 
 # ----------------------------------------------------------------------------
@@ -163,6 +211,62 @@ class _ForwardFilter(logging.Filter):
 # ----------------------------------------------------------------------------
 
 
+WARN_REASON_MAX = 200  # characters of a reason that go into a warning (the full text is in the job log and gpu_events.jsonl)
+NON_MODEL_KEYS = frozenset({"same_lang", "import"})  # translate's ``models_used`` also counts lines that no model translated
+
+
+def _cut(text: Any, limit: int = WARN_REASON_MAX) -> str:
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= limit else t[: limit - 3] + "..."
+
+
+def collect_warnings(models: Any) -> list[dict[str, str]]:
+    """The registry's substitutions and skipped parts as ``result["warnings"]`` items (all strings, ``reason`` cut to
+    ``WARN_REASON_MAX``, each shown once)."""
+    out: list[dict[str, str]] = []
+    for sub in list(getattr(models, "substitutions", None) or []):
+        out.append({"kind": "substitution", "requested": str(sub.requested), "used": str(sub.used), "reason": _cut(sub.reason)})
+    for un in list(getattr(models, "unavailable", None) or []):
+        out.append({"kind": "unavailable", "stage": str(un.stage), "group": str(un.group), "reason": _cut(un.reason)})
+    uniq: list[dict[str, str]] = []
+    for w in out:
+        if w not in uniq:
+            uniq.append(w)
+    return uniq
+
+
+def models_used_warning(summary: Any) -> list[dict[str, str]]:
+    """``mixed_models`` when the translate summary's ``models_used`` (``{model: lines}``) names more than one real model:
+    a resumed or partly cached run mixes the voices of two translators."""
+    used = (summary or {}).get("models_used") if isinstance(summary, dict) else None
+    if not isinstance(used, dict):
+        return []
+    real = {str(k): v for k, v in used.items() if str(k) not in NON_MODEL_KEYS}
+    if len(real) < 2:
+        return []
+    ranked = sorted(real.items(), key=lambda kv: (-(kv[1] if isinstance(kv[1], (int, float)) else 0), kv[0]))
+    return [{"kind": "mixed_models", "models": ", ".join(f"{k}: {v}" for k, v in ranked)}]
+
+
+class _FirstSubstitution(list):  # type: ignore[type-arg]
+    """The registry's ``substitutions`` list that tells the job the moment the first entry arrives (a model that did not
+    fit is replaced when it is loaded, minutes before the first progress report)."""
+
+    def __init__(self, items: Any, on_first: Callable[[Any], None]) -> None:
+        super().__init__(items)
+        self._on_first = on_first
+        self._told = bool(self)
+
+    def append(self, item: Any) -> None:
+        super().append(item)
+        if not self._told:
+            self._told = True
+            try:
+                self._on_first(item)
+            except Exception:  # a notice must never fail the load
+                log.debug("substitution notice failed", exc_info=True)
+
+
 @contextmanager
 def pipeline_ctx(
     h: appdirs.ProjectHandle,
@@ -174,8 +278,14 @@ def pipeline_ctx(
     sets: dict[str, Any] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> Iterator[Any]:
-    """Pipeline context wired to the job (progress callback, log forwarding); models closed on exit."""
-    ex = {"progress_cb": job.stage_progress_cb(), **(extra or {})}
+    """Pipeline context wired to the job (progress callback, cancel check, log forwarding); models closed on exit.
+
+    ``extra["cancel_check"]`` lets a stage raise the Cancel (or wait out a Pause) between two model calls without
+    reporting progress. Before the models are closed, what the registry substituted or could not load is written to
+    ``job.result["warnings"]`` (also when the job fails or is cancelled), and the first substitution is announced in
+    the job's message line while the job runs.
+    """
+    ex = {"progress_cb": job.stage_progress_cb(), "cancel_check": job.checkpoint, **(extra or {})}
     try:  # the project glossary is generated from characters.yaml + the Step 2 choices
         from vndub_app import translation
 
@@ -183,6 +293,12 @@ def pipeline_ctx(
     except Exception as e:  # never fatal: the translate stage works without a glossary
         log.warning("cannot write the project glossary: %s", e)
     ctx = session.job_ctx(h, only=only, limit=limit, force=force, sets=_with_unvoiced(sets), extra=ex)
+    try:
+        ctx.models.substitutions = _FirstSubstitution(
+            ctx.models.substitutions, lambda sub: job.message("jobs.msg.substituted", requested=str(sub.requested), used=str(sub.used)),
+        )
+    except Exception as e:  # a registry without the list: the warnings are simply collected at the end
+        log.debug("cannot watch the registry's substitutions: %s", e)
     bridge = JobLogBridge(job).attach()
     unhook = job.on_cancel(ctx.models.abort_all)  # Cancel ends a model process mid-request, not after its answer
     try:
@@ -190,6 +306,10 @@ def pipeline_ctx(
     finally:
         unhook()
         bridge.detach()
+        try:
+            job.add_warnings(collect_warnings(ctx.models))
+        except Exception as e:
+            log.warning("cannot collect the job's warnings: %s", e)
         try:
             ctx.models.close()
         finally:
@@ -347,6 +467,7 @@ def _build_translate(slug: str, p: dict[str, Any]) -> FlowFn:
         with pipeline_ctx(h, job, force=bool(p.get("force"))) as ctx:
             res = run_stages(ctx, job, names)
         t = res.get("translate") or {}
+        job.add_warnings(models_used_warning(t))
         return {k: t[k] for k in ("lines", "failed", "missing", "backend") if k in t}
 
     return run
@@ -363,6 +484,8 @@ def _build_stage(slug: str, p: dict[str, Any]) -> FlowFn:
         job.set_stages(names, _n_hint(h))
         with pipeline_ctx(h, job, only=p.get("only") or None, limit=p.get("limit"), force=bool(p.get("force")), sets=p.get("sets")) as ctx:
             res = run_stages(ctx, job, names)
+        if name == "translate":
+            job.add_warnings(models_used_warning(res.get(name)))
         return {"summary": res.get(name) or {}}
 
     return run

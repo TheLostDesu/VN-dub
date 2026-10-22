@@ -431,6 +431,30 @@ def chosen_translation_llm(s: Settings) -> str:
     return name if spec.role == "llm" and not spec.name.startswith("mock") else ""
 
 
+def settings_snapshot(slug: str | None = None, settings: Settings | None = None) -> dict[str, Any]:
+    """What a job's behaviour depends on, as plain JSON: kept on the job record (``JobRecord.settings``) so a resume can
+    tell that the GPU budget, the translation model, the license policy, the folders, the profile or the project's
+    languages changed since the job was submitted. ``src_lang`` / ``tgt_lang`` are included for a known project."""
+    s = settings or load_settings()
+    snap: dict[str, Any] = {
+        "gpu_budget_gb": float(s.gpu_budget_gb),
+        "translation_llm": chosen_translation_llm(s) or DEFAULT_TRANSLATION_LLM,
+        "license_policy": s.license_policy,
+        "models_dir": str(effective_models_dir(s)),
+        "envs_dir": str(effective_envs_dir(s)),
+        "profile": s.profile,
+    }
+    if slug:
+        try:
+            tr = read_app_state(project_handle(slug)).get("translation", {})
+        except Exception:  # an unknown project: the languages are simply not known
+            tr = {}
+        if tr:
+            snap["src_lang"] = str(tr.get("src_lang") or "auto")
+            snap["tgt_lang"] = str(tr.get("tgt_lang") or "ru")
+    return snap
+
+
 def write_project_config(h: ProjectHandle, settings: Settings | None = None) -> Path:
     """(Re)generate ``<project>/pipeline.yaml`` from the bundled profile + app choices.
 

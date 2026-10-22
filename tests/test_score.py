@@ -185,3 +185,204 @@ def test_translation_failed_line_goes_to_review(make_ctx, tmp_path):
     score.run(ctx)
     sel = {r.line_id: r for r in read_jsonl(ctx.paths.selection, SelectionRecord)}
     assert sel[trs[0].line_id].status == "review" and sel[trs[0].line_id].reason == "translation failed"
+
+
+# ---- round 8: a gate that could not run never lets a line through, and a killed run resumes ---------------------------------
+
+
+def test_select_review_when_a_gate_group_was_unavailable():
+    good = apply_scores(_c("a.wav", utmos=4.0, dur_ratio=1.0, spk_sim=0.6), CFG, 0.3, False)  # no cer: the ASR was not there
+    assert good.passed  # it passes on the gates that could run
+    s = _sel([good])  # nothing says why: the old behaviour (a bare candidate is trusted)
+    assert s.status == "auto"
+    s = select("l1", [good], {"a.wav": SynthSidecar(line_id="l1", backend="x", route="A", k=0, created="2026-01-01T00:00:00")}, [], 2, {"cer": "VRAM taken by an orphan"})
+    assert s.status == "review" and s.winner == "a.wav"
+    assert "gate not checked" in s.reason and "cer" in s.reason and "VRAM taken by an orphan" in s.reason
+    # the reason also survives in the candidate's notes (reweight has no registry state)
+    good.notes = ["cer unavailable: VRAM taken by an orphan"]
+    assert _sel([good]).status == "review"
+    # a non-gate group (emotion) does not block, a candidate that has the metric is not affected
+    ok = apply_scores(_c("b.wav", utmos=4.0, cer=0.0, dur_ratio=1.0, spk_sim=0.6), CFG, 0.3, False)
+    sides = {"b.wav": SynthSidecar(line_id="l1", backend="x", route="A", k=0, created="2026-01-01T00:00:00")}
+    assert select("l1", [ok], sides, [], 2, {"cer": "VRAM"}).status == "auto"
+    good.notes = []
+    assert select("l1", [good], {"a.wav": sides["b.wav"]}, [], 2, {"emotion": "VRAM"}).status == "auto"
+    # the original recording needs no ASR check
+    orig = apply_scores(_c("o.wav", route="orig", backend="orig", utmos=4.5, spk_sim=1.0), CFG, 0.3, True)
+    orig.model_extra["na"] = ["cer"]
+    assert select("l1", [orig], {"o.wav": sides["b.wav"]}, [], 2, {"cer": "VRAM"}).status == "auto"
+    # a person's decision stays a decision
+    acc = OverrideRecord(line_id="l1", action="accept", payload={"candidate": "a.wav"}, ts="2025-12-31T00:00:00")
+    assert select("l1", [good], {"a.wav": sides["b.wav"]}, [acc], 2, {"cer": "VRAM"}).status == "override"
+
+
+@pytest.fixture
+def synthed(make_ctx, tmp_path):
+    ctx = make_ctx(tmp_path / "game")
+    build(ctx, n_per=2)
+    synth.run(ctx)
+    return ctx
+
+
+def _lines_not_won_by_orig(ctx):
+    return [s for s in read_jsonl(ctx.paths.selection, SelectionRecord) if s.route != "orig"]
+
+
+def test_stage_with_the_asr_unavailable_never_auto_accepts_and_says_so(synthed):
+    from tests.p3_helpers import watch_models
+    from vndub.gpu import VramBudgetExceeded
+
+    ctx = synthed
+    counts = watch_models(ctx, unavailable={"whisper_tiny": VramBudgetExceeded("whisper_tiny", "needs 1.5 GB, 0.3 GB free (an orphan process holds the card)")})
+    summary = score.run(ctx)
+    assert "orphan process" in summary["metrics_unavailable"]["cer"]
+    assert ("score", "cer") in [(u.stage, u.group) for u in ctx.models.unavailable]
+    mine = _lines_not_won_by_orig(ctx)
+    assert mine and all(s.status == "review" and "gate not checked" in s.reason and "cer" in s.reason for s in mine)
+    assert summary["lines_with_unchecked_gates"] == len(mine)
+    rows = read_jsonl(ctx.paths.scores(mine[0].line_id), CandidateScore)
+    assert all(r.metrics.get("cer") is None and r.metrics.get("utmos") is not None for r in rows if r.route != "orig")
+    assert any(n.startswith("cer unavailable") for r in rows for n in r.notes)
+    # --reweight needs no models and keeps the verdict
+    ctx.extra["reweight"] = True
+    score.run(ctx)
+    ctx.extra["reweight"] = False
+    assert all(s.status == "review" for s in _lines_not_won_by_orig(ctx))
+    # the ASR is back: only the CER group runs, and the lines are accepted
+    counts.restore()
+    again = watch_models(ctx)
+    score.run(ctx)
+    assert again["transcribe"] > 0 and again["mos"] == 0 and again["embed"] == 0 and again["emotion"] == 0
+    assert all(s.status == "auto" for s in _lines_not_won_by_orig(ctx))
+    rows = read_jsonl(ctx.paths.scores(mine[0].line_id), CandidateScore)
+    assert not any("unavailable" in n for r in rows for n in r.notes)
+
+
+def test_partial_metrics_survive_a_kill_between_groups(synthed):
+    from tests.p3_helpers import watch_models
+
+    ctx = synthed
+
+    def kill_at_emotion(op, items):
+        if op == "emotion":
+            raise KeyboardInterrupt("killed")
+
+    counts = watch_models(ctx, on_call=kill_at_emotion)
+    with pytest.raises(KeyboardInterrupt):
+        score.run(ctx)
+    assert counts["mos"] > 0 and counts["embed"] > 0
+    partial = ctx.paths.scores_dir / score.PARTIAL_FILE
+    assert partial.exists() and not list(ctx.paths.scores_dir.glob("*.jsonl"))  # no final record yet, only the partial one
+    from vndub.manifest.io import read_json
+
+    items = read_json(partial)["items"]
+    assert items and all(it["metrics"].get("utmos") is not None and it["metrics"].get("spk_sim") is not None for it in items.values())
+    assert all(it["metrics"].get("cer") is None for it in items.values())
+    counts.restore()
+    again = watch_models(ctx)
+    summary = score.run(ctx)
+    assert again["mos"] == 0 and again["embed"] == 0, "a finished group was computed again"
+    assert again["emotion"] > 0 and again["transcribe"] > 0
+    assert summary["resumed_candidates"] == len(items) and not partial.exists()
+    for s in read_jsonl(ctx.paths.selection, SelectionRecord):
+        rows = read_jsonl(ctx.paths.scores(s.line_id), CandidateScore)
+        assert all(r.metrics.get(k) is not None for r in rows for k in ("utmos", "spk_sim", "emo_sim", "cer", "dur_ratio") if not (r.route == "orig" and k == "cer")), s.line_id
+
+
+def test_partial_metrics_are_written_per_chunk_inside_a_group(make_ctx, tmp_path, monkeypatch):
+    from tests.p3_helpers import watch_models
+
+    ctx = make_ctx(tmp_path / "game")
+    build(ctx, n_per=6)
+    synth.run(ctx)
+    monkeypatch.setattr(score, "PARTIAL_EVERY_S", 0.0)  # every chunk is a checkpoint
+    state = {"n": 0}
+
+    def kill_second_asr_chunk(op, items):
+        if op == "transcribe":
+            state["n"] += 1
+            if state["n"] == 2:
+                raise KeyboardInterrupt("killed in the middle of the CER group")
+
+    counts = watch_models(ctx, on_call=kill_second_asr_chunk)
+    with pytest.raises(KeyboardInterrupt):
+        score.run(ctx)
+    n_asr_first_run = counts["transcribe"]
+    assert n_asr_first_run == 16  # one chunk went through before the kill (the second never started)
+    counts.restore()
+    again = watch_models(ctx)
+    score.run(ctx)
+    asr_needed = sum(1 for s in read_jsonl(ctx.paths.selection, SelectionRecord) for r in read_jsonl(ctx.paths.scores(s.line_id), CandidateScore) if r.route != "orig")
+    assert asr_needed > 16 and again["transcribe"] == asr_needed - 16, "the chunk that was finished before the kill was transcribed again"
+    assert again["mos"] == 0
+
+
+def test_emotion_group_skips_candidates_with_an_embedding_file(synthed):
+    from tests.p3_helpers import watch_models
+
+    ctx = synthed
+    score.run(ctx)
+    assert list(ctx.paths.scores_dir.rglob("*.e2v.npy"))
+    for p in ctx.paths.scores_dir.glob("*.jsonl"):  # no final records, no partial one: everything is to be computed again ...
+        p.unlink()
+    (ctx.paths.scores_dir / score.PARTIAL_FILE).unlink(missing_ok=True)
+    counts = watch_models(ctx)
+    score.run(ctx)
+    assert counts["mos"] > 0 and counts["transcribe"] > 0
+    assert counts["emotion"] == 0  # ... except what the embedding files already hold
+    for s in read_jsonl(ctx.paths.selection, SelectionRecord):
+        assert all(r.metrics.get("emo_sim") is not None for r in read_jsonl(ctx.paths.scores(s.line_id), CandidateScore))
+
+
+def test_score_progress_total_is_every_unit_and_never_shrinks(synthed):
+    ctx = synthed
+    events: list[tuple[int, int]] = []
+    ctx.extra["progress_cb"] = lambda stage, done, total, item: events.append((done, total))
+    score.run(ctx)
+    total = events[0][1]
+    assert events[0][0] == 0 and total > 0 and events[-1] == (total, total)
+    assert {t for _, t in events} == {total} and [d for d, _ in events] == sorted(d for d, _ in events)
+    # a rerun that finds everything: n / n at once, the same total
+    events.clear()
+    score.run(ctx)
+    assert events[0] == (total, total) and {t for _, t in events} == {total}
+    # a run that resumes after a kill reports the finished units first and the full total
+    from tests.p3_helpers import watch_models
+
+    for p in ctx.paths.scores_dir.glob("*.jsonl"):
+        p.unlink()
+    (ctx.paths.scores_dir / score.PARTIAL_FILE).unlink(missing_ok=True)
+
+    def kill(op, items):
+        if op == "transcribe":
+            raise KeyboardInterrupt()
+
+    counts = watch_models(ctx, on_call=kill)
+    events.clear()
+    with pytest.raises(KeyboardInterrupt):
+        score.run(ctx)
+    counts.restore()
+    events.clear()
+    score.run(ctx)
+    assert events[0][1] == total and 0 < events[0][0] < total  # most units were done before the kill
+    assert {t for _, t in events} == {total} and events[-1] == (total, total)
+
+
+def test_score_progress_class():
+    seen: list[tuple[int, int]] = []
+
+    class C:
+        def progress(self, done, total, item=None):
+            seen.append((done, total))
+
+    p = score._Progress(C(), total=10, done=4)
+    assert seen == [(4, 10)]  # the cached units are reported once, up front
+    p.chunk([{"id": "orig|l1"}, {"id": "l1|a"}, {"id": "l1|b"}])  # reference items are not units
+    assert seen[-1] == (6, 10)
+    p.add(100)
+    assert seen[-1] == (10, 10)  # never past the total
+    seen.clear()
+    score._Progress(C(), total=0, done=0)
+    assert seen == []
+    q = score._Progress(C(), total=5, done=9)
+    assert q.done == 5

@@ -121,12 +121,22 @@ class Resident:
     loaded_at: float
     load_s: float
     substituted_for: str | None = None
+    vram_gb: float = 0.0  # what the load was costed at (0 for a CPU backend): :meth:`ModelRegistry.would_fit` credits it
 
 
 @dataclass
 class Substitution:
     requested: str
     used: str
+    reason: str
+
+
+@dataclass
+class Unavailable:
+    """A stage skipped a part of its work because no backend for it could be acquired (VRAM, env, weights)."""
+
+    stage: str
+    group: str  # what was skipped: a score metric group ("cer", "speaker", "mos"), an analyze part, a synth route ...
     reason: str
 
 
@@ -151,11 +161,15 @@ class ModelRegistry:
     root: Path | None = None
     # tests: always use a backend's mock when it has one (deterministic, no envs)
     force_mock: bool = False
+    # VRAM is handed back asynchronously after an unload (and nvidia-smi is read at most once a second): when the LIVE
+    # free-memory check fails the registry waits this long and checks once more before it refuses (tests: 0.0)
+    vram_retry_s: float = 3.0
 
     def __post_init__(self) -> None:
         self.heavy: Resident | None = None
         self.light: dict[str, Resident] = {}
         self.substitutions: list[Substitution] = []
+        self.unavailable: list[Unavailable] = []
         self.events: list[dict[str, Any]] = []
         self.log = get_logger("gpu", (self.log_dir / "gpu.log") if self.log_dir else None)
 
@@ -220,7 +234,7 @@ class ModelRegistry:
         if spec.heavy:
             self.release_heavy()
             if self._cuda_ok():
-                self._check_budget(spec, need)
+                self._check_fit(spec, need)
                 device = self.device
             elif not self._cpu_allowed(spec):
                 raise BackendUnavailable(spec.name, "CUDA not available", "set gpu.allow_cpu_fallback: true to run on CPU (slow)")
@@ -238,7 +252,7 @@ class ModelRegistry:
             raise
         load_s = time.perf_counter() - t0
         self._check_device(spec, backend, device, info)
-        res = Resident(spec.name, spec, backend, key, time.time(), load_s, sub.requested if sub else None)
+        res = Resident(spec.name, spec, backend, key, time.time(), load_s, sub.requested if sub else None, need if device.startswith("cuda") else 0.0)
         if spec.heavy:
             self.heavy = res
         else:
@@ -273,20 +287,82 @@ class ModelRegistry:
             return self.factory(spec, options, device)
         return registry.instantiate(spec, options=options, device=device, models_dir=self.models_dir, log_dir=self.log_dir, context=self.context, root=self.root)
 
-    def _check_budget(self, spec: BackendSpec, need: float | None = None) -> None:
-        """``need`` = what this load costs (``estimate_vram_gb`` with the options: an LLM grows with ctx x parallel)."""
-        need = spec.vram_estimate_gb if need is None else need
+    def _check_static(self, spec: BackendSpec, need: float) -> None:
+        """The estimate against the configured budget (does not depend on what the GPU is doing right now)."""
         limit = self.budget_gb - self.safety_margin_gb
         if need > limit:
             raise VramBudgetExceeded(spec.name, f"needs ~{need:.1f} GB > budget {self.budget_gb:.1f} - margin {self.safety_margin_gb:.1f} GB", "raise gpu.vram_budget_gb only if the GPU really has the memory")
+
+    def _check_live(self, spec: BackendSpec, need: float, credit_gb: float = 0.0) -> None:
+        """The estimate against the free memory CUDA reports now (``credit_gb``: a resident model that would be unloaded first)."""
         free, total = self.cuda.mem_get_info()
-        free_gb = free / GB
+        free_gb = free / GB + credit_gb
         if need > free_gb - self.safety_margin_gb:
             raise VramBudgetExceeded(
                 spec.name,
                 f"needs ~{need:.1f} GB but only {free_gb:.2f} GB free of {total / GB:.1f} GB (margin {self.safety_margin_gb:.1f} GB)",
                 "close other GPU applications",
             )
+
+    def _check_budget(self, spec: BackendSpec, need: float | None = None) -> None:
+        """``need`` = what this load costs (``estimate_vram_gb`` with the options: an LLM grows with ctx x parallel)."""
+        need = spec.vram_estimate_gb if need is None else need
+        self._check_static(spec, need)
+        self._check_live(spec, need)
+
+    def _check_fit(self, spec: BackendSpec, need: float, credit_gb: float = 0.0, retry: bool = True) -> None:
+        """:meth:`_check_budget` with one second look when only the LIVE reading fails.
+
+        The estimate against the budget is a fact; the free memory is not: the process of the model that was just
+        unloaded hands its VRAM back a moment after it exits, and the nvidia-smi reading is cached for a second, so
+        the first look right after an unload can be too low. One more look after ``vram_retry_s`` (logged) keeps a
+        model that fits from being refused (and a smaller one from silently taking its place).
+        """
+        self._check_static(spec, need)
+        try:
+            self._check_live(spec, need, credit_gb)
+        except VramBudgetExceeded as first:
+            if not retry:
+                raise
+            self.log.info("%s: %s; looking again in %.1f s (VRAM is released asynchronously after an unload)", spec.name, first.reason, self.vram_retry_s)
+            if self.vram_retry_s > 0:
+                time.sleep(self.vram_retry_s)
+            try:
+                self.cuda.empty_cache()  # drops the probe's cached reading
+            except Exception:
+                pass
+            self._check_live(spec, need, credit_gb)
+
+    def would_fit(self, name: str, options: dict[str, Any] | None = None, *, retry: bool = True) -> tuple[BackendSpec, str | None]:
+        """Can ``acquire(name, options)`` load right now? Resolution and the VRAM checks, nothing is loaded.
+
+        Returns ``(spec, None)`` when it would load and ``(spec, reason)`` when it would not (the message of the
+        :class:`VramBudgetExceeded` / :class:`BackendUnavailable` that ``acquire`` would raise). ``spec`` is what the
+        name resolves to (the requested spec when nothing it falls back to is usable). Resident backends stay as they
+        are and no substitution is logged; a resident heavy model that ``acquire`` would unload first counts as free
+        memory (its costed size), so a stage asking before it loads gets the answer ``acquire`` will give.
+        """
+        try:
+            spec, _sub = self.resolve(name)
+        except BackendUnavailable as e:
+            return registry.get(name), str(e)
+        key = repr(sorted((options or {}).items()))
+        for res in ([self.heavy] if self.heavy else []) + list(self.light.values()):
+            if res.name == spec.name and res.options_key == key:
+                return spec, None  # already resident: acquire hands it back without a check
+        if not spec.heavy:
+            return spec, None
+        if not self._cuda_ok():
+            if self._cpu_allowed(spec):
+                return spec, None
+            return spec, str(BackendUnavailable(spec.name, "CUDA not available", "set gpu.allow_cpu_fallback: true to run on CPU (slow)"))
+        need = estimate_vram_gb(spec, dict(options or {}))
+        credit = self.heavy.vram_gb if self.heavy is not None else 0.0
+        try:
+            self._check_fit(spec, need, credit, retry)
+        except BackendUnavailable as e:
+            return spec, str(e)
+        return spec, None
 
     def _unload(self, res: Resident) -> None:
         t0 = time.perf_counter()
@@ -345,6 +421,21 @@ class ModelRegistry:
     @property
     def resident(self) -> list[str]:
         return ([self.heavy.name] if self.heavy else []) + list(self.light)
+
+    def record_unavailable(self, stage: str, group: str, reason: str) -> None:
+        """A stage could not acquire a backend and goes on without that part: remembered for the job's warnings
+        (the desktop app shows them) and written to ``gpu_events.jsonl``; a silent skip is how a bad candidate passes
+        or a worse model answers without anybody noticing."""
+        u = Unavailable(stage, group, reason)
+        if any(x.stage == u.stage and x.group == u.group for x in self.unavailable):
+            return
+        self.unavailable.append(u)
+        self.log.warning("%s: %s unavailable (%s)", stage, group, reason)
+        # the same base keys as _event(), so readers that walk every event (the report, tests) find them: no model behind it
+        ev = {"ts": now_iso(), "event": "unavailable", "model": None, "role": None, "heavy": False, "vram_estimate_gb": None, "stage": stage, "group": group, "reason": reason[:400]}
+        self.events.append(ev)
+        if self.timings_path is not None:
+            append_jsonl(self.timings_path, ev)
 
     def _event(self, kind: str, spec: BackendSpec, **data: Any) -> None:
         ev = {"ts": now_iso(), "event": kind, "model": spec.name, "role": spec.role, "heavy": spec.heavy, "vram_estimate_gb": spec.vram_estimate_gb, **data}

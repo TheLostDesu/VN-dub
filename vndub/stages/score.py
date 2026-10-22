@@ -20,6 +20,18 @@ renormalized); missing terms are listed per candidate. Every raw metric is
 persisted in ``scores/<line_id>.jsonl`` so ``vndub score --reweight`` re-derives
 composites and the selection without touching any model.
 
+A metric group whose backend cannot be acquired (VRAM taken by an orphan process, env or weights gone) is reported
+through ``ctx.models.record_unavailable("score", group, reason)`` and noted on every candidate that lacks it. When it is a
+GATE group (``mos`` -> utmos, ``speaker`` -> spk_sim, ``cer`` -> cer) the gate cannot be evaluated, and a candidate that
+passed only because that gate was skipped must not be accepted on its own: the line's selection becomes ``review`` with
+the reason (see :func:`unchecked_gates`; it also works from the stored notes, so ``--reweight`` keeps the verdict).
+
+Resume: the metrics of a candidate whose scoring has not finished are kept in ``scores/_partial.json`` (see
+:class:`_Partial`: keyed by candidate id, valid for its file fingerprint and the metric key), written after every metric
+group and at most every ``PARTIAL_EVERY_S`` seconds while a group runs; ``run`` starts from them and ``Cand.needs``
+therefore asks the models only for what is still missing. The file is removed when the final ``scores/<line_id>.jsonl``
+files are written. The emotion group also skips candidates whose ``.e2v.npy`` embedding already exists.
+
 Lines without original audio (``synth.voice_unvoiced``, route P) have nothing to compare the
 delivery to: ``emo_sim``, ``adv_delta``, ``prosody`` and ``dur_ratio`` are not computed (their terms
 are missing, so the composite is renormalized over utmos / pq / spk_sim / cer) and no gate needs them.
@@ -30,16 +42,20 @@ design) instead of the character's original clips -- the same threshold applies.
 from __future__ import annotations
 
 import math
+import re
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 
 from vndub.audio import features, vad
+from vndub.backends.base import BackendUnavailable
 from vndub.backends.score import prosody as pros
 from vndub.backends.score.cer import cer as cer_fn
 from vndub.backends.score.speaker_sim import cosine
-from vndub.manifest.io import CandidateScore, LineRecord, SelectionRecord, SynthSidecar, load_overrides, read_json, write_jsonl
+from vndub.manifest.io import CandidateScore, LineRecord, SelectionRecord, SynthSidecar, load_overrides, read_json, write_json, write_jsonl
 from vndub.stages import genutil as gu
 from vndub.stages.common import StageError
 from vndub.util import file_fingerprint, hash_obj
@@ -57,6 +73,12 @@ METRIC_GROUPS = {
     "cer": ["cer"],
     "prosody": ["f0_corr", "energy_corr", "pause_match", "prosody"],
 }
+
+# metric groups that feed a GATE (the others only feed the composite): group -> the metric the gate reads
+GATE_GROUPS = {"mos": "utmos", "speaker": "spk_sim", "cer": "cer"}
+GATE_LABELS = {"mos": "naturalness (utmos)", "speaker": "speaker similarity (spk_sim)", "cer": "speech intelligibility (cer)"}
+PARTIAL_FILE = "_partial.json"
+PARTIAL_EVERY_S = 15.0  # at most this often while a metric group runs (it is also written when a group ends)
 
 
 # ----------------------------------------------------------------------------
@@ -126,6 +148,27 @@ def evaluate_gates(m: dict[str, Any], gates: Any, spk_threshold: float, cer_max:
             out["dur"] = lo <= float(m["dur_ratio"]) <= hi
     if m.get("spk_sim") is not None:
         out["spk_sim"] = float(m["spk_sim"]) >= spk_threshold
+    return out
+
+
+def unchecked_gates(c: CandidateScore, unavailable: dict[str, str] | None = None) -> dict[str, str]:
+    """Gate groups (``mos`` / ``speaker`` / ``cer``) that could not be evaluated for this candidate: its metric is missing
+    (and not "not applicable") because the group's backend was unavailable or failed for it. The reason comes from this
+    run's ``unavailable`` or from the candidate's stored notes (``"<group> unavailable: ..."`` / ``"<group> failed: ..."``),
+    so the verdict survives ``--reweight``."""
+    out: dict[str, str] = {}
+    na = list((c.model_extra or {}).get("na") or [])
+    for group, metric in GATE_GROUPS.items():
+        if c.metrics.get(metric) is not None or metric in na:
+            continue
+        reason = (unavailable or {}).get(group)
+        if reason is None:
+            for n in c.notes:
+                if n.startswith(f"{group} unavailable: ") or n.startswith(f"{group} failed: "):
+                    reason = n.split(": ", 1)[1]
+                    break
+        if reason is not None:
+            out[group] = reason
     return out
 
 
@@ -241,6 +284,11 @@ def select(
     passing = [c for c in pool if c.passed]
     if passing:
         best = max(passing, key=lambda c: c.composite or 0.0)
+        skipped = unchecked_gates(best, unavailable)
+        if skipped:
+            # it passed the gates that ran; a gate that could not run (no backend) may have caught it: a person decides
+            what = "; ".join(f"{GATE_LABELS[g]}: {r[:100]}" for g, r in skipped.items())
+            return rec(best, "review", f"best of {len(passing)} passing, but not accepted automatically: gate not checked ({what})")
         return rec(best, "auto", f"best of {len(passing)} passing{unavail_note}")
     best = max(pool, key=lambda c: c.composite if c.composite is not None else -1.0)
     why = (best.model_extra or {}).get("failures") or "no gate could be evaluated"
@@ -268,10 +316,16 @@ class Cand:
         """Is there an original recording of the line to compare the delivery with?"""
         return bool(self.line.src_wav or self.line.src_wav16) and self.passport.get("source") != "text"
 
-    def needs(self, metric: str) -> bool:
-        if metric in REFERENCE_METRICS and not self.has_ref_audio:
+    def applies(self, metric: str, off: Any = ()) -> bool:
+        """Is ``metric`` part of this candidate's work at all (not switched off, not marked n/a, a reference exists)?"""
+        if metric in off or metric in self.na:
             return False
-        return self.rec.metrics.get(metric) is None and metric not in self.na
+        return not (metric in REFERENCE_METRICS and not self.has_ref_audio)
+
+    def needs(self, metric: str) -> bool:
+        """Is ``metric`` still to be computed? A record restored from ``scores/_partial.json`` already holds the metrics of the
+        groups that finished before a kill, so only the missing ones are asked of the models."""
+        return self.applies(metric) and self.rec.metrics.get(metric) is None
 
     @property
     def na(self) -> list[str]:
@@ -280,6 +334,11 @@ class Cand:
 
 # metrics that compare a candidate with the original recording of its line
 REFERENCE_METRICS = ("emo_sim", "adv_delta", "prosody")
+# the metrics that count as one unit of work each in the progress (a unit per candidate per metric)
+UNIT_METRICS = ("utmos", "pq", "spk_sim", "emo_sim", "adv_delta", "cer", "prosody")
+# group -> the metric a candidate lacks when the group did not run (for the notes)
+GROUP_METRIC = {"mos": "utmos", "aesthetics": "pq", "speaker": "spk_sim", "emotion": "emo_sim", "adv": "adv_delta", "cer": "cer"}
+_STALE_NOTE = re.compile(r"^[a-z_]+ (unavailable|failed): ")
 
 
 def native_speed(side: SynthSidecar | None) -> float:
@@ -289,24 +348,97 @@ def native_speed(side: SynthSidecar | None) -> float:
 
 
 class _Progress:
-    """``ctx.progress`` over the metric computations (one unit per candidate per metric group)."""
+    """``ctx.progress`` over the metric computations: one unit per candidate per metric.
 
-    def __init__(self, ctx: Any, total: int, n_items: int = 0) -> None:
-        self.ctx, self.total, self.done, self.n_items = ctx, max(0, int(total)), 0, n_items
+    ``total`` is ALL the units of the stage, the ones already computed (restored from the final scores or from the partial
+    file) included, and ``done`` starts at those: the first report is ``(cached, total)``, then real work moves it. ``total``
+    never shrinks to the remaining units (a resumed run used to report only what was left, which made the app's throughput
+    store think the stage was tiny and fast)."""
+
+    def __init__(self, ctx: Any, total: int, done: int = 0) -> None:
+        self.ctx, self.total = ctx, max(0, int(total))
+        self.done = min(max(0, int(done)), self.total)
+        if self.total:
+            ctx.progress(self.done, self.total, None)
 
     def add(self, n: int, item: str | None = None) -> None:
-        if self.total:
+        if self.total and n > 0:
             self.done = min(self.total, self.done + n)
             self.ctx.progress(self.done, self.total, item)
 
     def chunk(self, part: list[dict[str, Any]]) -> None:
-        self.add(len(part), str(part[-1].get("id", "")).split("|")[0] if part else None)
+        """A chunk of backend items; the reference-side items (``orig|...``, ``ref|...``) are not units."""
+        real = [it for it in part if not str(it.get("id", "")).startswith(("orig|", "ref|", "perf|"))]
+        self.add(len(real), str(real[-1].get("id", "")).split("|")[0] if real else None)
 
     def finish(self) -> None:
-        if self.total:
+        """Units nobody could compute (an unavailable group) are done too."""
+        if self.total and self.done < self.total:
             self.add(self.total - self.done)
-        elif self.n_items:  # everything was scored before: report the candidates as done
-            self.ctx.progress(self.n_items, self.n_items, None)
+
+
+def _units(cands: list[Cand], off: set[str]) -> tuple[int, int]:
+    """(all metric units of the stage, the ones already computed)."""
+    total = done = 0
+    for c in cands:
+        for m in UNIT_METRICS:
+            if c.applies(m, off):
+                total += 1
+                done += c.rec.metrics.get(m) is not None
+    return total, done
+
+
+class _Partial:
+    """Metrics of candidates whose scoring was not finished, in ``scores/_partial.json``.
+
+    One file for the stage: ``{"version": 1, "mkey": <metric key>, "items": {<candidate id>: <the candidate's score record>}}``.
+    An entry is only used for the same file (``fp`` = size + mtime of the wav) and the same metric key, so a regenerated
+    candidate or a changed model setting starts clean. It is written after every metric group and, while a group runs, at
+    most every ``PARTIAL_EVERY_S`` seconds (a hard kill loses seconds, not the group). :meth:`forget` removes the entries
+    of candidates whose final ``scores/<line_id>.jsonl`` has been written."""
+
+    def __init__(self, path: Path, mkey: str, clock: Any = time.monotonic) -> None:
+        self.path, self.mkey, self._clock = Path(path), mkey, clock
+        self.items: dict[str, dict[str, Any]] = {}
+        try:
+            raw = read_json(self.path, {}) or {}
+            if isinstance(raw, dict) and raw.get("mkey") == mkey and isinstance(raw.get("items"), dict):
+                self.items = dict(raw["items"])
+        except Exception:  # a torn or foreign file is just no resume data
+            self.items = {}
+        self._dirty: dict[str, Cand] = {}
+        self._last = clock()
+
+    @classmethod
+    def open(cls, ctx: Any) -> "_Partial":
+        return cls(ctx.paths.scores_dir / PARTIAL_FILE, _metric_key(ctx.cfg))
+
+    def lookup(self, cid: str, fp: str) -> dict[str, Any] | None:
+        d = self.items.get(cid)
+        return d if d and d.get("fp") == fp and d.get("mkey") == self.mkey else None
+
+    def touch(self, c: Cand) -> None:
+        self._dirty[c.cid] = c
+
+    def checkpoint(self, force: bool = False) -> None:
+        if not self._dirty or (not force and self._clock() - self._last < PARTIAL_EVERY_S):
+            return
+        for cid, c in self._dirty.items():
+            self.items[cid] = c.rec.model_dump(mode="json")
+        self._dirty.clear()
+        write_json(self.path, {"version": 1, "mkey": self.mkey, "items": self.items}, indent=False)
+        self._last = self._clock()
+
+    def forget(self, cids: Any) -> None:
+        gone = [cid for cid in cids if cid in self.items]
+        for cid in cids:
+            self._dirty.pop(cid, None)
+        for cid in gone:
+            del self.items[cid]
+        if not self.items:
+            self.path.unlink(missing_ok=True)
+        elif gone:
+            write_json(self.path, {"version": 1, "mkey": self.mkey, "items": self.items}, indent=False)
 
 
 def _metric_key(cfg: Any) -> str:
@@ -328,11 +460,13 @@ def run(ctx: Any) -> dict[str, Any]:
     unavailable: dict[str, str] = {}
     if cfg.score.emotion != cfg.analyze.e2v:
         ctx.log.warning("score.emotion (%s) differs from analyze.e2v (%s): emotion similarity compares different embedding spaces", cfg.score.emotion, cfg.analyze.e2v)
+    partial = _Partial.open(ctx)
 
     cands: list[Cand] = []
     per_line: dict[str, list[Cand]] = {}
     sidecars: dict[str, dict[str, SynthSidecar | None]] = {}
     failed_counts: dict[str, int] = {}
+    restored = 0
     for line in lines:
         old = {c.wav: c for c in gu.load_scores(ctx, line.line_id)}
         passport = gu.load_passport(ctx, line.line_id) or {}
@@ -351,7 +485,11 @@ def run(ctx: Any) -> dict[str, Any]:
             rel = ctx.paths.rel(wav)
             fp = file_fingerprint(wav)
             prev = old.get(rel)
-            if prev is not None and (reweight or ((prev.model_extra or {}).get("fp") == fp and (prev.model_extra or {}).get("mkey") == mkey)):
+            saved = None if reweight else partial.lookup(f"{line.line_id}|{wav.stem}", fp)
+            if saved is not None:  # a killed run got this far (it started from the final record, if there was one)
+                record = CandidateScore.model_validate(saved)
+                restored += 1
+            elif prev is not None and (reweight or ((prev.model_extra or {}).get("fp") == fp and (prev.model_extra or {}).get("mkey") == mkey)):
                 record = prev
             else:
                 record = CandidateScore(line_id=line.line_id, wav=rel, backend=side.backend, route=side.route, metrics={})
@@ -364,9 +502,11 @@ def run(ctx: Any) -> dict[str, Any]:
             sidecars[line.line_id][rel] = side
         per_line[line.line_id] = lst
         cands += lst
+    if restored:
+        ctx.log.info("score: %d candidate(s) resumed from %s", restored, PARTIAL_FILE)
 
     if not reweight and cands:
-        _compute(ctx, cands, unavailable)
+        _compute(ctx, cands, unavailable, partial)
 
     # ---- composite, gates, selection ------------------------------------------
     selections: list[SelectionRecord] = []
@@ -393,6 +533,8 @@ def run(ctx: Any) -> dict[str, Any]:
         mine = {s.line_id for s in selections}
         selections = [*selections, *[s for lid, s in prev.items() if lid not in mine]]
     write_jsonl(ctx.paths.selection, selections)
+    if not reweight:  # (a reweight did not look at the partial records: they may hold more than the final ones)
+        partial.forget([c.cid for c in cands])  # the final records are on disk
 
     status: dict[str, int] = {}
     for s in selections:
@@ -409,23 +551,81 @@ def run(ctx: Any) -> dict[str, Any]:
         "spk_threshold": f"{thr:.3f} {thr_src}",
         "reweight": reweight,
     }
+    if restored:
+        summary["resumed_candidates"] = restored
     if unavailable:
         summary["metrics_unavailable"] = unavailable
+    unchecked = sum(1 for x in selections if x.status == "review" and "gate not checked" in x.reason)
+    if unchecked:
+        summary["lines_with_unchecked_gates"] = unchecked
     return summary
+
+
+def _mark_unavailable(ctx: Any, unavailable: dict[str, str], group: str, reason: str) -> None:
+    """A metric group could not run: remembered for the selection and the notes, told to the registry (-> the job's warnings)."""
+    unavailable.setdefault(group, reason)
+    gu.record_unavailable(ctx, NAME, group, reason)
 
 
 def _acquire(ctx: Any, names: list[str], group: str, unavailable: dict[str, str]):
     b, used, reason = gu.acquire_first(ctx, names)
     if b is None:
-        unavailable[group] = reason
+        _mark_unavailable(ctx, unavailable, group, reason)
     return b, used
 
 
-def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
+@contextmanager
+def _guard(ctx: Any, unavailable: dict[str, str], group: str) -> Iterator[None]:
+    """A backend that disappears while a group runs (``BackendUnavailable`` out of ``run_batched``) ends that group, not the stage."""
+    try:
+        yield
+    except BackendUnavailable as e:
+        _mark_unavailable(ctx, unavailable, group, e.reason or str(e))
+
+
+def _emb_fresh(out: Path, wav: Path) -> bool:
+    """Is the embedding file there and not older than its audio (the rule ``genutil.embed_paths`` uses)?"""
+    try:
+        return out.exists() and out.stat().st_mtime >= Path(wav).stat().st_mtime
+    except OSError:
+        return False
+
+
+def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str], partial: _Partial | None = None) -> None:
+    """Fill the missing metrics of ``cands`` group by group (one model at a time, all candidates under it).
+
+    The metrics found in ``partial`` are already in the records, so only the missing groups run. The partial file is written
+    after every group and at most every ``PARTIAL_EVERY_S`` seconds inside one, also when the stage dies half way."""
+    partial = partial or _Partial.open(ctx)
+    for c in cands:  # reasons from an earlier run are rewritten below when they still hold
+        c.rec.notes = [n for n in c.rec.notes if not _STALE_NOTE.match(n)]
+    off: set[str] = set()
+    if not ctx.cfg.score.aesthetics:
+        off.add("pq")
+    if not ctx.cfg.score.adv:
+        off.add("adv_delta")
+    total, done = _units(cands, off)
+    prog = _Progress(ctx, total, done)
+    try:
+        _compute_groups(ctx, cands, unavailable, partial, prog)
+    finally:
+        partial.checkpoint(force=True)
+
+
+def _compute_groups(ctx: Any, cands: list[Cand], unavailable: dict[str, str], partial: _Partial, prog: _Progress) -> None:
     cfg = ctx.cfg
     s = cfg.score
     tgt = cfg.project.tgt_lang
-    prog = _Progress(ctx, sum(1 for c in cands for m in ("utmos", "pq", "spk_sim", "emo_sim", "adv_delta", "cer", "prosody") if c.needs(m)), len(cands))
+
+    def failed(c: Cand, group: str, err: Any) -> None:
+        """This item got no result from a group that ran: a note (the gate verdict reads it), and a loud report when the GPU is full."""
+        err = str(err or "no result")
+        note = f"{group} failed: {err[:120]}"
+        if note not in c.rec.notes:
+            c.rec.notes = [*c.rec.notes, note]
+        partial.touch(c)
+        if gu.is_vram_error(err):
+            _mark_unavailable(ctx, unavailable, group, f"out of memory: {err[:160]}")
 
     # MOS
     todo = [c for c in cands if c.needs("utmos")]
@@ -433,10 +633,24 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
         b, _ = _acquire(ctx, [s.mos, s.mos_fallback], "mos", unavailable)
         if b is not None:
             by = {c.cid: c for c in todo}
-            for r in gu.run_batched(b, "mos", [{"id": c.cid, "wav": str(c.wav)} for c in todo], on_chunk=prog.chunk):
-                v = r.get("mos", r.get("utmos", r.get("score")))
-                if v is not None and not r.get("error") and r.get("id") in by:
-                    by[r["id"]].rec.metrics["utmos"] = round(float(v), 4)
+
+            def got_mos(part: list[dict[str, Any]], res: list[dict[str, Any]]) -> None:
+                for r in res:
+                    c = by.get(r.get("id"))
+                    if c is None:
+                        continue
+                    v = r.get("mos", r.get("utmos", r.get("score")))
+                    if v is not None and not r.get("error"):
+                        c.rec.metrics["utmos"] = round(float(v), 4)
+                        partial.touch(c)
+                    else:
+                        failed(c, "mos", r.get("error"))
+                prog.chunk(part)
+                partial.checkpoint()
+
+            with _guard(ctx, unavailable, "mos"):
+                gu.run_batched(b, "mos", [{"id": c.cid, "wav": str(c.wav)} for c in todo], on_results=got_mos)
+        partial.checkpoint(force=True)
     # aesthetics
     if s.aesthetics:
         todo = [c for c in cands if c.needs("pq")]
@@ -444,11 +658,25 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
             b, _ = _acquire(ctx, [s.aesthetics], "aesthetics", unavailable)
             if b is not None:
                 by = {c.cid: c for c in todo}
-                for r in gu.run_batched(b, "aesthetics", [{"id": c.cid, "wav": str(c.wav)} for c in todo], on_chunk=prog.chunk):
-                    if not r.get("error") and r.get("id") in by:
-                        for k in ("pq", "ce", "cu", "pc"):
-                            if r.get(k) is not None:
-                                by[r["id"]].rec.metrics[k] = round(float(r[k]), 4)
+
+                def got_aes(part: list[dict[str, Any]], res: list[dict[str, Any]]) -> None:
+                    for r in res:
+                        c = by.get(r.get("id"))
+                        if c is None:
+                            continue
+                        if not r.get("error"):
+                            for k in ("pq", "ce", "cu", "pc"):
+                                if r.get(k) is not None:
+                                    c.rec.metrics[k] = round(float(r[k]), 4)
+                            partial.touch(c)
+                        else:
+                            failed(c, "aesthetics", r.get("error"))
+                    prog.chunk(part)
+                    partial.checkpoint()
+
+                with _guard(ctx, unavailable, "aesthetics"):
+                    gu.run_batched(b, "aesthetics", [{"id": c.cid, "wav": str(c.wav)} for c in todo], on_results=got_aes)
+            partial.checkpoint(force=True)
     else:
         for c in cands:
             if "pq" not in c.na:
@@ -491,10 +719,14 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
                     k = f"orig|{c.line.line_id}"
                     jobs.append((k, ctx.paths.abs(c.line.src_wav16 or c.line.src_wav), c.emb_dir / f"orig.{name}.npy"))
                 jobs.append((f"cand|{c.cid}", c.wav, c.emb_dir / f"{c.wav.stem}.{name}.npy"))
-            vecs = gu.embed_paths(ctx, b, list(dict.fromkeys(jobs)))
+            vecs: dict[str, Any] = {}
+            with _guard(ctx, unavailable, "speaker"):
+                vecs = gu.embed_paths(ctx, b, list(dict.fromkeys(jobs)))  # the npy files survive a kill: a rerun only re-reads them
             for c in todo:
                 v = vecs.get(f"cand|{c.cid}")
                 if v is None:
+                    if "speaker" not in unavailable:  # (when the backend vanished, the group is reported as a whole)
+                        failed(c, "speaker", "no embedding")
                     continue
                 keys, kind = ref_keys(c.line.speaker_id, c.rec.route)
                 refs = [vecs[k] for k in (keys or [f"orig|{c.line.line_id}"]) if k in vecs]
@@ -504,6 +736,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
                         c.rec.notes = [*c.rec.notes, "spk_sim vs the original line (no voicebank refs)"]
                     elif kind == "perf":
                         c.rec.notes = [*c.rec.notes, "spk_sim vs the performer's sample (consistency; no original voice)"]
+                    partial.touch(c)
             prog.add(len(todo), todo[-1].line.line_id)
         if s.speaker_extra:
             b2, name2 = _acquire(ctx, [s.speaker_extra], "speaker_extra", unavailable)
@@ -513,11 +746,15 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
                     if c.line.src_wav16 or c.line.src_wav:
                         jobs.append((f"orig|{c.line.line_id}", ctx.paths.abs(c.line.src_wav16 or c.line.src_wav), c.emb_dir / f"orig.{name2}.npy"))
                     jobs.append((f"cand|{c.cid}", c.wav, c.emb_dir / f"{c.wav.stem}.{name2}.npy"))
-                vecs = gu.embed_paths(ctx, b2, list(dict.fromkeys(jobs)))
+                vecs2: dict[str, Any] = {}
+                with _guard(ctx, unavailable, "speaker_extra"):
+                    vecs2 = gu.embed_paths(ctx, b2, list(dict.fromkeys(jobs)))
                 for c in todo:
-                    a, o = vecs.get(f"cand|{c.cid}"), vecs.get(f"orig|{c.line.line_id}")
+                    a, o = vecs2.get(f"cand|{c.cid}"), vecs2.get(f"orig|{c.line.line_id}")
                     if a is not None and o is not None:
                         c.rec.metrics["spk_sim_extra"] = round(cosine(a, o), 4)
+                        partial.touch(c)
+        partial.checkpoint(force=True)
     # emotion similarity (same emotion2vec+ model as analyze)
     todo = [c for c in cands if c.needs("emo_sim")]
     if todo:
@@ -525,6 +762,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
         if b is not None:
             items = []
             orig_out: dict[str, Path] = {}
+            have = 0  # candidates whose embedding file survived an interrupted run: no model call for them
             for c in todo:
                 lid = c.line.line_id
                 emb = ((c.passport.get("emotion") or {}).get("e2v") or {}).get("embedding_path")
@@ -534,24 +772,41 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
                 elif lid not in orig_out and (c.line.src_wav16 or c.line.src_wav):
                     out = c.emb_dir / f"orig.{name}.e2v.npy"
                     orig_out[lid] = out
-                    if not out.exists():
-                        items.append({"id": f"orig|{lid}", "wav": str(ctx.paths.abs(c.line.src_wav16 or c.line.src_wav)), "out": str(out)})
-                items.append({"id": c.cid, "wav": str(c.wav), "out": str(c.emb_dir / f"{c.wav.stem}.{name}.e2v.npy")})
+                    osrc = ctx.paths.abs(c.line.src_wav16 or c.line.src_wav)
+                    if not _emb_fresh(out, osrc):
+                        items.append({"id": f"orig|{lid}", "wav": str(osrc), "out": str(out)})
+                cout = c.emb_dir / f"{c.wav.stem}.{name}.e2v.npy"
+                if _emb_fresh(cout, c.wav):
+                    have += 1
+                    continue
+                items.append({"id": c.cid, "wav": str(c.wav), "out": str(cout)})
             for it in items:
                 Path(it["out"]).parent.mkdir(parents=True, exist_ok=True)
-            res = {r["id"]: r for r in gu.run_batched(b, "emotion", items, on_chunk=prog.chunk)}
+            prog.add(have, todo[-1].line.line_id)
+            res: dict[str, dict[str, Any]] = {}
+
+            def got_emo(part: list[dict[str, Any]], got: list[dict[str, Any]]) -> None:
+                res.update({r["id"]: r for r in got if r.get("id") is not None})
+                prog.chunk(part)
+
+            with _guard(ctx, unavailable, "emotion"):
+                gu.run_batched(b, "emotion", items, on_results=got_emo)
             for c in todo:
                 r = res.get(c.cid, {})
                 p = r.get("embedding_path") or (c.emb_dir / f"{c.wav.stem}.{name}.e2v.npy")
                 o = orig_out.get(c.line.line_id)
                 if r.get("error") or not Path(p).exists() or o is None or not Path(o).exists():
+                    if r.get("error"):
+                        failed(c, "emotion", r["error"])
                     continue
                 c.rec.metrics["emo_sim"] = round(cosine(np.load(p), np.load(o)), 4)
+                partial.touch(c)
                 if r.get("label"):
                     setattr(c.rec, "emo_label", r["label"])
                     orig_label = (c.passport.get("style") or {}).get("emotion")
                     if orig_label:
                         c.rec.metrics["emo_match"] = 1.0 if r["label"] == orig_label else 0.0
+        partial.checkpoint(force=True)
     # A/D/V delta
     todo = [c for c in cands if c.needs("adv_delta")]
     if todo and s.adv:
@@ -561,29 +816,58 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
             for c in todo:
                 if not (c.passport.get("emotion") or {}).get("adv") and (c.line.src_wav16 or c.line.src_wav):
                     orig_items[c.line.line_id] = {"id": f"orig|{c.line.line_id}", "wav": str(ctx.paths.abs(c.line.src_wav16 or c.line.src_wav))}
-            res = {r["id"]: r for r in gu.run_batched(b, "adv", [{"id": c.cid, "wav": str(c.wav)} for c in todo] + list(orig_items.values()), on_chunk=prog.chunk)}
-            for c in todo:
-                r = res.get(c.cid, {})
-                o = (c.passport.get("emotion") or {}).get("adv") or res.get(f"orig|{c.line.line_id}", {})
-                if r.get("error") or r.get("arousal") is None or o.get("arousal") is None:
-                    continue
-                c.rec.metrics["adv_delta"] = round(abs(float(r["arousal"]) - float(o["arousal"])) + abs(float(r.get("valence", 0.5)) - float(o.get("valence", 0.5))), 4)
+            by = {c.cid: c for c in todo}
+            orig_res: dict[str, dict[str, Any]] = {}
+
+            def got_adv(part: list[dict[str, Any]], res_: list[dict[str, Any]]) -> None:
+                for r in res_:  # the original-line items come first, so their result is known when the candidates arrive
+                    rid = str(r.get("id"))
+                    if rid.startswith("orig|"):
+                        orig_res[rid] = r
+                        continue
+                    c = by.get(rid)
+                    if c is None:
+                        continue
+                    o = (c.passport.get("emotion") or {}).get("adv") or orig_res.get(f"orig|{c.line.line_id}", {})
+                    if r.get("error") or r.get("arousal") is None or o.get("arousal") is None:
+                        failed(c, "adv", r.get("error") or "no arousal value")
+                        continue
+                    c.rec.metrics["adv_delta"] = round(abs(float(r["arousal"]) - float(o["arousal"])) + abs(float(r.get("valence", 0.5)) - float(o.get("valence", 0.5))), 4)
+                    partial.touch(c)
+                prog.chunk(part)
+                partial.checkpoint()
+
+            with _guard(ctx, unavailable, "adv"):
+                gu.run_batched(b, "adv", list(orig_items.values()) + [{"id": c.cid, "wav": str(c.wav)} for c in todo], on_results=got_adv)
+        partial.checkpoint(force=True)
     # CER
     todo = [c for c in cands if c.needs("cer")]
     if todo:
         b, _ = _acquire(ctx, [s.cer_asr, s.cer_asr_fallback], "cer", unavailable)
         if b is not None:
-            res = {r["id"]: r for r in gu.run_batched(b, "transcribe", [{"id": c.cid, "wav": str(c.wav), "lang": tgt} for c in todo], on_chunk=prog.chunk, lang=tgt)}
             trs = gu.load_translations(ctx)
-            for c in todo:
-                r = res.get(c.cid, {})
-                if r.get("error"):
-                    continue
-                cont = [trs.get(x) for x in ((c.line.model_extra or {}).get("sustain_lines") or [])]
-                ref = cer_reference(c.side, c.tr, [x for x in cont if x is not None])
-                hyp = r.get("text", "")
-                c.rec.metrics["cer"] = round(cer_fn(ref or "", hyp), 4)
-                setattr(c.rec, "asr_text", hyp)
+            by = {c.cid: c for c in todo}
+
+            def got_cer(part: list[dict[str, Any]], res_: list[dict[str, Any]]) -> None:
+                for r in res_:
+                    c = by.get(r.get("id"))
+                    if c is None:
+                        continue
+                    if r.get("error"):
+                        failed(c, "cer", r["error"])
+                        continue
+                    cont = [trs.get(x) for x in ((c.line.model_extra or {}).get("sustain_lines") or [])]
+                    ref = cer_reference(c.side, c.tr, [x for x in cont if x is not None])
+                    hyp = r.get("text", "")
+                    c.rec.metrics["cer"] = round(cer_fn(ref or "", hyp), 4)
+                    setattr(c.rec, "asr_text", hyp)
+                    partial.touch(c)
+                prog.chunk(part)
+                partial.checkpoint()
+
+            with _guard(ctx, unavailable, "cer"):
+                gu.run_batched(b, "transcribe", [{"id": c.cid, "wav": str(c.wav), "lang": tgt} for c in todo], on_results=got_cer, lang=tgt)
+        partial.checkpoint(force=True)
     # duration + prosody (core DSP, F0 via the configured f0 backend)
     for c in cands:
         if c.rec.metrics.get("dur_ratio") is None:
@@ -593,7 +877,8 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
                 c.rec.metrics["duration_s"] = round(features.duration(c.wav), 3)
     todo = [c for c in cands if c.needs("prosody")]
     if todo:
-        f0b, _, _ = gu.acquire_first(ctx, [cfg.analyze.f0])
+        # no F0 backend: the core pYIN does it (slower, rougher); said so, the prosody term is still computed
+        f0b, _, _ = gu.acquire_first(ctx, [cfg.analyze.f0], group="f0 backend (core pYIN used instead)", stage=NAME)
         jobs = [(c.cid, c.wav, c.feat_dir / f"{c.wav.stem}.f0.npy") for c in todo]
         for c in todo:
             pf = (c.passport.get("prosody") or {}).get("f0_contour_path")
@@ -622,7 +907,6 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
             src_pauses = p.get("pauses")
             src_dur = gu.src_duration(ctx, c.line, c.passport)
             pm = pros.pause_match(src_pauses, src_dur, prof["pauses"], len(y) / sr) if src_pauses is not None else None
-            prog.add(1, c.line.line_id)
             c.rec.metrics["f0_corr"] = None if fc is None else round(fc, 4)
             c.rec.metrics["energy_corr"] = None if ec is None else round(ec, 4)
             c.rec.metrics["pause_match"] = None if pm is None else round(pm, 4)
@@ -630,9 +914,17 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str]) -> None:
             c.rec.metrics["prosody"] = None if ps is None else round(ps, 4)
             if ps is None:
                 c.rec.na = [*c.na, "prosody"]  # type: ignore[attr-defined]
+            partial.touch(c)
+            prog.add(1, c.line.line_id)
+            partial.checkpoint()
+        partial.checkpoint(force=True)
     prog.finish()
     for group, reason in unavailable.items():
+        metric = GROUP_METRIC.get(group)
         for c in cands:
+            if metric is not None and (c.rec.metrics.get(metric) is not None or metric in c.na):
+                continue  # this candidate has what the group would have given
             note = f"{group} unavailable: {reason[:120]}"
             if note not in c.rec.notes:
                 c.rec.notes = [*c.rec.notes, note]
+                partial.touch(c)

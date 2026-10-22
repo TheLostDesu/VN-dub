@@ -123,7 +123,7 @@ def test_job_progress_reports_eta_and_whole_job_estimate() -> None:
         ctx.set_stages(["synth", "master"], n_items=10)
         ctx.begin_stage("synth")
         for i in range(1, 6):
-            time.sleep(0.02)
+            time.sleep(0.07)  # slower than a cached result is found (EtaEstimator.INSTANT_S_PER_ITEM)
             ctx.progress(i, 5, f"line{i}")
         return {"n": 5}
 
@@ -135,7 +135,176 @@ def test_job_progress_reports_eta_and_whole_job_estimate() -> None:
     assert job.eta_s == 0.0
     # measured and stored per voiced line (5 progress items of 10 lines), for the next job's estimate
     assert r.throughput.get("synth") is not None
-    assert r.throughput.get("synth") == pytest.approx(0.02 * 5 / 10, abs=0.02)
+    assert r.throughput.get("synth") == pytest.approx(0.07 * 5 / 10, abs=0.03)
+    r.shutdown()
+
+
+def test_eta_cached_items_reported_one_by_one_are_not_work() -> None:
+    """After a restart a stage reports every cached item on its own: 1000 of them in a second are a scan, not 1000 lines a second."""
+    e = EtaEstimator(min_items=2)
+    e.reset(now=0.0)
+    for i in range(1, 1001):
+        e.update(i, 2000, now=i * 0.001)  # 1 ms each, well under 50 ms
+    assert e.measured == 0 and e.sec_per_item is None and e.rate_per_min is None and e.eta(1000, 2000) is None
+    e.update(1001, 2000, now=4.0)  # the first real item: the scan's second goes to it
+    e.update(1002, 2000, now=7.0)
+    assert e.measured == 2 and e.sec_per_item == pytest.approx(3.5)
+    assert e.rate_per_min == pytest.approx(60 / 3.5)
+
+
+def test_eta_a_slow_cached_scan_is_still_cached() -> None:
+    e = EtaEstimator(min_items=2)
+    e.reset(now=0.0)
+    e.update(2000, 5000, now=30.0)  # 30 s over 2000 cached items = 15 ms each
+    assert e.measured == 0 and e.rate_per_min is None
+    e.update(2001, 5000, now=33.0)  # a real item: 3 s
+    e.update(2002, 5000, now=36.0)
+    assert e.measured == 2 and e.sec_per_item == pytest.approx((33 + 3) / 2)  # the scan's time goes to the next real item
+    # the boundary: under 50 ms per item is a cached result, over it is work
+    w = EtaEstimator(min_items=1)
+    w.reset(now=0.0)
+    w.update(10, 100, now=0.49)  # 49 ms each
+    assert w.measured == 0
+    w.update(20, 100, now=1.5)  # 1.01 s over 10 items
+    assert w.measured == 10
+
+
+def test_throughput_store_clamps_a_new_value_to_a_third_up_or_down(tmp_path: Path) -> None:
+    ts = ThroughputStore(tmp_path / "t.json")
+    ts.record("synth", 1.0)  # nothing known yet: taken as it is
+    assert ts.get("synth") == pytest.approx(1.0)
+    ts.record("synth", 100.0)  # clamped to 3.0, then the EMA
+    assert ts.get("synth") == pytest.approx(0.5 * 3.0 + 0.5 * 1.0)
+    ts.record("score", 6.0)
+    ts.record("score", 0.01)  # clamped to 2.0
+    assert ts.get("score") == pytest.approx(0.5 * 2.0 + 0.5 * 6.0)
+
+
+def _run_stage_job(r: JobRunner, n_hint: int, plan: list[tuple[str, int, float]]) -> jobs.JobRecord:
+    """A job that enters the given stages in order: ``(name, items, seconds the stage has been working)``."""
+
+    def fn(ctx: jobs.JobContext) -> None:
+        ctx.set_stages(list(dict.fromkeys(n for n, _, _ in plan)), n_items=n_hint)
+        for name, items, secs in plan:
+            ctx.begin_stage(name)
+            ctx.eta.reset(now=time.monotonic() - secs)  # the stage has worked this long
+            ctx.progress(items, items, "x")
+
+    job = r.submit("stage", fn)
+    r.wait(job.id, 10)
+    assert job.state == "done", job.error
+    return job
+
+
+def test_a_stage_entered_again_is_not_recorded() -> None:
+    r = JobRunner(None, None)
+    _run_stage_job(r, 30, [("synth", 30, 60.0), ("score", 30, 30.0)])
+    assert r.throughput.get("synth") == pytest.approx(2.0, rel=0.05)  # 60 s / 30 items, 30 lines
+    assert r.throughput.get("score") == pytest.approx(1.0, rel=0.05)
+    # a regen round: synth and score again with a few items and a very different speed
+    _run_stage_job(r, 30, [("synth", 30, 60.0), ("score", 30, 30.0), ("synth", 25, 150.0), ("score", 25, 100.0)])
+    assert r.throughput.get("synth") == pytest.approx(2.0, rel=0.05)  # the second entry did not count
+    assert r.throughput.get("score") == pytest.approx(1.0, rel=0.05)
+    r.shutdown()
+
+
+def test_a_small_job_or_mostly_cached_stage_is_not_recorded() -> None:
+    r = JobRunner(None, None)
+    _run_stage_job(r, 5, [("synth", 5, 60.0)])  # a 5-line listen job carries the model's load time
+    assert r.throughput.get("synth") is None
+
+    def mostly_cached(ctx: jobs.JobContext) -> None:
+        ctx.set_stages(["score"], n_items=100)
+        ctx.begin_stage("score")
+        t0 = time.monotonic()
+        ctx.eta.reset(now=t0)
+        ctx.progress(190, 200)  # 190 cached results found at once
+        ctx.eta.update(200, 200, now=t0 + 100.0)  # ... and 10 real ones in the next 100 s: under 20 items and under 20 % of 200
+
+    job = r.submit("stage", mostly_cached)
+    r.wait(job.id, 10)
+    assert job.state == "done" and r.throughput.get("score") is None
+
+    _run_stage_job(r, 100, [("score", 25, 100.0)])  # 25 real items of 25: recorded
+    assert r.throughput.get("score") == pytest.approx(100 / 25 * 25 / 100, rel=0.05)
+    r.shutdown()
+
+
+def test_a_short_stage_with_all_its_items_measured_is_recorded() -> None:
+    r = JobRunner(None, None)
+    _run_stage_job(r, 12, [("pack", 3, 9.0)])  # 3 of 3 items: 100 % of its total although under 20 items
+    assert r.throughput.get("pack") == pytest.approx(9.0 / 3 * 3 / 12, rel=0.05)
+    r.shutdown()
+
+
+def test_the_runner_keeps_throughput_in_a_v3_file(app_env: Path) -> None:
+    (app_env / "throughput_v2.json").write_text(json.dumps({"synth": 0.001, "score": 0.002}), encoding="utf-8")  # poisoned by earlier resumes
+    jobs.reset_runner(None)
+    r = jobs.runner()
+    try:
+        assert r.throughput.get("synth") is None  # the v2 numbers are not read
+        r.throughput.record("synth", 2.0)
+        assert json.loads((app_env / "throughput_v3.json").read_text(encoding="utf-8")) == {"synth": 2.0}
+        assert json.loads((app_env / "throughput_v2.json").read_text(encoding="utf-8")) == {"synth": 0.001, "score": 0.002}  # left alone
+    finally:
+        jobs.reset_runner(None)
+
+
+def test_old_records_without_settings_load_and_new_ones_keep_them(tmp_path: Path) -> None:
+    state = tmp_path / "jobs.json"
+    old = jobs.JobRecord(id="old1", kind="full", title_key="jobs.full", project="demo", state="done", created="2026-10-01T10:00:00+00:00").info(with_log=True)
+    del old["settings"]  # a record written before the field existed
+    state.write_text(json.dumps([old]), encoding="utf-8")
+    r1 = JobRunner(state, None)
+    assert r1.get("old1").settings == {} and r1.get("old1").info()["settings"] == {}
+    snap = {"gpu_budget_gb": 7.5, "profile": "apptest"}
+    j = r1.submit("report", lambda ctx: None, gpu=False, project="demo", settings=snap)
+    r1.wait(j.id, 10)
+    r1._save(force=True)  # noqa: SLF001
+    assert JobRunner(state, None).get(j.id).settings == snap and j.info()["settings"] == snap
+    r1.shutdown()
+
+
+def test_interrupted_records_older_than_two_weeks_are_forgotten_at_load(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    def ago(days: float) -> str:
+        return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+
+    def rec(i: str, state: str, created: str, finished: str | None) -> dict:
+        return jobs.JobRecord(id=i, kind="full", title_key="jobs.full", project="demo", state=state, created=created, finished=finished).info(with_log=True)
+
+    state = tmp_path / "jobs.json"
+    state.write_text(json.dumps([
+        rec("stale", "interrupted", ago(40), ago(15)),  # interrupted 15 days ago: gone
+        rec("stale_no_finish", "interrupted", ago(20), None),  # no finish time: judged by created
+        rec("fresh", "interrupted", ago(40), ago(13)),
+        rec("old_done", "done", ago(60), ago(60)),  # only interrupted records expire
+        rec("was_running", "running", ago(30), None),  # active when the app died: interrupted NOW, so it is fresh
+    ]), encoding="utf-8")
+    r = JobRunner(state, None)
+    assert {j.id for j in r.list()} == {"fresh", "old_done", "was_running"}
+    assert r.get("was_running").state == "interrupted"
+    assert {j["id"] for j in json.loads(state.read_text(encoding="utf-8"))} == {"fresh", "old_done", "was_running"}  # forgetting is persisted
+    r.shutdown()
+
+
+def test_add_warnings_appends_without_duplicates() -> None:
+    r = JobRunner(None, None)
+    seen: list[int] = []
+    w = {"kind": "unavailable", "stage": "score", "group": "cer", "reason": "r"}
+
+    def fn(ctx: jobs.JobContext) -> dict:
+        ctx.set_result(warnings=[{"kind": "settings_changed", "keys": "gpu_budget_gb"}])
+        seen.append(ctx.add_warnings([w, w, {"kind": "settings_changed", "keys": "gpu_budget_gb"}]))
+        seen.append(ctx.add_warnings([w]))
+        return {"n": 1}
+
+    job = r.submit("stage", fn)
+    r.wait(job.id, 10)
+    assert seen == [1, 0]
+    assert job.result["warnings"] == [{"kind": "settings_changed", "keys": "gpu_budget_gb"}, w]
+    assert job.result["n"] == 1  # the flow's own result went in beside them
     r.shutdown()
 
 
