@@ -8,4 +8,4 @@
 | 0.5.0 | Round 5: models don't silently end up running from system RAM |
 | 0.6.0 | Round 6: the Cancel button works everywhere: model processes are killed at once, the translate stage has progress, pause and cancel, the button shows "Cancelling..." |
 | 0.6.1 | Round 6.1: translation runs once (step 2); the preview and the full run no longer translate again |
-| 0.6.2 | Round 6.2: the time estimate is honest: cached results and pauses no longer skew it, stages are added up per line, the first estimate comes from the previous run |
+| 0.6.2 | Round 6.2: the time estimate is honest: the speed is the average since the stage began (model loading and the wait for a batch count), shown in lines a minute; cached results and pauses no longer skew it, stages are added up per line, the first estimate comes from the previous run |

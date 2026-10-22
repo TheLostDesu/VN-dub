@@ -29,36 +29,52 @@ def wait_until(pred, timeout: float = 10.0, step: float = 0.02) -> None:
 # ----------------------------------------------------------------------------
 
 
-def test_eta_needs_measurements_then_converges() -> None:
-    e = EtaEstimator(alpha=0.5, min_items=2)
+def test_eta_needs_measurements_then_averages() -> None:
+    e = EtaEstimator(min_items=2)
     assert e.update(0, 10, now=0.0) is None
     assert e.update(1, 10, now=2.0) is None  # one item measured: not enough
     eta = e.update(2, 10, now=4.0)  # 2 s per item, 8 left
     assert eta == pytest.approx(16.0)
     assert e.rate_per_min == pytest.approx(30.0)
-    # the EMA follows a change of speed; a chunk of 2 items weighs as two steps
-    e.update(4, 10, now=6.0)  # 1 s per item
-    assert e.sec_per_item == pytest.approx(0.75 * 1.0 + 0.25 * 2.0)
+    e.update(4, 10, now=6.0)  # faster for a moment: the average since the start is 6 s / 4
+    assert e.sec_per_item == pytest.approx(1.5)
     assert e.eta(10, 10) == 0.0
 
 
-def test_eta_resets_when_progress_goes_backwards() -> None:
+def test_eta_counts_the_wait_before_the_first_batch() -> None:
+    e = EtaEstimator()
+    e.reset(now=0.0)  # the stage began; nothing reported while the model loads and thinks
+    e.update(16, 100, now=300.0)  # 5 minutes, then a batch of 16 lines
+    assert e.rate_per_min == pytest.approx(3.2)
+    assert e.eta(16, 100) == pytest.approx(84 * 300 / 16)
+
+
+def test_eta_batches_landing_together_do_not_look_fast() -> None:
+    e = EtaEstimator()
+    e.reset(now=0.0)
+    e.update(16, 64, now=300.0)  # two scenes in parallel finish their batches a second apart
+    e.update(32, 64, now=301.0)
+    assert e.rate_per_min == pytest.approx(32 / 301 * 60)
+
+
+def test_eta_new_pass_keeps_the_clock() -> None:
     e = EtaEstimator(min_items=1)
     e.update(0, 5, now=0.0)
     e.update(3, 5, now=3.0)
     assert e.eta(3, 5) == pytest.approx(2.0)
-    e.update(0, 5, now=10.0)  # a new pass (regen round): the clock restarts, the average stays
-    assert e._done_last == 0 and e._t_last == 10.0  # noqa: SLF001
+    e.update(0, 5, now=10.0)  # a new pass (regen round): the count restarts, the 7 s between were work
+    e.update(1, 5, now=11.0)
+    assert e.sec_per_item == pytest.approx(11.0 / 4)
     assert e.eta(0, 0) is None
 
 
 def test_eta_ignores_cached_scan_and_pauses() -> None:
-    e = EtaEstimator(alpha=0.5, min_items=2)
-    e.update(0, 100, now=0.0)
+    e = EtaEstimator(min_items=2)
+    e.reset(now=0.0)
     e.update(60, 100, now=0.05)  # 60 cached results found at once: not throughput
     assert e.sec_per_item is None and e.eta(60, 100) is None
-    e.update(61, 100, now=2.05)
-    e.update(62, 100, now=4.05)  # 2 s per item, 38 left
+    e.update(61, 100, now=2.0)  # the scan's 0.05 s goes to this item
+    e.update(62, 100, now=4.0)
     assert e.eta(62, 100) == pytest.approx(76.0)
     e.rebase(now=1000.0)  # paused for a long time
     e.update(63, 100, now=1002.0)
@@ -77,6 +93,24 @@ def test_throughput_store_persists_and_estimates(tmp_path: Path) -> None:
     assert ts.get("synth") == pytest.approx(3.0)
     again = ThroughputStore(p)
     assert again.get("synth") == pytest.approx(3.0) and again.get("score") == pytest.approx(1.0)
+
+
+def test_job_rate_is_lines_not_candidates() -> None:
+    r = JobRunner(None, None)
+    seen: list[float | None] = []
+
+    def fn(ctx: jobs.JobContext) -> None:
+        ctx.set_stages(["synth"], n_items=5)  # 5 lines, 2 candidates each
+        ctx.begin_stage("synth")
+        ctx.eta.reset(now=time.monotonic() - 60.0)  # the stage has worked a minute
+        ctx.progress(4, 10, "c4")
+        seen.append(ctx.job.rate_per_min)
+
+    job = r.submit("stage", fn)
+    r.wait(job.id, 10)
+    assert job.state == "done"
+    assert seen[0] == pytest.approx(2.0, rel=0.05)  # 4 candidates a minute = 2 lines a minute
+    r.shutdown()
 
 
 def test_job_progress_reports_eta_and_whole_job_estimate() -> None:

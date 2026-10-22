@@ -11,7 +11,7 @@
 * A job that runs a child process (``uv``, ``make_envs``, ``vc_redist``) registers it with
   :meth:`JobContext.watch_process`: cancelling the job (the Cancel button, or the app closing)
   kills the whole process tree at once instead of waiting for its next line of output.
-* ETA: :class:`EtaEstimator` (EMA of seconds per item inside the current stage) plus
+* ETA: :class:`EtaEstimator` (average seconds per item since the current stage began) plus
   :class:`ThroughputStore` (measured seconds per line for every stage, persisted in
   ``<data>/throughput_v2.json``) for the stages still ahead.
 * Records are persisted to ``<data>/jobs.json``; jobs that were active when the app
@@ -56,61 +56,74 @@ class JobCancelled(Exception):
 
 
 class EtaEstimator:
-    """Remaining time of the current stage from measured per-item throughput.
+    """Remaining time of the current stage from its measured throughput.
 
-    Keeps an exponential moving average of seconds per item over progress updates (a chunk of
-    several items weighs as much as that many single steps); returns ``None`` until ``min_items``
-    items were measured. Items that "finish" at once (a scan of cached results at the start of a
-    stage) are not throughput: they move the baseline but are not measured.
+    The speed is the plain average since the stage began: all the time the stage has worked
+    (model loading, the wait for the first batch, gaps between batches) divided by the items it
+    finished. A stage that thinks 5 minutes and then reports a batch of 16 lines runs at
+    3.2 lines a minute, not at the speed of the moment the batch arrived; batches that land
+    close together (``llm.parallel`` > 1) don't make it look faster either.
+
+    Not counted: the time the job was paused (:meth:`rebase`), and items that "finish" at once
+    (cached results found by a scan): those are not throughput, and the time the scan took goes
+    to the next real items. Returns ``None`` until ``min_items`` items were measured.
     """
 
     INSTANT_S_PER_ITEM = 0.01
 
-    def __init__(self, alpha: float = 0.3, min_items: int = 2) -> None:
-        self.alpha = alpha
+    def __init__(self, min_items: int = 2) -> None:
         self.min_items = min_items
         self.reset()
 
-    def reset(self) -> None:
-        self._t_last: float | None = None
+    def reset(self, now: float | None = None) -> None:
+        """Start over; with ``now`` the clock starts at once (the stage began), else at the first update."""
+        self._t_last: float | None = now
         self._done_last = 0
         self._measured = 0
-        self.sec_per_item: float | None = None
+        self._work_s = 0.0
 
     def rebase(self, now: float | None = None) -> None:
         """Forget the time since the last update (the job was paused): it was not work."""
         if self._t_last is not None:
             self._t_last = time.monotonic() if now is None else now
 
+    @property
+    def sec_per_item(self) -> float | None:
+        if self._measured <= 0:
+            return None
+        return self._work_s / self._measured
+
     def update(self, done: int, total: int, now: float | None = None) -> float | None:
         now = time.monotonic() if now is None else now
-        if self._t_last is None or done < self._done_last:
+        if self._t_last is None:
             self._t_last, self._done_last = now, done
+            return self.eta(done, total)
+        if done < self._done_last:  # a new pass (regen round): the clock keeps running, the count restarts
+            self._done_last = done
             return self.eta(done, total)
         delta = done - self._done_last
         if delta > 0:
             dt = now - self._t_last
-            if delta == 1 or dt / delta >= self.INSTANT_S_PER_ITEM:
-                spi = dt / delta
-                if self.sec_per_item is None:
-                    self.sec_per_item = spi
-                else:
-                    a = 1 - (1 - self.alpha) ** delta
-                    self.sec_per_item = a * spi + (1 - a) * self.sec_per_item
+            if delta > 1 and dt / delta < self.INSTANT_S_PER_ITEM:
+                self._done_last = done  # cached: not measured, the clock is not moved
+            else:
+                self._work_s += dt
                 self._measured += delta
-            self._t_last, self._done_last = now, done
+                self._t_last, self._done_last = now, done
         return self.eta(done, total)
 
     def eta(self, done: int, total: int) -> float | None:
-        if self.sec_per_item is None or self._measured < self.min_items or total <= 0:
+        spi = self.sec_per_item
+        if spi is None or self._measured < self.min_items or total <= 0:
             return None
-        return max(0.0, (total - done) * self.sec_per_item)
+        return max(0.0, (total - done) * spi)
 
     @property
     def rate_per_min(self) -> float | None:
-        if not self.sec_per_item:
+        spi = self.sec_per_item
+        if not spi or self._measured < self.min_items:
             return None
-        return 60.0 / self.sec_per_item
+        return 60.0 / spi
 
 
 class ThroughputStore:
@@ -291,8 +304,8 @@ class JobContext:
         self._finish_stage()
         stages = self.job.stages or [name]
         idx = stages.index(name) + 1 if name in stages else self.job.stage_index + 1
-        self.eta.reset()
         self._stage_t0 = time.monotonic()
+        self.eta.reset(self._stage_t0)  # the time before the first report (loading a model) is the stage's too
         self.runner._update(self.job, stage=name, stage_index=idx, done=0, total=0, item=None, stage_eta_s=None, force=True)
         self.checkpoint()
 
@@ -311,9 +324,10 @@ class JobContext:
             ahead = self.job.stages[self.job.stages.index(self.job.stage) + 1 :]
             rest = self.runner.throughput.estimate(ahead, self.n_items_hint)
             eta = stage_eta + rest if rest is not None else stage_eta
-        self.runner._update(
-            self.job, done=done, total=total, item=item, stage_eta_s=stage_eta, eta_s=eta, rate_per_min=self.eta.rate_per_min
-        )
+        rate = self.eta.rate_per_min
+        if rate is not None and self.n_items_hint > 0 and total > self.n_items_hint:
+            rate *= self.n_items_hint / total  # the stage counts candidates / parts: the UI shows lines a minute
+        self.runner._update(self.job, done=done, total=total, item=item, stage_eta_s=stage_eta, eta_s=eta, rate_per_min=rate)
         self.checkpoint()
 
     def stage_progress_cb(self) -> Callable[[str, int, int, str | None], None]:
@@ -553,6 +567,7 @@ class JobRunner:
                 self._update(job, state="cancelled", finished=now_iso(), force=True)
                 return
             self._update(job, state="running", started=now_iso(), force=True)
+            ctx.eta.reset(time.monotonic())  # a job without stages: its clock starts now
             res = fn(ctx)
             ctx._finish_stage()
             if res:
