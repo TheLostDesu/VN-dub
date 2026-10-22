@@ -123,10 +123,16 @@ class EtaEstimator:
 
     Not counted: the time the job was paused (:meth:`rebase`), and items that "finish" at once
     (cached results found by a scan): those are not throughput, and the time the scan took goes
-    to the next real items. "At once" is a wall time per item below ``INSTANT_S_PER_ITEM``, whether the scan reports
-    one item at a time or in a jump (after a restart every cached item is reported, and a thousand of them one by
-    one would otherwise look like a thousand lines in a few seconds). Returns ``None`` until ``min_items`` items were
-    measured.
+    to the next real items.
+
+    Cached or real is decided per *burst*: reports that follow each other closer than
+    ``INSTANT_S_PER_ITEM`` belong to the burst the first of them opened, and the burst is work
+    when its whole time (the gap before it plus its own spread) is at least ``INSTANT_S_PER_ITEM``
+    per item. A batch of 16 lines that took 5 minutes and is then reported line by line within a
+    few milliseconds is 16 lines of work; a thousand cached items reported one by one in a second
+    (after a restart) are a scan. Judging each report alone would call the 15 lines after the
+    first of a batch "cached" and leave the batch's whole time on one line. Returns ``None``
+    until ``min_items`` items were measured.
     """
 
     INSTANT_S_PER_ITEM = 0.05
@@ -137,32 +143,53 @@ class EtaEstimator:
 
     def reset(self, now: float | None = None) -> None:
         """Start over; with ``now`` the clock starts at once (the stage began), else at the first update."""
-        self._t_last: float | None = now  # where the work time counted so far ends (cached items do not move it)
-        self._t_report = now  # when the count last changed: a cached item is judged by the gap to the one before it
+        self._t_last: float | None = now  # where the committed work time ends (cached bursts do not move it)
+        self._t_report = now  # the last report that changed the count
         self._done_last = 0
-        self._measured = 0
+        self._measured = 0  # committed: bursts already closed
         self._work_s = 0.0
+        self._b_ref = now  # the open burst: when the gap before it began, its items, when it last grew
+        self._b_n = 0
+        self._b_end = now
+
+    def _burst_is_work(self) -> bool:
+        if self._b_n <= 0 or self._b_ref is None or self._b_end is None:
+            return False
+        return (self._b_end - self._b_ref) / self._b_n >= self.INSTANT_S_PER_ITEM
+
+    def _close_burst(self) -> None:
+        if self._burst_is_work() and self._t_last is not None and self._b_end is not None:
+            self._work_s += self._b_end - self._t_last
+            self._measured += self._b_n
+            self._t_last = self._b_end
+        self._b_n = 0  # a cached burst leaves the clock where it was: its time goes to the next real items
 
     def rebase(self, now: float | None = None) -> None:
         """Forget the time since the last update (the job was paused): it was not work."""
         if self._t_last is not None:
-            self._t_last = self._t_report = time.monotonic() if now is None else now
+            self._close_burst()
+            now = time.monotonic() if now is None else now
+            self._t_last = self._t_report = self._b_ref = self._b_end = now
 
     @property
     def measured(self) -> int:
         """Items that counted as work (cached results found at once are not among them)."""
-        return self._measured
+        return self._measured + (self._b_n if self._burst_is_work() else 0)
 
     @property
     def sec_per_item(self) -> float | None:
-        if self._measured <= 0:
+        n = self.measured
+        if n <= 0:
             return None
-        return self._work_s / self._measured
+        work = self._work_s
+        if self._burst_is_work() and self._b_end is not None and self._t_last is not None:
+            work += self._b_end - self._t_last
+        return work / n
 
     def update(self, done: int, total: int, now: float | None = None) -> float | None:
         now = time.monotonic() if now is None else now
         if self._t_last is None:
-            self._t_last = self._t_report = now
+            self._t_last = self._t_report = self._b_ref = self._b_end = now
             self._done_last = done
             return self.eta(done, total)
         if done < self._done_last:  # a new pass (regen round): the clock keeps running, the count restarts
@@ -170,28 +197,25 @@ class EtaEstimator:
             return self.eta(done, total)
         delta = done - self._done_last
         if delta > 0:
-            # Cached or real is decided by the gap to the previous report, not to the last measured item: a thousand
-            # cached items reported one by one each look instant, however long the scan took in all.
-            gap = now - (self._t_report if self._t_report is not None else self._t_last)
-            self._t_report = now
-            if gap / delta < self.INSTANT_S_PER_ITEM:
-                self._done_last = done  # cached: not measured, the work clock is not moved (the scan's time goes to the next real item)
-            else:
-                self._work_s += now - self._t_last
-                self._measured += delta
-                self._t_last, self._done_last = now, done
+            prev = self._t_report if self._t_report is not None else self._t_last
+            if now - prev >= self.INSTANT_S_PER_ITEM or self._b_n == 0:
+                self._close_burst()
+                self._b_ref = prev  # the burst's time starts where the gap before it began
+            self._b_n += delta
+            self._b_end = self._t_report = now
+            self._done_last = done
         return self.eta(done, total)
 
     def eta(self, done: int, total: int) -> float | None:
         spi = self.sec_per_item
-        if spi is None or self._measured < self.min_items or total <= 0:
+        if spi is None or self.measured < self.min_items or total <= 0:
             return None
         return max(0.0, (total - done) * spi)
 
     @property
     def rate_per_min(self) -> float | None:
         spi = self.sec_per_item
-        if not spi or self._measured < self.min_items:
+        if not spi or self.measured < self.min_items:
             return None
         return 60.0 / spi
 

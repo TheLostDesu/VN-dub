@@ -152,6 +152,26 @@ def test_eta_cached_items_reported_one_by_one_are_not_work() -> None:
     assert e.rate_per_min == pytest.approx(60 / 3.5)
 
 
+def test_eta_a_batch_reported_line_by_line_is_all_work() -> None:
+    """128 lines in 30 minutes, in batches of 16 each reported line by line a millisecond apart: 4.3 lines a minute."""
+    e = EtaEstimator(min_items=2)
+    e.reset(now=0.0)
+    done = 0
+    for b in range(1, 9):
+        t = b * 225.0  # one batch every 3 min 45 s
+        for k in range(16):
+            done += 1
+            e.update(done, 1000, now=t + k * 0.001)
+    assert e.measured == 128
+    assert e.rate_per_min == pytest.approx(128 / (1800.015 / 60), rel=0.01)
+    # mid-batch the speed is already the batch's, not one line's
+    m = EtaEstimator(min_items=2)
+    m.reset(now=0.0)
+    for k in range(1, 9):
+        m.update(k, 100, now=300.0 + k * 0.001)
+    assert m.measured == 8 and m.rate_per_min == pytest.approx(8 / 5.0, rel=0.01)
+
+
 def test_eta_a_slow_cached_scan_is_still_cached() -> None:
     e = EtaEstimator(min_items=2)
     e.reset(now=0.0)
