@@ -626,8 +626,8 @@ def test_21_preview_first_scene_can_be_cancelled(flow: Flow) -> None:
 def test_22_full_run(flow: Flow) -> None:
     flow.needs("preview")
     j = flow.job("/api/run/full", {"shutdown_when_done": False}, timeout=600)
-    assert j["kind"] == "full" and j["stages"] == ["translate", "text_emotion", "voicebank", "synth", "score", "master", "pack", "report"]
-    assert j["stage_index"] == 8 and j["result"]["shutdown"] is False and sum(j["result"]["score"].values()) >= 26
+    assert j["kind"] == "full" and j["stages"] == ["voicebank", "synth", "score", "master", "pack", "report"]
+    assert j["stage_index"] == 6 and j["result"]["shutdown"] is False and sum(j["result"]["score"].values()) >= 26
     assert j["stage"] == "report" and j["state"] == "done" and j["error"] is None
     st = flow.get("/api/project")["stage_status"]
     for stage in ("translate", "voicebank", "synth", "score", "master", "pack", "report"):

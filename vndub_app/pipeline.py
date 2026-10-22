@@ -371,8 +371,9 @@ def _build_stage(slug: str, p: dict[str, Any]) -> FlowFn:
 # Step 4/5: preview and the full run
 # ----------------------------------------------------------------------------
 
-PREVIEW_STAGES = ["translate", "text_emotion", "voicebank", "synth", "score", "master"]
-FULL_STAGES = ["translate", "text_emotion", "voicebank", "synth", "score", "master", "pack", "report"]
+# translation (translate + text_emotion) is step 2 and is not repeated by the preview or the full run
+PREVIEW_STAGES = ["voicebank", "synth", "score", "master"]
+FULL_STAGES = ["voicebank", "synth", "score", "master", "pack", "report"]
 
 
 @flow("preview", heavy=True)

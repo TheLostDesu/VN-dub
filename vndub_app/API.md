@@ -163,9 +163,9 @@ the job's `result` when `state == "done"`. Audio URLs are always produced by the
 | POST | `/api/characters/{sid}/tuning/apply-similar` | → `{updated: [sid]}` (same gender + age_hint) |
 
 ### Preview — Step 4, full run — Step 5 (S)
-| POST | `/api/preview/run` | `{mode: first_scene|first_n, n: 40}` → Job (translate, text_emotion, voicebank, synth, score, master — only those lines) |
+| POST | `/api/preview/run` | `{mode: first_scene|first_n, n: 40}` → Job (voicebank, synth, score, master — only those lines; translation is not repeated) |
 | GET | `/api/preview/items` | `{line_ids, items: [{line_id, speaker_id, name, text_src, text_tgt, original_url|null, dub_url|null, status}]}` |
-| POST | `/api/run/full` | `{shutdown_when_done: bool}` → Job (translate … report, regen loop) |
+| POST | `/api/run/full` | `{shutdown_when_done: bool}` → Job (voicebank … report, regen loop; translation is not repeated) |
 | GET | `/api/gpu` | `{name, total_gb, used_gb}` or `{available: false}` |
 
 ### Review — Step 6 (S)
