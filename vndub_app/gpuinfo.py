@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
 import threading
 import time
 from typing import Any
+
+from vndub.gpu import find_nvidia_smi
 
 _LOCK = threading.Lock()
 _CACHE: tuple[float, dict[str, Any] | None] = (0.0, None)
@@ -15,7 +16,7 @@ _TTL_S = 1.0
 
 
 def available() -> bool:
-    return shutil.which("nvidia-smi") is not None
+    return find_nvidia_smi() is not None
 
 
 def query(max_age: float = _TTL_S) -> dict[str, Any] | None:
@@ -25,7 +26,7 @@ def query(max_age: float = _TTL_S) -> dict[str, Any] | None:
         t, val = _CACHE
         if time.monotonic() - t < max_age:
             return val
-    exe = shutil.which("nvidia-smi")
+    exe = find_nvidia_smi()
     val = None
     if exe:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform.startswith("win") else 0

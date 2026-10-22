@@ -1,15 +1,16 @@
-"""Diagnostics ("Doctor", wizard step 0): green / yellow / red rows with a fix where one exists.
+r"""Diagnostics ("Doctor", wizard step 0): green / yellow / red rows with a fix where one exists.
 
 ``GET  /api/doctor``                   ``{summary, gpu, rows, torch, mock, profile, data_dir}``
-``POST /api/doctor/fix/{action}``      ``download_ffmpeg`` (Job) | ``open_data_dir`` | ``open_driver_page``
-                                      | ``add_defender_exclusion_help`` (``{ok, ...}``)
+``POST /api/doctor/fix/{action}``      ``download_ffmpeg`` (Job) | ``install_vcredist`` (Job) | ``open_data_dir``
+                                      | ``open_driver_page`` | ``open_vcredist_page`` | ``add_defender_exclusion_help``
+                                      (``{ok, ...}``)
 
 The router carries full ``/api/...`` paths; include it without a prefix.
 
-Rows (ids): ``gpu driver vram disk ffmpeg internet defender envs models``. Each row is
+Rows (ids): ``gpu driver vram disk ffmpeg vcredist git internet defender envs models``. Each row is
 ``{id, status: green|yellow|red, value, params, fix: {action, label_key}|null}``; the UI shows
 ``doctor.<id>.title`` and ``doctor.<id>.<status>`` interpolated with ``params``. The backend sends
-no display text. ``fix.action`` is either one of the four fix actions above (button label
+no display text. ``fix.action`` is either one of the fix actions above (button label
 ``doctor.fix.<action>``) or a navigation action from ``errors.ACTIONS`` (``open_tools`` /
 ``open_models``, label ``actions.<action>``).
 
@@ -21,6 +22,12 @@ Thresholds (also in docs/decisions/O.md):
   12.1..12.8 (older wheels only), red below 12.1 / no driver.
 * Disk: needed = what is still to download for the default setup (+10 GB working room);
   green >= needed, yellow >= 60 % of it, red below.
+* Visual C++ runtime (Windows only): green when HKLM (64-bit view) ``SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64``
+  says ``Installed=1`` with 14.40 or newer (binaries built with VS 2022 17.10+ need that), or when ``msvcp140.dll`` and
+  ``vcruntime140_1.dll`` in System32 are 14.40+; red otherwise (no model starts without it). The fix runs the
+  ``redist\vc_redist.x64.exe`` next to ``VNDub.exe`` (a job), or, without that file (a dev run), opens Microsoft's page.
+* Git: green when ``git`` is on PATH or bundled (``git\cmd\git.exe`` next to ``VNDub.exe``); yellow otherwise, naming the
+  envs whose installation clones repositories.
 
 Every probe is injectable (:class:`Probes`) so tests need neither a GPU nor a network. The Windows
 Defender row is a manual card: the app never changes security settings, it only shows the command.
@@ -63,11 +70,16 @@ CUDA_GREEN = (12, 8)
 CUDA_MIN = (12, 1)
 WORK_ROOM_GB = 10.0
 ENV_ESTIMATE_GB = 4.0
+ENV_ESTIMATE_BY_NAME_GB = {"main": 9.0}  # torch cu128 + the asr/hf/score packages in one venv; the others are smaller
 DISK_YELLOW_SHARE = 0.6
 DISK_FLOOR_GB = 8.0
 
-FIX_ACTIONS = ("download_ffmpeg", "open_data_dir", "open_driver_page", "add_defender_exclusion_help")
-ROW_IDS = ("gpu", "driver", "vram", "disk", "ffmpeg", "internet", "defender", "envs", "models")
+VC_REG_KEY = r"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+VC_MIN = (14, 40)  # binaries built with VS 2022 17.10+ (llama.cpp b11469, torch 2.8) need runtime 14.40+
+VC_DLLS = ("msvcp140.dll", "vcruntime140_1.dll")
+
+FIX_ACTIONS = ("download_ffmpeg", "install_vcredist", "open_data_dir", "open_driver_page", "open_vcredist_page", "add_defender_exclusion_help")
+ROW_IDS = ("gpu", "driver", "vram", "disk", "ffmpeg", "vcredist", "git", "internet", "defender", "envs", "models")
 
 
 # ----------------------------------------------------------------------------
@@ -188,6 +200,115 @@ def probe_profile() -> str:
 
 
 @dataclass
+class VcRuntime:
+    """What :func:`decide_vcruntime` found: ``ok`` = 14.40 or newer is there; ``version`` = ``"14.44.35211"`` (or ``None``)."""
+
+    ok: bool
+    version: str | None
+    source: str  # registry | files | none
+    applicable: bool = True
+
+
+def _fmt_version(v: tuple[int, ...]) -> str:
+    return ".".join(str(x) for x in v[:3])
+
+
+def decide_vcruntime(reg: Callable[[str], int | None], dll_version: Callable[[str], tuple[int, int, int, int] | None]) -> VcRuntime:
+    """Is the Visual C++ 2015-2022 runtime there and new enough?
+
+    ``reg(name)`` reads a DWORD of the ``Runtimes\\x64`` key, ``dll_version(name)`` the file version of a System32 DLL
+    (both injectable for tests). The registry decides; the DLLs are the fallback when it says nothing useful.
+    """
+    major, minor = reg("Major"), reg("Minor")
+    registry: tuple[int, int, int] | None = None
+    if reg("Installed") == 1 and major is not None and minor is not None:
+        registry = (major, minor, reg("Bld") or 0)
+        if (major, minor) >= VC_MIN:
+            return VcRuntime(True, _fmt_version(registry), "registry")
+    dlls = [dll_version(n) for n in VC_DLLS]  # the registry value can be missing although the files are there
+    if all(v is not None and v[:2] >= VC_MIN for v in dlls):
+        return VcRuntime(True, _fmt_version(min(v for v in dlls if v)), "files")
+    if registry is not None:
+        return VcRuntime(False, _fmt_version(registry), "registry")
+    found = [v for v in dlls if v]
+    if found:
+        return VcRuntime(False, _fmt_version(min(found)), "files")
+    return VcRuntime(False, None, "none")
+
+
+def _read_vc_registry() -> dict[str, int]:
+    import winreg
+
+    out: dict[str, int] = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, VC_REG_KEY, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+            for name in ("Installed", "Major", "Minor", "Bld"):
+                try:
+                    value, kind = winreg.QueryValueEx(key, name)
+                except OSError:
+                    continue
+                if kind == winreg.REG_DWORD:
+                    out[name] = int(value)
+    except OSError:
+        pass
+    return out
+
+
+def _file_version(path: str) -> tuple[int, int, int, int] | None:
+    """``FileVersion`` of a PE file (version.dll); ``None`` when the file is missing or has no version resource."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        ver = ctypes.WinDLL("version", use_last_error=True)  # type: ignore[attr-defined]
+        ver.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+        ver.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+        ver.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+        ver.GetFileVersionInfoW.restype = wintypes.BOOL
+        ver.VerQueryValueW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT)]
+        ver.VerQueryValueW.restype = wintypes.BOOL
+        size = ver.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not ver.GetFileVersionInfoW(path, 0, size, buf):
+            return None
+        ptr, length = ctypes.c_void_p(), wintypes.UINT()
+        if not ver.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(length)) or not ptr.value or length.value < 16:
+            return None
+        info = (wintypes.DWORD * 4).from_address(ptr.value)  # VS_FIXEDFILEINFO: signature, struct version, FileVersionMS, FileVersionLS
+        ms, ls = info[2], info[3]
+        return (ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def probe_vcredist() -> VcRuntime:
+    """Registry first (HKLM, 64-bit view), then the DLLs in System32; not applicable off Windows."""
+    if not sys.platform.startswith("win"):
+        return VcRuntime(True, None, "none", applicable=False)
+    sysdir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    return decide_vcruntime(_read_vc_registry().get, lambda name: _file_version(str(sysdir / name)))
+
+
+def probe_vcredist_bundled() -> bool:
+    """Is the redistributable the installer carries (``redist\\vc_redist.x64.exe`` next to ``VNDub.exe``) there to run?"""
+    from vndub_app import installer
+
+    return installer.bundled_vcredist() is not None
+
+
+def probe_git() -> dict[str, Any]:
+    """``{path, source: system|bundled|None, frozen, envs}``: PATH first, then the MinGit next to ``VNDub.exe``."""
+    from vndub_app import installer
+
+    found = installer.find_git()
+    bundled = installer.bundled_git()
+    source = None if found is None else ("bundled" if bundled is not None and found == bundled else "system")
+    return {"path": str(found) if found else None, "source": source, "frozen": bool(getattr(sys, "frozen", False)), "envs": installer.envs_using_git()}
+
+
+@dataclass
 class Probes:
     """Everything Doctor looks at; replace any field in tests."""
 
@@ -195,6 +316,9 @@ class Probes:
     disk_free_gb: Callable[[Path], float] = probe_disk_free_gb
     internet: Callable[[], bool] = probe_internet
     tools: Callable[[], dict[str, dict[str, Any]]] = probe_tools
+    vcredist: Callable[[], VcRuntime] = probe_vcredist
+    vcredist_bundled: Callable[[], bool] = probe_vcredist_bundled
+    git: Callable[[], dict[str, Any]] = probe_git
     envs: Callable[[], dict[str, Any]] = probe_envs
     models: Callable[[], dict[str, Any]] = probe_models
     data_dir: Callable[[], Path] = appdirs.data_dir
@@ -288,8 +412,10 @@ def row_vram(g: GpuInfo | None) -> dict[str, Any]:
 
 
 def disk_need_gb(models: dict[str, Any], envs: dict[str, Any]) -> float:
-    missing_envs = len(envs.get("needed", [])) - len(envs.get("present", []))
-    return round(float(models.get("default_missing_gb", 0.0)) + max(0, missing_envs) * ENV_ESTIMATE_GB + WORK_ROOM_GB, 1)
+    present = set(envs.get("present", []))
+    missing = [e for e in envs.get("needed", []) if e not in present]
+    envs_gb = sum(ENV_ESTIMATE_BY_NAME_GB.get(e, ENV_ESTIMATE_GB) for e in missing)
+    return round(float(models.get("default_missing_gb", 0.0)) + envs_gb + WORK_ROOM_GB, 1)
 
 
 def row_disk(free_gb: float, need_gb: float, drive: str) -> dict[str, Any]:
@@ -307,6 +433,29 @@ def row_ffmpeg(tools: dict[str, dict[str, Any]]) -> dict[str, Any]:
     if not missing:
         return _row("ffmpeg", "green", tools.get("ffmpeg", {}).get("path"), {"path": tools.get("ffmpeg", {}).get("path") or ""})
     return _row("ffmpeg", "red", None, {"missing": ", ".join(missing)}, _fix("download_ffmpeg"))
+
+
+def row_vcredist(platform: str, rt: VcRuntime | None, bundled: bool) -> dict[str, Any]:
+    """Red without the Visual C++ runtime (no model starts); the fix runs the bundled redistributable, or opens Microsoft's page."""
+    if not platform.startswith("win") or (rt is not None and not rt.applicable):
+        return _row("vcredist", "green", None, {"applicable": False, "reason": "not_applicable"})
+    min_version = f"{VC_MIN[0]}.{VC_MIN[1]}"
+    if rt is None:  # the probe itself failed
+        return _row("vcredist", "yellow", None, {"min_version": min_version})
+    params = {"version": rt.version or "", "min_version": min_version, "source": rt.source, "bundled": bundled}
+    if rt.ok:
+        return _row("vcredist", "green", rt.version, params)
+    fix = _fix("install_vcredist") if bundled else _fix("open_vcredist_page")
+    return _row("vcredist", "red", rt.version, {**params, "reason": "too_old" if rt.version else "missing"}, fix)
+
+
+def row_git(g: dict[str, Any]) -> dict[str, Any]:
+    """Green when git is found (PATH or bundled); yellow, naming the envs that clone repositories, when it is not."""
+    envs = ", ".join(g.get("envs") or [])
+    if g.get("path"):
+        params: dict[str, Any] = {"path": g["path"], "source": g.get("source") or "system", "envs": envs}
+        return _row("git", "green", g["path"], {**params, "reason": "bundled"} if g.get("source") == "bundled" else params)
+    return _row("git", "yellow", None, {"envs": envs, **({"reason": "bundled_missing"} if g.get("frozen") else {})})
 
 
 def row_internet(ok: bool) -> dict[str, Any]:
@@ -376,14 +525,18 @@ def run_doctor(probes: Probes | None = None, *, refresh: bool = False) -> dict[s
     data_dir = _safe(probes.data_dir, appdirs.default_data_dir(), "data_dir")
     profile = _safe(probes.profile, "default", "profile")
     mock = profile in ("test", "apptest")
-    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="doctor") as pool:
+    with ThreadPoolExecutor(max_workers=9, thread_name_prefix="doctor") as pool:
         f_gpu = pool.submit(_safe, probes.gpu, None, "gpu")
         f_net = pool.submit(_safe, lambda: _cached_internet(probes, refresh), False, "internet")
         f_tools = pool.submit(_safe, probes.tools, {}, "tools")
         f_envs = pool.submit(_safe, probes.envs, {"needed": [], "present": []}, "envs")
         f_models = pool.submit(_safe, probes.models, {}, "models")
         f_disk = pool.submit(_safe, lambda: probes.disk_free_gb(Path(data_dir)), 0.0, "disk")
+        f_vc = pool.submit(_safe, probes.vcredist, None, "vcredist")
+        f_vcb = pool.submit(_safe, probes.vcredist_bundled, False, "vcredist_bundled")
+        f_git = pool.submit(_safe, probes.git, {"path": None, "source": None, "frozen": False, "envs": []}, "git")
         gpu, net, tools, envs, models, free = (f.result() for f in (f_gpu, f_net, f_tools, f_envs, f_models, f_disk))
+        vc, vc_bundled, git = (f.result() for f in (f_vc, f_vcb, f_git))
     drive = os.path.splitdrive(str(data_dir))[0] or str(data_dir)
     rows = [
         row_gpu(gpu),
@@ -391,6 +544,8 @@ def run_doctor(probes: Probes | None = None, *, refresh: bool = False) -> dict[s
         row_vram(gpu),
         row_disk(float(free), disk_need_gb(models, envs), drive),
         row_ffmpeg(tools),
+        row_vcredist(probes.platform, vc, bool(vc_bundled)),
+        row_git(git),
         row_internet(bool(net)),
         row_defender(probes.platform, Path(data_dir)),
         row_envs(envs, mock),
@@ -426,6 +581,10 @@ def apply_fix(action: str) -> dict[str, Any]:
         return {"ok": True, "path": str(data)}
     if action == "open_driver_page":
         return {"ok": True, "url": NVIDIA_DRIVER_URL}
+    if action == "open_vcredist_page":
+        from vndub_app import installer
+
+        return {"ok": True, "url": installer.VCREDIST_URL}
     if action == "add_defender_exclusion_help":
         return {
             "ok": True,
@@ -437,6 +596,12 @@ def apply_fix(action: str) -> dict[str, Any]:
         }
     from vndub_app import installer, jobs
 
+    if action == "install_vcredist":
+        exe = installer.bundled_vcredist()
+        if exe is None:  # the row offers this fix only while the file is there; it can have been deleted since
+            raise AppError("file_not_found", params={"path": r"redist\vc_redist.x64.exe"}, details="the bundled vc_redist.x64.exe was not found", status=404)
+        job = jobs.runner().submit("vcredist_install", lambda ctx: installer.install_vcredist(ctx), params={"file": str(exe)}, gpu=False)
+        return job.info()
     job = jobs.runner().submit("ffmpeg_download", lambda ctx: installer.install_tools(["ffmpeg"], ctx), params={"names": ["ffmpeg"]}, gpu=False)
     return job.info()
 

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -12,7 +16,7 @@ from typing import Any, Iterator
 import pytest
 from o_helpers import drop_runner, fresh_runner, make_env
 
-from vndub_app import appdirs, jobs, shell
+from vndub_app import appdirs, jobs, shell, winproc
 
 
 @pytest.fixture
@@ -339,3 +343,384 @@ def test_children_die_with_the_app(tmp_path: Path) -> None:
     if alive:
         subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
     assert not alive, "the child survived its parent"
+
+
+# ---- stop_jobs: one deadline for all jobs ---------------------------------------------------------------------------------------
+
+
+def test_stop_jobs_waits_one_shared_deadline_not_one_per_job(o_env: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Two jobs that never look at the cancel flag: closing the window must cost one timeout, not two."""
+    r = jobs.runner()
+    release = threading.Event()
+    started = threading.Barrier(3)
+
+    def deaf(ctx: Any) -> None:  # a model call that does not return: no checkpoint, no progress
+        started.wait(10)
+        release.wait(30)
+
+    a, b = r.submit("full", deaf, gpu=False), r.submit("full", deaf, gpu=False)
+    try:
+        started.wait(10)
+        caplog.set_level(logging.INFO, logger="vndub_app.shell")
+        t0 = time.monotonic()
+        stopped = shell.stop_jobs(timeout=1.0)
+        elapsed = time.monotonic() - t0
+        assert set(stopped) == {a.id, b.id}
+        assert 0.9 <= elapsed < 1.8, elapsed  # a per-job timeout would take 2 s
+        warning = next(rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING)
+        assert "2 of 2 job" in warning and a.id in warning and b.id in warning and "running" in warning  # the log says who was stuck
+    finally:
+        release.set()
+        r.wait(a.id, 10), r.wait(b.id, 10)
+
+
+def test_stop_jobs_does_not_wait_for_the_deadline_when_the_jobs_stop(o_env: Path) -> None:
+    """The deadline is shared, but jobs that stop in time are not waited for until it passes."""
+    r = jobs.runner()
+
+    def polite(ctx: Any) -> None:
+        while True:
+            ctx.checkpoint()
+            time.sleep(0.02)
+
+    for _ in range(3):
+        r.submit("full", polite, gpu=False)
+    time.sleep(0.2)
+    t0 = time.monotonic()
+    assert len(shell.stop_jobs(timeout=20.0)) == 3
+    assert time.monotonic() - t0 < 5  # cancelled together, not one after the other
+    assert all(j.state == "interrupted" for j in r.list())
+
+
+# ---- ending the process ---------------------------------------------------------------------------------------------------------
+
+
+class _Exited(Exception):
+    """What the replaced ``_hard_exit`` raises in the main thread: ``os._exit`` does not return either."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class ExitRecorder:
+    """Stands in for ``shell._hard_exit``: records (code, calling thread); only the main thread gets the exception."""
+
+    def __init__(self, events: list[str]) -> None:
+        self.calls: list[tuple[int, str]] = []
+        self.fired = threading.Event()
+        self.events = events
+
+    def __call__(self, code: int) -> None:
+        name = threading.current_thread().name
+        self.calls.append((code, name))
+        self.events.append(f"exit:{name}")
+        self.fired.set()
+        if threading.current_thread() is threading.main_thread():
+            raise _Exited(code)
+
+
+def _watchdogs() -> list[Any]:
+    return [t for t in threading.enumerate() if t.name == "vndub-exit-watchdog"]
+
+
+@pytest.fixture
+def main_env(o_env: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[ExitRecorder]:
+    """``shell.main`` runs in the test process: nothing global is touched and no real exit can happen."""
+    from vndub_app import webbuild
+
+    events: list[str] = []
+    rec = ExitRecorder(events)
+    real_stop_jobs = shell.stop_jobs
+
+    def spy_stop_jobs(*a: Any, **kw: Any) -> list[str]:
+        events.append("stop_jobs")
+        events.append(f"watchdog_alive_at_cleanup:{any(t.is_alive() for t in _watchdogs())}")
+        return real_stop_jobs(*a, **kw)
+
+    monkeypatch.setattr(shell, "_hard_exit", rec)
+    monkeypatch.setattr(shell, "stop_jobs", spy_stop_jobs)
+
+    def fake_logging_shutdown(handlers: Any = None) -> None:
+        if handlers is None:  # uvicorn's dictConfig calls logging.shutdown(handler_list) itself: only main's own call counts
+            events.append("logging.shutdown")
+
+    monkeypatch.setattr(logging, "shutdown", fake_logging_shutdown)
+    monkeypatch.setattr(winproc, "hide_child_consoles", lambda: (lambda: None))  # a global Popen patch / Job Object would outlive the test
+    monkeypatch.setattr(winproc, "kill_children_on_exit", lambda: True)
+    monkeypatch.setattr(webbuild, "ensure_built", lambda *a, **kw: {})  # never `npm run build` from a test
+    yield rec
+    for wd in _watchdogs():  # a leftover one would end the whole pytest run when it fires
+        wd.disarm()
+        wd.join(5)
+    assert not _watchdogs()
+
+
+def test_main_ends_the_process_directly_after_the_cleanup(main_env: ExitRecorder, o_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The regression: the exit used to be a sleeping thread created after main() had returned, i.e. one that never ran."""
+    from vndub_app import server
+
+    monkeypatch.setattr(server, "create_app", tiny_app)
+    with pytest.raises(_Exited) as e:
+        shell.main(["--browser", "--idle-exit", "1"])  # real server, real browser-mode loop; leaves when the "tab" is gone
+    assert e.value.code == 0
+    assert main_env.calls == [(0, "MainThread")]  # called directly and synchronously, not from a helper thread
+    assert main_env.events == ["stop_jobs", "watchdog_alive_at_cleanup:True", "logging.shutdown", "exit:MainThread"]
+    assert not (o_env / "app.instance.json").exists()  # the instance lock was released before the exit
+    (wd,) = _watchdogs()
+    assert wd.daemon and wd.is_alive()  # armed (it is the safety net) and not fired
+
+
+def test_main_without_hard_exit_returns_normally(main_env: ExitRecorder, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shell, "start_server_async", lambda *a, **kw: shell.ServerState())
+    monkeypatch.setattr(shell, "run_browser", lambda state, idle_exit_s, **kw: 7)
+    assert shell.main(["--browser"], hard_exit=False) == 7
+    assert main_env.calls == [] and _watchdogs() == []  # tests and `--selfcheck` style runs never get a watchdog or an exit
+    assert main_env.events[0] == "stop_jobs"
+
+
+def test_hard_exit_is_os_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[int] = []
+    monkeypatch.setattr(os, "_exit", seen.append)
+    shell._hard_exit(3)
+    assert seen == [3]
+
+
+def test_the_watchdog_forces_the_exit_when_the_cleanup_hangs(main_env: ExitRecorder, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shell, "start_server_async", lambda *a, **kw: shell.ServerState())
+    monkeypatch.setattr(shell, "run_browser", lambda state, idle_exit_s, **kw: 0)
+    monkeypatch.setattr(shell, "EXIT_WATCHDOG_S", 0.4)
+
+    def stuck(*a: Any, **kw: Any) -> list[str]:  # a job that never stops: waits until something ends the process
+        main_env.events.append("stop_jobs")
+        main_env.fired.wait(15)
+        return []
+
+    monkeypatch.setattr(shell, "stop_jobs", stuck)
+    t0 = time.monotonic()
+    with pytest.raises(_Exited):
+        shell.main(["--browser"])
+    assert main_env.calls[0] == (0, "vndub-exit-watchdog")  # the watchdog ended it while the cleanup was still stuck ...
+    assert 0.3 <= time.monotonic() - t0 < 10
+    assert main_env.calls[-1] == (0, "MainThread")  # ... (here the stuck step then returns and main's own exit follows)
+    assert main_env.events[:2] == ["stop_jobs", "exit:vndub-exit-watchdog"]
+
+
+def test_the_watchdog_can_be_disarmed_and_never_fires_early(monkeypatch: pytest.MonkeyPatch) -> None:
+    fired: list[int] = []
+    monkeypatch.setattr(shell, "_hard_exit", fired.append)
+    wd = shell._start_exit_watchdog(5, delay=30.0)
+    try:
+        assert wd.name == "vndub-exit-watchdog" and wd.daemon and wd.is_alive()
+        time.sleep(0.2)
+        assert fired == []
+    finally:
+        wd.disarm()
+        wd.join(5)
+    assert fired == [] and not wd.is_alive()
+    short = shell._start_exit_watchdog(9, delay=0.1)
+    short.join(10)
+    assert fired == [9]
+
+
+def test_a_crash_in_the_loop_still_cleans_up_and_exits_with_1(main_env: ExitRecorder, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shell, "start_server_async", lambda *a, **kw: shell.ServerState())
+
+    def boom(state: Any, idle_exit_s: Any, **kw: Any) -> int:
+        raise RuntimeError("the loop died")
+
+    monkeypatch.setattr(shell, "run_browser", boom)
+    with pytest.raises(_Exited) as e:
+        shell.main(["--browser"])
+    assert e.value.code == 1 and main_env.calls == [(1, "MainThread")] and main_env.events[0] == "stop_jobs"
+    main_env.events.clear()
+    with pytest.raises(RuntimeError):  # without hard_exit (tests) the error is not swallowed, the cleanup still ran
+        shell.main(["--browser"], hard_exit=False)
+    assert main_env.events[0] == "stop_jobs"
+
+
+def test_a_window_that_cannot_start_falls_back_to_the_browser_and_exits_the_same_way(main_env: ExitRecorder, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shell, "start_server_async", lambda *a, **kw: shell.ServerState())
+
+    def no_window(state: Any, debug: bool = False) -> int:
+        raise RuntimeError("no WebView2")
+
+    monkeypatch.setattr(shell, "run_window", no_window)
+    monkeypatch.setattr(shell, "run_browser", lambda state, idle_exit_s, **kw: 0)
+    with pytest.raises(_Exited) as e:
+        shell.main([])
+    assert e.value.code == 0 and main_env.events == ["stop_jobs", "watchdog_alive_at_cleanup:True", "logging.shutdown", "exit:MainThread"]
+
+
+def test_a_failing_cleanup_step_does_not_skip_the_next_ones(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    done: list[str] = []
+
+    def bad_jobs(*a: Any, **kw: Any) -> list[str]:
+        raise RuntimeError("jobs broke")
+
+    class State:
+        def stop(self) -> None:
+            done.append("server")
+
+    class Lock:
+        def release(self) -> None:
+            done.append("lock")
+
+    monkeypatch.setattr(shell, "stop_jobs", bad_jobs)
+    caplog.set_level(logging.WARNING, logger="vndub_app.shell")
+    shell._cleanup_for_exit(State(), Lock())  # type: ignore[arg-type]
+    assert done == ["server", "lock"] and "stopping jobs failed: jobs broke" in caplog.text
+
+
+# ---- the Job Object safety net: why it is missing, in app.log --------------------------------------------------------------------
+
+
+def test_job_object_status_has_the_documented_shape() -> None:
+    st = winproc.job_object_status()
+    assert set(st) == {"installed", "error"} and isinstance(st["installed"], bool)
+    assert st["error"] is None or isinstance(st["error"], str)
+
+
+def test_job_object_status_is_logged_as_info_or_warning(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="vndub_app.shell")
+    denied = "AssignProcessToJobObject failed: Access is denied. (error 5)"
+    for status, level, text in (
+        ({"installed": True, "error": None}, logging.INFO, "Job Object installed"),
+        ({"installed": False, "error": denied}, logging.WARNING, f"NOT installed ({denied})"),
+    ):
+        caplog.clear()
+        monkeypatch.setattr(winproc, "job_object_status", lambda status=status: status)
+        shell._log_job_object_status()
+        assert [(r.levelno, text in r.getMessage()) for r in caplog.records] == [(level, True)]
+    caplog.clear()
+    monkeypatch.setattr(winproc, "job_object_status", lambda: {"installed": False, "error": None})  # never tried (selfcheck, not Windows)
+    shell._log_job_object_status()
+    assert caplog.records == []
+
+
+def test_the_server_thread_logs_the_job_object_status_right_after_logging_is_set_up(o_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vndub_app import server
+
+    events: list[str] = []
+    real_setup = server.setup_logging
+
+    def setup() -> Any:
+        events.append("setup_logging")
+        return real_setup()
+
+    monkeypatch.setattr(server, "setup_logging", setup)
+    monkeypatch.setattr(shell, "_log_job_object_status", lambda: events.append("job_object_status"))
+    state = shell.start_server_async(0, app_factory=tiny_app)
+    try:
+        assert shell.wait_for_health(state, 30.0) == state.url
+        assert events == ["setup_logging", "job_object_status"]
+    finally:
+        state.stop()
+
+
+def _run_python(code: str) -> subprocess.CompletedProcess[str]:
+    repo = Path(__file__).resolve().parents[2]
+    return subprocess.run([sys.executable, "-c", f"import sys; sys.path.insert(0, r'{repo}')\n{code}"], capture_output=True, text=True, timeout=60)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Objects")
+def test_job_object_status_reports_installed_in_a_fresh_process() -> None:
+    p = _run_python(
+        "import json\n"
+        "from vndub_app import winproc\n"
+        "before = winproc.job_object_status()\n"
+        "ok = winproc.kill_children_on_exit()\n"
+        "print(json.dumps([before, ok, winproc.job_object_status(), winproc.JOB_OBJECT_ERROR]))\n"
+    )
+    assert p.returncode == 0, p.stderr
+    before, ok, after, error = json.loads(p.stdout.strip().splitlines()[-1])
+    assert before == {"installed": False, "error": None} and ok is True and after == {"installed": True, "error": None} and error is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Objects")
+def test_a_failing_job_object_records_the_step_and_the_windows_error() -> None:
+    """Make AssignProcessToJobObject fail with ERROR_ACCESS_DENIED (what a job that forbids nesting gives), then recover."""
+    p = _run_python(
+        "import ctypes, json\n"
+        "from vndub_app import winproc\n"
+        "real = ctypes.WinDLL\n"
+        "class Fake:\n"
+        "    def __init__(self, k32):\n"
+        "        self._k32 = k32\n"
+        "        def assign(*a):\n"
+        "            ctypes.set_last_error(5)\n"
+        "            return 0\n"
+        "        self.AssignProcessToJobObject = assign\n"
+        "    def __getattr__(self, name):\n"
+        "        return getattr(self._k32, name)\n"
+        "ctypes.WinDLL = lambda name, **kw: Fake(real(name, **kw))\n"
+        "failed = winproc.kill_children_on_exit()\n"
+        "status = winproc.job_object_status()\n"
+        "ctypes.WinDLL = real\n"
+        "recovered = winproc.kill_children_on_exit()\n"
+        "print(json.dumps([failed, status, recovered, winproc.job_object_status()]))\n"
+    )
+    assert p.returncode == 0, p.stderr
+    failed, status, recovered, final = json.loads(p.stdout.strip().splitlines()[-1])
+    assert failed is False and status["installed"] is False
+    assert "AssignProcessToJobObject" in status["error"] and "error 5" in status["error"]
+    assert recovered is True and final == {"installed": True, "error": None}  # the error is cleared by a later success
+
+
+def _pid_alive(pid: int) -> bool:
+    import ctypes
+
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    code = ctypes.c_ulong()
+    k32.GetExitCodeProcess(ctypes.c_void_p(h), ctypes.byref(code))
+    k32.CloseHandle(ctypes.c_void_p(h))
+    return code.value == 259  # STILL_ACTIVE
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Objects")
+def test_the_real_app_process_ends_at_once_and_takes_its_children_with_it(tmp_path: Path) -> None:
+    """End to end in a fresh process: a thread that never ends (a stand-in for pythonnet / WebView2) must not keep the app alive.
+
+    The old exit was a daemon thread that slept 10 s before ``os._exit``, so the process lived at least 10 s longer
+    than the ~3 s a clean run needs; the 10 s limit below tells the two apart.
+    """
+    repo = Path(__file__).resolve().parents[2]
+    code = (
+        "import subprocess, sys, threading, time\n"
+        f"sys.path.insert(0, r'{repo}')\n"
+        "from vndub_app import shell\n"
+        "threading.Thread(target=threading.Event().wait, daemon=False).start()\n"  # the interpreter could never finish on its own
+        "real = shell.run_browser\n"
+        "def run_browser(state, idle_exit_s, **kw):\n"
+        "    c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        "    print('child', c.pid, time.time(), flush=True)\n"
+        "    return real(state, idle_exit_s, **kw)\n"
+        "shell.run_browser = run_browser\n"
+        "sys.exit(shell.main(['--browser', '--idle-exit', '1']))\n"
+    )
+    env = {
+        **os.environ, "VNDUB_DATA": str(tmp_path / "data"), "VNDUB_APP_PROFILE": "apptest", "VNDUB_NO_BROWSER": "1",
+        "VNDUB_NO_WEB_BUILD": "1", "VNDUB_NO_SHUTDOWN": "1", "LOCALAPPDATA": str(tmp_path / "local"), "APPDATA": str(tmp_path / "roaming"),
+    }
+    p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    pid = 0
+    try:
+        out, err = p.communicate(timeout=60)
+        ended = time.time()
+        line = next(ln for ln in out.splitlines() if ln.startswith("child "))
+        pid, started = int(line.split()[1]), float(line.split()[2])
+        assert p.returncode == 0, err
+        assert ended - started < 10, ended - started  # ~3 s: health check + 1 s idle + cleanup; no sleeping exit thread
+        deadline = time.monotonic() + 10
+        while _pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not _pid_alive(pid), "the child survived the end of the app"
+    finally:
+        if p.poll() is None:
+            p.kill()
+        if pid and _pid_alive(pid):
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)

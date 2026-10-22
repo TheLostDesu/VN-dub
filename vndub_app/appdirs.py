@@ -8,8 +8,10 @@ Layout of the data folder (DEFAULT ``%LOCALAPPDATA%\\VNDub``, ``~/.local/share/v
     <data>/logs/app.log             rotating app log
     <data>/configs/tools.local.yaml external tool paths written by the installer
     <data>/tools/                   external tools (ffmpeg, vgmstream ...)
-    <data>/envs/                    backend virtual environments (VNDUB_ENVS_DIR)
-    <data>/models/                  model weights (VNDUB_MODELS_DIR)
+    <data>/envs/                    backend virtual environments (VNDUB_ENVS_DIR; Settings.envs_dir moves it)
+    <data>/envs/_uv/cache/          uv's download cache (UV_CACHE_DIR): next to the venvs so uv can hardlink wheels into them
+    <data>/envs/_uv/python/         CPython builds uv installs for the app (UV_PYTHON_INSTALL_DIR)
+    <data>/models/                  model weights (VNDUB_MODELS_DIR; Settings.models_dir moves it)
     <data>/voices/<id>.yaml + .wav  voice library (performer designs reused across projects)
     <data>/backups/<game>/<ts>/     files replaced in the game by the patch installer
     <data>/projects/<slug>/         one project per game:
@@ -172,6 +174,7 @@ class Settings(BaseModel):
     gpu_budget_gb: float = 7.5
     license_policy: str = "research"            # research | commercial
     models_dir: str = ""                        # "" = <data>/models
+    envs_dir: str = ""                          # "" = <data>/envs (also holds uv's Python builds and cache: <envs>/_uv)
     player_volume: dict[str, float] = Field(default_factory=dict)
     last_project: str | None = None
     shutdown_when_done: bool = False
@@ -208,6 +211,35 @@ def effective_models_dir(s: Settings | None = None) -> Path:
         return Path(s.models_dir)
     env = os.environ.get("VNDUB_MODELS_DIR")
     return Path(env) if env else models_dir()
+
+
+# The VNDUB_ENVS_DIR value the app itself exported (``installer.configure_environment``). Anything else found in
+# the variable was set from outside (a shell, a dev's environment, a test) and is never overwritten.
+_EXPORTED_ENVS: str | None = None
+
+
+def mark_envs_exported(path: str | None) -> None:
+    """Remember the ``VNDUB_ENVS_DIR`` value the app exported itself (``None`` forgets it)."""
+    global _EXPORTED_ENVS
+    _EXPORTED_ENVS = path
+
+
+def external_envs_dir() -> Path | None:
+    """``VNDUB_ENVS_DIR`` when it was set from outside the app, else ``None``."""
+    env = os.environ.get("VNDUB_ENVS_DIR")
+    return Path(env) if env and env != _EXPORTED_ENVS else None
+
+
+def effective_envs_dir(s: Settings | None = None) -> Path:
+    """The folder the settings ask for: ``Settings.envs_dir``, else an outside ``VNDUB_ENVS_DIR``, else ``<data>/envs``.
+
+    What is in use is decided by ``installer.configure_environment`` (an outside variable beats the setting there,
+    and a dev checkout may keep its ``.venvs``): ask ``installer.envs_dir()`` for that.
+    """
+    s = s or load_settings()
+    if s.envs_dir:
+        return Path(s.envs_dir)
+    return external_envs_dir() or envs_dir()
 
 
 # ----------------------------------------------------------------------------
@@ -321,6 +353,7 @@ def default_app_state() -> dict[str, Any]:
         "completed": [],
         "translation": {
             "tgt_lang": "ru",
+            "src_lang": "auto",        # auto = detected from the script text | a language code
             "source": "auto",          # auto | import
             "import_path": "",
             "honorifics": "drop",      # drop | keep | adapt
@@ -402,21 +435,21 @@ def write_project_config(h: ProjectHandle, settings: Settings | None = None) -> 
     Relative resource paths of the bundled profile are made absolute so the config works
     from any cwd (packaged app). App DEFAULTS: ``link.mode: no_asr`` (spec 0.1 mode A; the
     Advanced checkbox ``asr_check`` switches it to ``asr``), project glossary, data-folder
-    models dir and tool paths from ``tools.local.yaml``. ``app_state.config_overrides``
+    models dir and the tool paths the installer knows (``tools.local.yaml``, installed or
+    bundled with the app: ``installer.tool_paths``). ``app_state.config_overrides``
     (dotted keys) are applied last.
     """
+    from vndub_app import installer  # imports this module
+
     s = settings or load_settings()
     st = read_app_state(h)
     base = base_config_path(s.profile)
     root = resource_root()
-    tools_local: dict[str, Any] = {}
-    if tools_local_yaml().exists():
-        tools_local = yaml.safe_load(tools_local_yaml().read_text(encoding="utf-8")) or {}
     cfg: dict[str, Any] = {
         "extends": str(base),
         "license_policy": s.license_policy,
         "tools_file": str(root / "configs" / "tools.yaml"),
-        "tools": {k: str(v) for k, v in (tools_local.get("tools", tools_local) or {}).items() if v},
+        "tools": installer.tool_paths(),
         "gpu": {"vram_budget_gb": float(s.gpu_budget_gb)},
         "project": {
             "game_dir": str(h.game_dir),
@@ -424,6 +457,7 @@ def write_project_config(h: ProjectHandle, settings: Settings | None = None) -> 
             "out_dir": str(h.out),
             "models_dir": str(effective_models_dir(s)),
             "tgt_lang": st.get("translation", {}).get("tgt_lang", "ru"),
+            "src_lang": st.get("translation", {}).get("src_lang") or "auto",
         },
         "link": {"mode": "asr" if st.get("advanced", {}).get("asr_check") else "no_asr"},
         "translate": {

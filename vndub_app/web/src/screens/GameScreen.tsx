@@ -8,11 +8,12 @@ import { KrkrDumpGuide } from "../components/ManualGuides";
 import { StepFooter } from "../components/StepFooter";
 import { Button, Callout, Card, Chip, Collapsible, PageTitle, ProgressBar, Spinner, TextField } from "../components/ui";
 import { useI18n } from "../i18n";
-import { useActiveJob, useJobTracker } from "../state/progress";
+import { useJobTracker } from "../state/progress";
 import { useProject } from "../state/project";
 import { fmtMinutes, fmtPercent } from "../util/format";
 
 const GAME_KINDS = ["import", "recover_text", "asr_check"];
+const TOOL_KINDS = ["tools_install"];
 const ANALYSIS_STAGES = ["analyze", "text_emotion"];
 
 function noTextCount(v: ProjectSummary["no_text_lines"] | undefined): number {
@@ -31,7 +32,7 @@ function analysisFraction(job: JobInfo): number | null | undefined {
 }
 
 export default function GameScreen() {
-  const { t, has, tOr } = useI18n();
+  const { t, has, tOr, langName } = useI18n();
   const { project, open, reload, loading } = useProject();
   const engineName = (id: string | null, label: string | null): string => (id ? tOr(`engines.${id}`, label ?? id) : label ?? "");
 
@@ -57,15 +58,10 @@ export default function GameScreen() {
     }
   }, []);
 
-  const gameJob = useJobTracker({ onFinal: () => void loadSummary() });
-  const toolJob = useJobTracker({ onDone: () => void loadSummary() });
-  const activeGameJob = useActiveJob(GAME_KINDS);
-
-  // Follow a game job that is already running (the user came back to this screen).
-  useEffect(() => {
-    if (activeGameJob && !gameJob.job) gameJob.attach(activeGameJob);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeGameJob?.id]);
+  // The jobs keep running when the screen is left: the trackers follow them again on return (a running job, else the
+  // finished panel of the open game, exactly as it looked when the user left).
+  const gameJob = useJobTracker({ onFinal: () => void loadSummary(), kinds: GAME_KINDS, project: project?.slug ?? null });
+  const toolJob = useJobTracker({ onDone: () => void loadSummary(), kinds: TOOL_KINDS });
 
   useEffect(() => {
     api.projects().then(setRecent).catch(() => setRecent([]));
@@ -183,16 +179,29 @@ export default function GameScreen() {
                 {project.game_dir}
               </p>
             </div>
-            {summary && engineName(summary.engine.id, summary.engine.label) ? (
-              <Chip tone="info" testid="game-engine">
-                {t("game.engine")}: {engineName(summary.engine.id, summary.engine.label)}
-                {summary.engine.version ? ` ${summary.engine.version}` : ""}
-              </Chip>
-            ) : project.engine ? (
-              <Chip tone="info" testid="game-engine">
-                {t("game.engine")}: {engineName(project.engine, null)}
-              </Chip>
-            ) : null}
+            <div className="chip-line">
+              {summary && engineName(summary.engine.id, summary.engine.label) ? (
+                <Chip tone="info" testid="game-engine">
+                  {t("game.engine")}: {engineName(summary.engine.id, summary.engine.label)}
+                  {summary.engine.version ? ` ${summary.engine.version}` : ""}
+                </Chip>
+              ) : project.engine ? (
+                <Chip tone="info" testid="game-engine">
+                  {t("game.engine")}: {engineName(project.engine, null)}
+                </Chip>
+              ) : null}
+              {summary?.languages?.src ? (
+                <Chip tone="info" testid="game-text-lang">
+                  {t("game.text_lang")}: {langName(summary.languages.src)}
+                  {summary.languages.src_detected ? ` (${t("game.text_lang.detected")})` : ""}
+                </Chip>
+              ) : null}
+              {summary?.languages?.audio && summary.languages.audio !== summary.languages.src ? (
+                <Chip tone="info" testid="game-audio-lang">
+                  {t("game.audio_lang")}: {langName(summary.languages.audio)}
+                </Chip>
+              ) : null}
+            </div>
           </div>
 
           {!gameJob.job && !imported && summaryLoaded && !opening ? (

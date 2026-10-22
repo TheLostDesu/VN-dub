@@ -307,7 +307,7 @@ def _f0_hint(char: Character, char_f0: float | None) -> float:
 
 def _plan_designs(
     ctx: Any, sid: str, char: Character, existing: list[dict[str, Any]], n: int, char_f0: float | None,
-    description: str | None = None, line_ids: list[str] | None = None, origin: str = "stage",
+    description: str | None = None, line_ids: list[str] | None = None, origin: str = "stage", audition_only: bool = False,
 ) -> list[_DesignJob]:
     """Jobs for ``n`` new voice designs of one character (ids and seeds continue after ``existing``)."""
     vb = ctx.cfg.voicebank.performer
@@ -315,7 +315,8 @@ def _plan_designs(
     total = max(1, vb.test_sentences)
     n_aud = min(max(0, vb.sample_lines), total) or min(1, total)
     audition = dz.sample_items(ctx, sid, n_aud, line_ids)
-    extra = dz.test_sentence_items(lang, total - len(audition), skip={a["text"] for a in audition})
+    # audition_only: casting of a character with nothing to compare with renders just the clips the user listens to
+    extra = [] if audition_only else dz.test_sentence_items(lang, total - len(audition), skip={a["text"] for a in audition})
     prior = [d for d in existing if d.get("kind") == "voice_design" and d.get("design_index") is not None]
     base = max([int(d["design_index"]) for d in prior], default=-1) + 1
     jobs: list[_DesignJob] = []
@@ -487,7 +488,8 @@ def _score_designs(
 ) -> None:
     """Fill spk_sim / F0 / rank_score of ``ds`` in place (``vecs``: embedding vectors by job key)."""
     max_delta = ctx.cfg.voicebank.performer.max_f0_delta_semitones
-    jobs = [(f"{d['design_id']}|{p.name}", p, p.with_suffix(".f0.npy")) for d in ds for p in dz.clip_paths(ctx, d) if p.exists()]
+    # without a character F0 there is nothing to compare a design's pitch with: skip the (slow) pYIN over every clip
+    jobs = [(f"{d['design_id']}|{p.name}", p, p.with_suffix(".f0.npy")) for d in ds for p in dz.clip_paths(ctx, d) if p.exists()] if char_f0 else []
     f0s = gu.f0_of(ctx, f0_backend, jobs)
     for d in ds:
         clips = [p for p in dz.clip_paths(ctx, d) if p.exists()]
@@ -1024,7 +1026,10 @@ def _rvc_train_character(
     if progress is not None:
         progress(1, 3, sid)
     try:
-        res = backend.train(job) or {}
+        # hours, not the per-item minutes: at the old 720 s the adapter was killed mid-training and the Applio
+        # process it had started lived on, holding its VRAM next to the next model
+        timeout_s = float((getattr(backend, "options", None) or {}).get("timeout_train_s", 6 * 3600))
+        res = backend.train(job, timeout_s=timeout_s) or {}
     except BackendUnavailable:
         raise
     except Exception as e:
@@ -1254,7 +1259,7 @@ def propose_designs(
     backend, _, reason = gu.acquire_first(ctx, [vb.performer.backend])
     if backend is None:
         raise BackendUnavailable(vb.performer.backend, reason)
-    jobs = _plan_designs(ctx, speaker_id, char, existing, n, char_f0, description, sample_line_ids, origin="user")
+    jobs = _plan_designs(ctx, speaker_id, char, existing, n, char_f0, description, sample_line_ids, origin="user", audition_only=not has_audio)
     new = _render_designs(ctx, backend, jobs, tick)
     if want_clone:
         clone = _clone_design(ctx, speaker_id, char, refs, char_f0, dz.sample_items(ctx, speaker_id, max(1, vb.performer.sample_lines), sample_line_ids), "user", tick)

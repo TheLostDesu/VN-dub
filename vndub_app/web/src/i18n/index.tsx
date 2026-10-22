@@ -53,6 +53,8 @@ interface I18nValue {
   /** Translate if the key exists, otherwise return `fallback` (no warning). */
   tOr: (key: string | null | undefined, fallback: string, params?: Params) => string;
   has: (key: string) => boolean;
+  /** Display name of a language code (`lang.<code>`), the raw code when the table has no such key. */
+  langName: (code: string) => string;
 }
 
 const I18nContext = createContext<I18nValue>({
@@ -60,6 +62,7 @@ const I18nContext = createContext<I18nValue>({
   t: (k, p) => translate(DEFAULT_LANG, k, p),
   tOr: (k, f, p) => (k && hasKey(DEFAULT_LANG, k) ? translate(DEFAULT_LANG, k, p) : f),
   has: (k) => hasKey(DEFAULT_LANG, k),
+  langName: (c) => (hasKey(DEFAULT_LANG, `lang.${c}`) ? translate(DEFAULT_LANG, `lang.${c}`) : c),
 });
 
 export function I18nProvider({ lang, children }: { lang: Lang; children: ReactNode }) {
@@ -69,6 +72,7 @@ export function I18nProvider({ lang, children }: { lang: Lang; children: ReactNo
       lang,
       t,
       has: (k) => hasKey(lang, k),
+      langName: (c) => (hasKey(lang, `lang.${c}`) ? translate(lang, `lang.${c}`) : c),
       tOr: (k, f, p) => (k && hasKey(lang, k) ? translate(lang, k, p) : f),
     }),
     [lang, t],

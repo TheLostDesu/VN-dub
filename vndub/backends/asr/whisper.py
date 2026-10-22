@@ -2,7 +2,7 @@
 
 from vndub.backends.base import BackendSpec, WeightSpec
 
-_COMMON = dict(role="asr", env="asr", adapter="faster_whisper", license="MIT", commercial_ok=True, cpu_ok=True)
+_COMMON = dict(role="asr", env="main", adapter="faster_whisper", license="MIT", commercial_ok=True, cpu_ok=True)
 
 SPECS = [
     BackendSpec(

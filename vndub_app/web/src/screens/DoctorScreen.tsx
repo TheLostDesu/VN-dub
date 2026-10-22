@@ -19,6 +19,9 @@ function rowParams(row: DoctorRow): Record<string, unknown> {
   return p;
 }
 
+// what the fixes of this screen start; the tracker re-attaches to them after a visit to another screen
+const FIX_JOBS = ["ffmpeg_download", "vcredist_install"];
+
 const MIN_VRAM_GB = 7.5; // a "8 GB" card reports about 8.0; anything below 7.5 is a smaller card
 
 export default function DoctorScreen() {
@@ -42,7 +45,7 @@ export default function DoctorScreen() {
     }
   }, []);
 
-  const tracker = useJobTracker({ onFinal: () => void load() });
+  const tracker = useJobTracker({ onFinal: () => void load(), kinds: FIX_JOBS });
 
   useEffect(() => {
     markFirstRunDone();
@@ -60,6 +63,8 @@ export default function DoctorScreen() {
       const res = await api.doctorFix(action);
       if (isJob(res)) tracker.attach(res);
       else if (action === "add_defender_exclusion_help" && "command" in res) setDefender(res as DefenderHelp);
+      // a page to open (driver, Visual C++ download): the backend never starts a browser itself
+      else if ("url" in res && typeof res.url === "string") window.open(res.url, "_blank", "noopener,noreferrer");
       else void load();
     } catch (e) {
       setError(toErrorInfo(e));

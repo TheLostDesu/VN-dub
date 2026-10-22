@@ -6,7 +6,7 @@ SPECS = [
     BackendSpec(
         name="audiobox",
         role="aesthetics",
-        env="score",
+        env="main",
         adapter="audiobox",
         license="CC-BY-4.0",
         commercial_ok=True,

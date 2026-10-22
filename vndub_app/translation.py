@@ -12,6 +12,8 @@ n_candidates, routes, backends  ``config_overrides`` -> ``pipeline.yaml`` (synth
 license policy                  global ``Settings.license_policy`` -> ``pipeline.yaml``
 source auto / import            ``translate.import`` (path) in ``pipeline.yaml``
 tgt_lang                        ``project.tgt_lang`` and ``work/project.yaml`` (translate prefers it)
+src_lang auto / code            ``project.src_lang`` and ``work/project.yaml``: auto = the language the
+                                pipeline detected from the script text (``src_lang_detected`` record)
 =============================== =========================================================
 """
 
@@ -32,6 +34,7 @@ HONORIFICS_TO_GLOSSARY = {"drop": "drop", "keep": "transliterate", "adapt": "map
 HONORIFICS_FROM_GLOSSARY = {v: k for k, v in HONORIFICS_TO_GLOSSARY.items()}
 ADDRESS_FORMS = ("ты", "вы")
 TGT_LANGS = ("ru", "en")
+SRC_LANGS = ("auto", "ja", "en", "zh", "ko", "ru", "uk", "de", "fr", "es", "it", "pt")
 LICENSE_POLICIES = ("research", "commercial")
 ROUTES = ("A", "B", "C")
 DEFAULT_HONORIFIC_MAP = {"さん": "", "ちゃん": "", "くん": "", "様": "", "先輩": "семпай", "先生": "сэнсэй"}
@@ -82,6 +85,40 @@ def _backend_rows(cfg: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def source_language(h: appdirs.ProjectHandle) -> dict[str, Any]:
+    """``{"choice": "auto" | code, "effective": code | "", "detected": record | None}`` of the script text.
+
+    With the choice ``auto`` the code comes from the detector (parse writes it into ``work/project.yaml`` with
+    the ``src_lang_detected`` record). A project file that still holds a plain code without that record (made
+    before the detector existed, or by a code chosen earlier) is detected again over the parsed lines, so an old
+    project does not stay "Japanese" because that used to be the default. Before the import nothing is known.
+    """
+    from vndub.config import load_project_yaml, save_project_yaml
+    from vndub.manifest.io import load_lines
+    from vndub.text.lang import AUTO, detect_language
+
+    st = appdirs.read_app_state(h)
+    choice = str(st.get("translation", {}).get("src_lang") or AUTO)
+    if choice != AUTO:
+        return {"choice": choice, "effective": choice, "detected": None}
+    py = h.work / "project.yaml"
+    if not py.exists():
+        return {"choice": choice, "effective": "", "detected": None}
+    proj = load_project_yaml(py)
+    rec = getattr(proj, "src_lang_detected", None)
+    if rec and proj.src_lang and proj.src_lang != AUTO:
+        return {"choice": choice, "effective": proj.src_lang, "detected": dict(rec)}
+    paths = session.work_paths(h)
+    if paths.lines.exists():
+        guess = detect_language(l.text_src for l in load_lines(paths.lines))
+        if guess.lang:
+            proj.src_lang, proj.src_lang_detected = guess.lang, guess.as_dict()
+            save_project_yaml(py, proj)
+            log.info("project %s: source language %s detected (confidence %.2f)", h.slug, guess.lang, guess.confidence)
+            return {"choice": choice, "effective": guess.lang, "detected": guess.as_dict()}
+    return {"choice": choice, "effective": proj.src_lang if proj.src_lang != AUTO else "", "detected": None}
+
+
 def get_settings(h: appdirs.ProjectHandle) -> dict[str, Any]:
     from vndub.config import load_config
 
@@ -90,8 +127,12 @@ def get_settings(h: appdirs.ProjectHandle) -> dict[str, Any]:
     cfg = load_config(h.config_file)
     st = appdirs.read_app_state(h)
     tr = st["translation"]
+    src = source_language(h)
     return {
         "tgt_lang": tr.get("tgt_lang", "ru"),
+        "src_lang": src["choice"],
+        "src_lang_effective": src["effective"],
+        "src_lang_detected": src["detected"],
         "source": tr.get("source", "auto"),
         "import_path": tr.get("import_path", ""),
         "honorifics": tr.get("honorifics", "drop"),
@@ -124,6 +165,10 @@ def _put_settings(h: appdirs.ProjectHandle, body: dict[str, Any]) -> dict[str, A
         if body["tgt_lang"] not in TGT_LANGS:
             raise _bad("tgt_lang", body["tgt_lang"])
         tr["tgt_lang"] = body["tgt_lang"]
+    if "src_lang" in body:
+        if body["src_lang"] not in SRC_LANGS:
+            raise _bad("src_lang", body["src_lang"])
+        tr["src_lang"] = body["src_lang"]
     if "source" in body:
         if body["source"] not in ("auto", "import"):
             raise _bad("source", body["source"])
@@ -181,22 +226,34 @@ def _put_settings(h: appdirs.ProjectHandle, body: dict[str, Any]) -> dict[str, A
     st["translation"], st["advanced"], st["config_overrides"] = tr, adv_state, ov
     appdirs.write_app_state(h, st)
     appdirs.write_project_config(h)
-    _sync_project_lang(h, tr["tgt_lang"])
+    _sync_project_lang(h, tr["tgt_lang"], str(tr.get("src_lang") or "auto"))
     write_glossary(h)
     viewdata.clear_cache(h.slug)
     return get_settings(h)
 
 
-def _sync_project_lang(h: appdirs.ProjectHandle, lang: str) -> None:
-    """``translate`` prefers ``work/project.yaml: tgt_lang``; keep it equal to the app choice."""
+def _sync_project_lang(h: appdirs.ProjectHandle, lang: str, src: str = "auto") -> None:
+    """The stages prefer ``work/project.yaml`` (``tgt_lang``, ``src_lang``): keep it equal to the app choices.
+
+    A source code chosen by the user replaces any detection; ``auto`` drops a code that was not detected so the
+    next read (:func:`source_language`) or parse detects it again.
+    """
     py = h.work / "project.yaml"
     if not py.exists():
         return
     from vndub.config import load_project_yaml, save_project_yaml
 
     proj = load_project_yaml(py)
+    changed = False
     if proj.tgt_lang != lang:
         proj.tgt_lang = lang
+        changed = True
+    detected = getattr(proj, "src_lang_detected", None)
+    if src != "auto" and (proj.src_lang != src or detected):
+        proj.src_lang, proj.src_lang_detected, changed = src, None, True
+    elif src == "auto" and not detected and proj.src_lang != "auto":
+        proj.src_lang, changed = "auto", True
+    if changed:
         save_project_yaml(py, proj)
 
 

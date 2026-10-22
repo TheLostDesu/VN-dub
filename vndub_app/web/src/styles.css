@@ -153,6 +153,10 @@ a {
 p.hint {
   margin-bottom: 0.5rem;
 }
+p.hint.src-lang-hint {
+  margin-top: -0.4rem;
+  margin-bottom: 0.9rem;
+}
 .warn-text {
   color: var(--warn);
 }

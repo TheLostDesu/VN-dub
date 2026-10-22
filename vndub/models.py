@@ -192,7 +192,10 @@ def selftest(cfg: PipelineConfig, name: str) -> dict[str, Any]:
         b = registry.instantiate(spec, device=device, models_dir=models_dir, log_dir=log_dir, context={"tools": tools})
         res = b.selftest() or {}
         res.setdefault("ok", True)
-        res["device"] = device
+        res.setdefault("device", device)  # the adapter's real device when it reports one, not what was asked for
+        if device.startswith("cuda") and str(res.get("device") or "").startswith("cpu"):
+            res["ok"] = False
+            res["error"] = f"ran on the CPU although {device} was requested: the torch of env '{spec.env or 'core'}' has no CUDA (reinstall the environment with CUDA torch)"
         return res
     except BackendUnavailable as e:
         return {"ok": False, "error": str(e)}

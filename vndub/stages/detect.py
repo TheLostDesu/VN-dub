@@ -29,7 +29,7 @@ DRM_MARKERS = {
     "enigma": ["enigma_ide.dll"],
 }
 
-KEEP_FIELDS = ("src_lang", "tgt_lang", "notes", "voice_codec")
+KEEP_FIELDS = ("src_lang", "src_lang_detected", "audio_lang", "tgt_lang", "notes", "voice_codec")
 
 
 def find_drm(game: Path) -> list[str]:
@@ -96,6 +96,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
         engine=chosen.engine,
         engine_version=chosen.version,
         src_lang=ctx.cfg.project.src_lang,
+        audio_lang=ctx.cfg.project.audio_lang,
         tgt_lang=ctx.cfg.project.tgt_lang,
         voice_codec=VoiceCodec(**codec) if codec else VoiceCodec(),
         encrypted=chosen.encrypted,
@@ -111,11 +112,20 @@ def run(ctx: StageContext) -> dict[str, Any]:
     if ctx.paths.project_yaml.exists() and not ctx.force:
         old = load_project_yaml(ctx.paths.project_yaml)
         if Path(old.game_dir).resolve() == game.resolve():
+            # a detected text language is kept only while the config still says auto (parse detects it again
+            # over the new lines); a code in the config replaces it
+            keep_detected = ctx.cfg.project.src_lang == "auto"
             for f in KEEP_FIELDS:
                 if f == "voice_codec":
                     if not codec:
                         proj.voice_codec = old.voice_codec
                         proj.voice_codec_detected = bool(getattr(old, "voice_codec_detected", False))  # type: ignore[attr-defined]
+                elif f in ("src_lang", "src_lang_detected"):
+                    if keep_detected or not getattr(old, "src_lang_detected", None):
+                        setattr(proj, f, getattr(old, f, None))
+                elif f == "audio_lang":
+                    if getattr(old, "audio_lang", ""):
+                        proj.audio_lang = old.audio_lang
                 else:
                     setattr(proj, f, getattr(old, f))
     save_project_yaml(ctx.paths.project_yaml, proj)
@@ -129,6 +139,8 @@ def run(ctx: StageContext) -> dict[str, Any]:
         "encrypted": chosen.encrypted,
         "drm": drm,
         "voice_codec": f"{proj.voice_codec.container}/{proj.voice_codec.codec} {proj.voice_codec.sr}Hz {proj.voice_codec.ch}ch" if codec else "unknown (probed after extract)",
+        "src_lang": proj.src_lang,
+        "audio_lang": proj.audio_lang or proj.src_lang,
         "warnings": warnings[:4],
         "notes": chosen.notes[:4],
         "project_yaml": str(ctx.paths.project_yaml),

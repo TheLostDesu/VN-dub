@@ -13,7 +13,7 @@
 from vndub.backends.base import BackendSpec, WeightSpec
 
 _HOME = "https://github.com/QwenLM/Qwen3-TTS"
-_COMMON = dict(role="tts", env="hf", license="Apache-2.0", commercial_ok=True, cpu_ok=True, mock="mock_tts", homepage=_HOME)
+_COMMON = dict(role="tts", env="main", license="Apache-2.0", commercial_ok=True, cpu_ok=True, mock="mock_tts", homepage=_HOME)
 
 SPECS = [
     BackendSpec(

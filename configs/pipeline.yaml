@@ -13,7 +13,8 @@ project:
   work_dir: "work"               # manifests, caches, audio, candidates (relative to the current dir)
   out_dir: "out"                 # packed patches: out/<engine>/...
   models_dir: "models"           # downloaded weights (env var VNDUB_MODELS_DIR overrides)
-  src_lang: ja
+  src_lang: auto                 # language of the script text: auto = detected by parse (written into work/project.yaml), or ja | en | zh | ko | ru ...
+  audio_lang: ""                 # language of the voice files when it differs from the text (a translated release with the original voices); "" = same as the text
   tgt_lang: ru
 
 # research   -> every backend allowed (non-commercial weights included)
@@ -102,10 +103,12 @@ translate:
     backend: gemma4_12b          # GGUF via llama.cpp llama-server (tools.llama_server)
     fallbacks: [qwen35_9b, hy_mt15_7b]
     ctx: 16384
-    n_gpu_layers: -1
+    n_gpu_layers: -1             # -1 = every layer on the GPU, never a silent partial offload (a model that does not fit fails over to the next fallback); a number = a partial offload on purpose
     temperature: 0.3
     port: 8089
     max_retries: 2
+    extra_args: []               # more llama-server flags, e.g. ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"] (quantized KV cache: half the size, a little quality)
+    parallel: 1                  # llama-server slots = scenes translated at once (KV cache grows with ctx x parallel: 2 wants 12 GB+ VRAM with the 12B model)
   batch_lines: 20                # lines per request (per scene)
   context_window_lines: 15       # previously translated lines shown to the model
   glossary: "configs/glossary.yaml"   # create with: vndub translate --seed-glossary

@@ -19,6 +19,11 @@ uv run vndub models selftest qwen3_tts        # load, 2 s clip, peak VRAM, unloa
 
 Each env can also self-test without the core: `.venvs\<env>\Scripts\python.exe -m adapters.<env>.main --selftest [backend...]`.
 
+Since 2026-10-22 the former `asr`, `hf` and `score` envs are ONE env, `main` (`envs/main.txt`: torch 2.8.0 cu128,
+transformers 4.57.3; the adapter code keeps its packages `adapters/asr`, `adapters/hf`, `adapters/score` and is dispatched by
+`adapters/main/table.py`). The "Env" column below says `main` for all of them; the build-machine notes further down still name the
+envs as they were built on 2026-10-21.
+
 Weights live in `models/` (or `VNDUB_MODELS_DIR`): one directory per repo
 (`models/<repo-basename>/`, `models/<name>-ct2` conversions inside it), plus `models/hf_home`
 and `models/torch_home` for packages that cache on their own (SSL backbones, torch.hub).
@@ -32,47 +37,47 @@ backend whose "Commercial" column is "no" (falling back or marking lines for rev
 
 | Backend | Role | Model / repo | Env | VRAM est. GB | License | Commercial | Fallback | Profile | Status on build machine |
 |---|---|---|---|---|---|---|---|---|---|
-| [anime_whisper](https://huggingface.co/litagin/anime-whisper) | asr | `litagin/anime-whisper` | asr | 2.5 | MIT | yes | whisper_large_v3_turbo | default | not verified: weights missing: run `vndub models pull anime_whisper` |
-| [gigaam_v3](https://huggingface.co/ai-sage/GigaAM-v3) | asr | `ai-sage/GigaAM-v3`@e2e_ctc | asr | 1.2 | MIT | yes | whisper_ru | default | **selftest OK on CPU** (load 35.5 s, 2 s clip 1.61 s) |
+| [anime_whisper](https://huggingface.co/litagin/anime-whisper) | asr | `litagin/anime-whisper` | main | 2.5 | MIT | yes | whisper_large_v3_turbo | default | not verified: weights missing: run `vndub models pull anime_whisper` |
+| [gigaam_v3](https://huggingface.co/ai-sage/GigaAM-v3) | asr | `ai-sage/GigaAM-v3`@e2e_ctc | main | 1.2 | MIT | yes | whisper_ru | default | **selftest OK on CPU** (load 35.5 s, 2 s clip 1.61 s) |
 | mock_asr | asr | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [qwen3_asr](https://github.com/QwenLM/Qwen3-ASR) | asr | `Qwen/Qwen3-ASR-1.7B` | hf | 4.0 | Apache-2.0 | yes | - | optional | not verified: env 'hf' not created |
-| [whisper_large_v3_turbo](https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo) | asr | `mobiuslabsgmbh/faster-whisper-large-v3-turbo` | asr | 1.8 | MIT | yes | - | default | not verified: weights missing: run `vndub models pull whisper_large_v3_turbo` |
-| [whisper_ru](https://huggingface.co/antony66/whisper-large-v3-russian) | asr | `antony66/whisper-large-v3-russian` | asr | 3.0 | MIT | yes | - | default | not verified: weights missing: run `vndub models pull whisper_ru` |
-| [whisper_tiny](https://huggingface.co/Systran/faster-whisper-tiny) | asr | `Systran/faster-whisper-tiny` | asr | 0.3 | MIT | yes | - | test | **selftest OK on CPU** (load 11.17 s, 2 s clip 0.94 s) |
+| [qwen3_asr](https://github.com/QwenLM/Qwen3-ASR) | asr | `Qwen/Qwen3-ASR-1.7B` | main | 4.0 | Apache-2.0 | yes | - | optional | not verified: env 'main' not created |
+| [whisper_large_v3_turbo](https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo) | asr | `mobiuslabsgmbh/faster-whisper-large-v3-turbo` | main | 1.8 | MIT | yes | - | default | not verified: weights missing: run `vndub models pull whisper_large_v3_turbo` |
+| [whisper_ru](https://huggingface.co/antony66/whisper-large-v3-russian) | asr | `antony66/whisper-large-v3-russian` | main | 3.0 | MIT | yes | - | default | not verified: weights missing: run `vndub models pull whisper_ru` |
+| [whisper_tiny](https://huggingface.co/Systran/faster-whisper-tiny) | asr | `Systran/faster-whisper-tiny` | main | 0.3 | MIT | yes | - | test | **selftest OK on CPU** (load 11.17 s, 2 s clip 0.94 s) |
 | mock_aligner | align | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [qwen3_aligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) | align | `Qwen/Qwen3-ForcedAligner-0.6B` | hf | 1.5 | Apache-2.0 | yes | whisperx_ja | default | not verified: env 'hf' not created |
-| [whisperx_ja](https://github.com/m-bain/whisperX) | align | `jonatasgrosman/wav2vec2-large-xlsr-53-japanese` | hf | 1.3 | Apache-2.0 (model) / BSD-2 (whisperx) | yes | - | default | not verified: env 'hf' not created |
-| [anime_ser](https://huggingface.co/litagin/anime_speech_emotion_classification) | ser | `litagin/anime_speech_emotion_classification` | hf | 0.8 | MIT | yes | - | default | not verified: env 'hf' not created |
+| [qwen3_aligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) | align | `Qwen/Qwen3-ForcedAligner-0.6B` | main | 1.5 | Apache-2.0 | yes | whisperx_ja | default | not verified: env 'main' not created |
+| [whisperx_ja](https://github.com/m-bain/whisperX) | align | `jonatasgrosman/wav2vec2-large-xlsr-53-japanese` | main | 1.3 | Apache-2.0 (model) / BSD-2 (whisperx) | yes | - | default | not verified: env 'main' not created |
+| [anime_ser](https://huggingface.co/litagin/anime_speech_emotion_classification) | ser | `litagin/anime_speech_emotion_classification` | main | 0.8 | MIT | yes | - | default | not verified: env 'main' not created |
 | [emotion2vec_plus_base](https://github.com/ddlBoJack/emotion2vec) | ser | `emotion2vec/emotion2vec_plus_base` | funasr | 0.8 | MIT (code); emotion2vec model license (commercial terms UNVERIFIED) | no | - | default | not verified: weights missing: run `vndub models pull emotion2vec_plus_base` |
 | [emotion2vec_plus_large](https://github.com/ddlBoJack/emotion2vec) | ser | `emotion2vec/emotion2vec_plus_large` | funasr | 1.8 | MIT (code); emotion2vec model license (commercial terms UNVERIFIED) | no | emotion2vec_plus_base | default | not verified: weights missing: run `vndub models pull emotion2vec_plus_large` |
 | [emotion2vec_plus_seed](https://github.com/ddlBoJack/emotion2vec) | ser | `emotion2vec/emotion2vec_plus_seed` | funasr | 0.8 | MIT (code); emotion2vec model license (commercial terms UNVERIFIED) | no | - | test | **selftest OK on CPU** (load 46.95 s, 2 s clip 1.25 s) |
 | mock_anime_ser | ser | - | core | 0.0 | MIT | yes | - | test | core (always available) |
 | mock_ser | ser | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [audeering_adv](https://huggingface.co/audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim) | adv | `audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim` | hf | 1.0 | CC-BY-NC-SA-4.0 | no | - | default | not verified: env 'hf' not created |
+| [audeering_adv](https://huggingface.co/audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim) | adv | `audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim` | main | 1.0 | CC-BY-NC-SA-4.0 | no | - | default | not verified: env 'main' not created |
 | mock_adv | adv | - | core | 0.0 | MIT | yes | - | test | core (always available) |
 | mock_events | events | - | core | 0.0 | MIT | yes | - | test | core (always available) |
 | [sensevoice](https://huggingface.co/FunAudioLLM/SenseVoiceSmall) | events | `FunAudioLLM/SenseVoiceSmall` | funasr | 1.0 | FunASR model license (maintainers state commercial use OK) | yes | - | default | not verified: weights missing: run `vndub models pull sensevoice` |
 | mock_caption | caption | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [qwen2_audio](https://github.com/QwenLM/Qwen2-Audio) | caption | `Qwen/Qwen2-Audio-7B-Instruct` | hf | 5.8 | Apache-2.0 | yes | - | optional | not verified: env 'hf' not created |
+| [qwen2_audio](https://github.com/QwenLM/Qwen2-Audio) | caption | `Qwen/Qwen2-Audio-7B-Instruct` | main | 5.8 | Apache-2.0 | yes | - | optional | not verified: env 'main' not created |
 | librosa_f0 | f0 | - | core | 0.0 | ISC (librosa) | yes | - | default,test | core (always available) |
 | [rmvpe](https://github.com/Dream-High/RMVPE) | f0 | downloaded by the env (`models pull`) | rvc | 0.6 | Apache-2.0 (RMVPE) / MIT (Applio) | yes | torchcrepe | default | not verified: env 'rvc' not created |
-| [torchcrepe](https://github.com/maxrmorrison/torchcrepe) | f0 | bundled with the pip package | score | 0.5 | MIT | yes | librosa_f0 | default | **selftest OK on CPU** (load 16.28 s, 2 s clip 19.92 s) |
+| [torchcrepe](https://github.com/maxrmorrison/torchcrepe) | f0 | bundled with the pip package | main | 0.5 | MIT | yes | librosa_f0 | default | **selftest OK on CPU** (load 16.28 s, 2 s clip 19.92 s) |
 | energy_vad | vad | - | core | 0.0 | MIT | yes | - | default,test | core (always available) |
-| [silero](https://github.com/snakers4/silero-vad) | vad | bundled with the pip package | asr | 0.0 | MIT | yes | energy_vad | default | **selftest OK on CPU** (load 10.71 s, 2 s clip 0.22 s) |
+| [silero](https://github.com/snakers4/silero-vad) | vad | bundled with the pip package | main | 0.0 | MIT | yes | energy_vad | default | **selftest OK on CPU** (load 10.71 s, 2 s clip 0.22 s) |
 | mock_stress | stress | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [ruaccent](https://github.com/Den4ikAI/ruaccent) | stress | downloaded by the env (`models pull`) | asr | 0.0 | MIT | yes | - | default,test | **selftest OK on CPU** (load 56.25 s, 2 s clip 0.28 s) |
-| [ecapa](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb) | embedder | `speechbrain/spkrec-ecapa-voxceleb` | score | 0.4 | Apache-2.0 | yes | - | default,test | **selftest OK on CPU** (load 17.68 s, 2 s clip 1.74 s) |
+| [ruaccent](https://github.com/Den4ikAI/ruaccent) | stress | downloaded by the env (`models pull`) | main | 0.0 | MIT | yes | - | default,test | **selftest OK on CPU** (load 56.25 s, 2 s clip 0.28 s) |
+| [ecapa](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb) | embedder | `speechbrain/spkrec-ecapa-voxceleb` | main | 0.4 | Apache-2.0 | yes | - | default,test | **selftest OK on CPU** (load 17.68 s, 2 s clip 1.74 s) |
 | mock_embedder | embedder | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [wavlm_sv](https://huggingface.co/microsoft/wavlm-base-plus-sv) | embedder | `microsoft/wavlm-base-plus-sv` | score | 0.8 | MIT | yes | - | optional | not verified: weights missing: run `vndub models pull wavlm_sv` |
+| [wavlm_sv](https://huggingface.co/microsoft/wavlm-base-plus-sv) | embedder | `microsoft/wavlm-base-plus-sv` | main | 0.8 | MIT | yes | - | optional | not verified: weights missing: run `vndub models pull wavlm_sv` |
 | mock_mos | mos | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [utmos22](https://github.com/tarepan/SpeechMOS) | mos | downloaded by the env (`models pull`) | score | 0.5 | MIT | yes | - | default,test | **selftest OK on CPU** (load 16.62 s, 2 s clip 9.89 s) |
-| [utmosv2](https://github.com/sarulab-speech/UTMOSv2) | mos | downloaded by the env (`models pull`) | score | 1.5 | MIT | yes | utmos22 | default | **selftest OK on CPU** (load 51.85 s, 2 s clip 39.08 s) |
-| [audiobox](https://github.com/facebookresearch/audiobox-aesthetics) | aesthetics | `facebook/audiobox-aesthetics` | score | 1.0 | CC-BY-4.0 | yes | - | default | **selftest OK on CPU** (load 16.84 s, 2 s clip 8.61 s) |
+| [utmos22](https://github.com/tarepan/SpeechMOS) | mos | downloaded by the env (`models pull`) | main | 0.5 | MIT | yes | - | default,test | **selftest OK on CPU** (load 16.62 s, 2 s clip 9.89 s) |
+| [utmosv2](https://github.com/sarulab-speech/UTMOSv2) | mos | downloaded by the env (`models pull`) | main | 1.5 | MIT | yes | utmos22 | default | **selftest OK on CPU** (load 51.85 s, 2 s clip 39.08 s) |
+| [audiobox](https://github.com/facebookresearch/audiobox-aesthetics) | aesthetics | `facebook/audiobox-aesthetics` | main | 1.0 | CC-BY-4.0 | yes | - | default | **selftest OK on CPU** (load 16.84 s, 2 s clip 8.61 s) |
 | mock_aesthetics | aesthetics | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [gemma4_12b](https://huggingface.co/unsloth/gemma-4-12b-it-GGUF) | llm | `unsloth/gemma-4-12b-it-GGUF` | core | 7.2 | Apache-2.0 | yes | qwen35_9b | default | not verified: GGUF not pulled (`vndub models pull gemma4_12b`); also needs `tools.llama_server` |
-| [hy_mt15_7b](https://huggingface.co/tencent/HY-MT1.5-7B-GGUF) | llm | `tencent/HY-MT1.5-7B-GGUF` | core | 5.5 | Tencent HY-MT license (see model card) | yes | - | default | not verified: GGUF not pulled (`vndub models pull hy_mt15_7b`); also needs `tools.llama_server` |
+| [gemma4_12b](https://huggingface.co/unsloth/gemma-4-12b-it-GGUF) | llm | `unsloth/gemma-4-12b-it-GGUF` | core | 7.5 | Apache-2.0 | yes | qwen35_9b | default | not verified: GGUF not pulled (`vndub models pull gemma4_12b`); also needs `tools.llama_server` |
+| [hy_mt15_7b](https://huggingface.co/tencent/HY-MT1.5-7B-GGUF) | llm | `tencent/HY-MT1.5-7B-GGUF` | core | 6.0 | Tencent HY-MT license (see model card) | yes | - | default | not verified: GGUF not pulled (`vndub models pull hy_mt15_7b`); also needs `tools.llama_server` |
 | mock_translator | llm | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [qwen35_9b](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | llm | `unsloth/Qwen3.5-9B-GGUF` | core | 6.5 | Apache-2.0 | yes | hy_mt15_7b | default | not verified: GGUF not pulled (`vndub models pull qwen35_9b`); also needs `tools.llama_server` |
+| [qwen35_9b](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | llm | `unsloth/Qwen3.5-9B-GGUF` | core | 6.3 | Apache-2.0 | yes | hy_mt15_7b | default | not verified: GGUF not pulled (`vndub models pull qwen35_9b`); also needs `tools.llama_server` |
 | [chatterbox_ml](https://github.com/resemble-ai/chatterbox) | tts | `ResembleAI/chatterbox` | chatterbox | 4.0 | MIT (Perth watermark embedded) | yes | - | default | not verified: env 'chatterbox' not created |
 | [cosyvoice3](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512) | tts | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | funasr | 3.8 | Apache-2.0 | yes | - | default | not verified: weights missing: run `vndub models pull cosyvoice3` |
 | [f5_ru](https://huggingface.co/Misha24-10/F5-TTS_RUSSIAN) | tts | `Misha24-10/F5-TTS_RUSSIAN` | f5 | 3.0 | CC-BY-NC-4.0 (Russian checkpoint) | no | - | optional | not verified: env 'f5' not created |
@@ -80,11 +85,11 @@ backend whose "Commercial" column is "no" (falling back or marking lines for rev
 | [higgs_tts3](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b) | tts | `bosonai/higgs-audio-v3-tts-4b` | higgs | 6.0 | Boson Research & Non-Commercial License | no | - | optional | not verified: env 'higgs' not created |
 | mock_tts | tts | - | core | 0.0 | MIT | yes | - | test | core (always available) |
 | [moss_tts](https://github.com/OpenMOSS/MOSS-TTS) | tts | `OpenMOSS-Team/MOSS-TTS-v1.5-GGUF` | gguf | 7.0 | Apache-2.0 | yes | - | optional | not verified: env 'gguf' not created |
-| [qwen3_tts](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`, `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | hf | 4.5 | Apache-2.0 | yes | - | default | not verified: env 'hf' not created |
-| [qwen3_tts_06b](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | hf | 2.5 | Apache-2.0 | yes | - | optional | not verified: env 'hf' not created |
-| [qwen3_tts_voicedesign](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | hf | 4.5 | Apache-2.0 | yes | - | default | not verified: env 'hf' not created |
+| [qwen3_tts](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`, `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | main | 4.5 | Apache-2.0 | yes | - | default | not verified: env 'main' not created |
+| [qwen3_tts_06b](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | main | 2.5 | Apache-2.0 | yes | - | optional | not verified: env 'main' not created |
+| [qwen3_tts_voicedesign](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | main | 4.5 | Apache-2.0 | yes | - | default | not verified: env 'main' not created |
 | sapi_tts | tts | - | core | 0.0 | Windows component (test use only) | no | - | test | core (always available) |
-| [voxcpm2](https://github.com/OpenBMB/VoxCPM) | tts | `openbmb/VoxCPM2` | hf | 7.8 | Apache-2.0 | yes | - | default | not verified: env 'hf' not created |
+| [voxcpm2](https://github.com/OpenBMB/VoxCPM) | tts | `openbmb/VoxCPM2` | main | 7.8 | Apache-2.0 | yes | - | default | not verified: env 'main' not created |
 | [zonos2](https://github.com/Zyphra/zonos2.cpp) | tts | `Zyphra/ZONOS2-GGUF` | gguf | 6.5 | MIT/Apache-2.0 (conflicting statements, both permissive) | yes | - | optional | not verified: env 'gguf' not created |
 | mock_vc | vc | - | core | 0.0 | MIT | yes | - | test | core (always available) |
 | [rvc](https://github.com/IAHispano/Applio) | vc | downloaded by the env (`models pull`) | rvc | 2.0 | MIT | yes | - | default | not verified: env 'rvc' not created |

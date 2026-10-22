@@ -23,8 +23,8 @@
       "license": "gemma",
       "title": {"ru": "Gemma 3 12B: универсальная модель Google", "en": "Gemma 3 12B: Google's general model"},
       "note": {
-        "ru": "Прошлое поколение встроенной Gemma 4, универсальная модель (не только перевод). Около 8 ГБ видеопамяти и больше. Условия использования Gemma.",
-        "en": "The previous generation of the built-in Gemma 4, a general model (not only translation). About 8 GB of video memory or more. Gemma terms of use."
+        "ru": "Прошлое поколение встроенной Gemma 4, универсальная модель (не только перевод). Нужно больше 8 ГБ видеопамяти (на 8 ГБ не запустится целиком, лучше 12 ГБ). Условия использования Gemma.",
+        "en": "The previous generation of the built-in Gemma 4, a general model (not only translation). Needs more than 8 GB of video memory (it will not fit an 8 GB card whole; 12 GB is comfortable). Gemma terms of use."
       }
     },
     {

@@ -27,7 +27,8 @@ from typing import Any
 from vndub.engines.base import VOICE_OVER, VOICE_OVER_NAMES, ExtractResult, ParseResult, build_characters, resolve_hidden_speakers
 from vndub.engines.generic_prefix import import_vntextpatch, textless_result
 from vndub.manifest.io import AudioIndexRecord, Character, load_characters, read_jsonl, save_characters, write_jsonl
-from vndub.stages.common import StageContext, StageError
+from vndub.stages.common import StageContext, StageError, resolve_src_lang
+from vndub.text.lang import detect_language, language_name
 
 NAME = "parse"
 VERSION = "2"
@@ -101,6 +102,17 @@ def run(ctx: StageContext) -> dict[str, Any]:
             chars.pop(sid, None)
     write_jsonl(ctx.paths.lines, lines)
     save_characters(ctx.paths.characters, chars)
+    # the language of the text: detected over the new lines when project.yaml says auto (or holds an earlier
+    # detection); a code the user set is kept, with a warning when the text clearly disagrees
+    src_lang = resolve_src_lang(ctx, lines, redetect=True)
+    lang_detected = bool(getattr(ctx.project, "src_lang_detected", None))
+    if not lang_detected:
+        guess = detect_language(l.text_src for l in lines)
+        if guess.lang and guess.lang != src_lang and guess.confidence >= 0.8:
+            ctx.log.warning(
+                "project.src_lang is %s but the script text looks like %s (%s, confidence %.2f): set project.src_lang: auto to detect it",
+                src_lang, guess.lang, language_name(guess.lang), guess.confidence,
+            )
     bound = {l.audio_id for l in lines if l.audio_id}
     unbound = [a for a in audio if a.id not in bound]
     write_jsonl(ctx.paths.manifest_dir / "unbound_audio.jsonl", [{"id": a.id, "relpath": a.relpath, "duration": a.duration} for a in unbound])
@@ -129,6 +141,8 @@ def run(ctx: StageContext) -> dict[str, Any]:
         "speakers": speakers,
         "characters": len(chars),
         "hidden_speakers": hidden,
+        "src_lang": src_lang,
+        "src_lang_detected": lang_detected,
         "notes": result.notes[:4],
     }
 

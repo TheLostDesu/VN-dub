@@ -77,12 +77,11 @@ def build_cfg():
     from vndub_app import installer
 
     s = appdirs.load_settings()
-    tools = {**installer.discover_installed(), **{k: v for k, v in installer.read_local_tools().items() if Path(v).exists()}}
     overrides: dict[str, Any] = {
         "license_policy": s.license_policy,
         "project.models_dir": str(appdirs.effective_models_dir(s)),
         "tools_file": str(appdirs.resource("configs", "tools.yaml")),
-        "tools": tools,
+        "tools": installer.tool_paths(),
         "gpu.vram_budget_gb": float(s.gpu_budget_gb),
     }
     return load_config(appdirs.base_config_path(s.profile), overrides)

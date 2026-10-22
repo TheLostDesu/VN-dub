@@ -34,6 +34,10 @@ def _model_dir(params: dict[str, Any]) -> Path:
 
 
 class FasterWhisperASR(ModelImpl):
+    """No ``batch_transcribe`` on purpose: ``WhisperModel.transcribe`` takes one audio; ``BatchedInferencePipeline``
+    only batches the 30 s windows of ONE long audio (VAD-cut), it has no cross-file batching for short clips and
+    would change the decoding setup (no ``condition_on_previous_text`` chain, VAD windows)."""
+
     selftest_op = "transcribe"
     selftest_kwargs = {"lang": "ja"}
 

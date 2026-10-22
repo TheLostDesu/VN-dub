@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from vndub_app import jobs
+from vndub_app import jobs, winproc
 from vndub_app.errors import AppError
 from vndub_app.jobs import EtaEstimator, JobCancelled, JobRunner, ThroughputStore
 
@@ -285,3 +288,166 @@ def test_job_not_found_error() -> None:
         r.get("nope")
     assert e.value.code == "job_not_found" and e.value.status == 404
     r.shutdown()
+
+
+# ----------------------------------------------------------------------------
+# JobContext.watch_process: cancelling a job ends the processes it started
+# ----------------------------------------------------------------------------
+
+SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
+
+
+def pid_alive(pid: int) -> bool:
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    import ctypes
+
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    code = ctypes.c_ulong()
+    k32.GetExitCodeProcess(ctypes.c_void_p(h), ctypes.byref(code))
+    k32.CloseHandle(ctypes.c_void_p(h))
+    return code.value == 259  # STILL_ACTIVE
+
+
+def test_cancel_kills_a_watched_process_at_once() -> None:
+    r = JobRunner(None, None)
+    started = threading.Event()
+    seen: dict = {}
+
+    def fn(ctx: jobs.JobContext) -> None:
+        proc = subprocess.Popen(SLEEPER)
+        seen["proc"] = proc
+        unwatch = ctx.watch_process(proc)
+        started.set()
+        try:
+            proc.wait()  # what installer.run_stream does: block on the child (no output = no line to notice a cancel on)
+        finally:
+            unwatch()
+        ctx.checkpoint()  # raises JobCancelled: the child did not end by itself
+
+    job = r.submit("install", fn, gpu=False)
+    try:
+        assert started.wait(10)
+        t0 = time.monotonic()
+        r.cancel(job.id)
+        r.wait(job.id, 10)
+        assert job.state == "cancelled" and time.monotonic() - t0 < 5
+        assert seen["proc"].poll() is not None  # the sleeper (60 s) is gone, not waiting for its next line of output
+    finally:
+        if "proc" in seen and seen["proc"].poll() is None:
+            seen["proc"].kill()
+        r.shutdown()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the tree walk is taskkill /T; elsewhere only process groups are killed")
+def test_cancel_kills_the_whole_process_tree() -> None:
+    """PowerShell -> uv -> python: the grandchild must go too, or a torch download keeps running after Cancel."""
+    r = JobRunner(None, None)
+    started = threading.Event()
+    seen: dict = {}
+    parent_code = (
+        "import subprocess, sys, time\n"
+        "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "print(g.pid, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+
+    def fn(ctx: jobs.JobContext) -> None:
+        proc = subprocess.Popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
+        seen["proc"] = proc
+        ctx.watch_process(proc)
+        seen["grandchild"] = int(proc.stdout.readline())  # type: ignore[union-attr]
+        started.set()
+        proc.wait()
+        ctx.checkpoint()
+
+    job = r.submit("install", fn, gpu=False)
+    try:
+        assert started.wait(15)
+        assert pid_alive(seen["grandchild"])
+        r.cancel(job.id)
+        r.wait(job.id, 10)
+        assert job.state == "cancelled"
+        wait_until(lambda: not pid_alive(seen["grandchild"]), timeout=5)
+    finally:
+        if "grandchild" in seen:
+            winproc.kill_tree(seen["grandchild"])
+        if "proc" in seen:
+            winproc.kill_tree(seen["proc"])
+            seen["proc"].stdout.close()
+        r.shutdown()
+
+
+def test_a_process_registered_after_the_cancel_is_killed_at_once() -> None:
+    r = JobRunner(None, None)
+    seen: dict = {}
+    reached = threading.Event()
+
+    def fn(ctx: jobs.JobContext) -> None:
+        while not ctx.cancelled:  # an install step that only looks at the cancel flag between steps
+            time.sleep(0.02)
+        proc = subprocess.Popen(SLEEPER)
+        seen["proc"] = proc
+        t0 = time.monotonic()
+        ctx.watch_process(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        seen["waited"] = time.monotonic() - t0
+        reached.set()
+
+    job = r.submit("install", fn, gpu=False)
+    try:
+        wait_until(lambda: job.state == "running")
+        r.cancel(job.id)
+        assert reached.wait(15)
+        assert seen["proc"].poll() is not None and seen["waited"] < 5  # killed by watch_process itself, not by the 10 s wait
+        r.wait(job.id, 10)
+    finally:
+        if "proc" in seen and seen["proc"].poll() is None:
+            seen["proc"].kill()
+        r.shutdown()
+
+
+def test_unwatch_removes_the_process_and_watching_twice_is_harmless() -> None:
+    r = JobRunner(None, None)
+    seen: dict = {}
+    ready = threading.Event()
+
+    def fn(ctx: jobs.JobContext) -> None:
+        proc = subprocess.Popen(SLEEPER)
+        seen["proc"] = proc
+        unwatch = ctx.watch_process(proc)
+        ctx.watch_process(proc)  # the same process again: still one entry
+        seen["entries"] = len(ctx._procs)  # noqa: SLF001
+        unwatch()
+        unwatch()  # and unwatching twice is fine too
+        seen["after"] = len(ctx._procs)  # noqa: SLF001
+        ready.set()
+        while True:
+            ctx.checkpoint()
+            time.sleep(0.02)
+
+    job = r.submit("install", fn, gpu=False)
+    try:
+        assert ready.wait(10)
+        assert seen["entries"] == 1 and seen["after"] == 0
+        r.cancel(job.id)
+        r.wait(job.id, 10)
+        assert job.state == "cancelled"
+        time.sleep(0.5)
+        assert seen["proc"].poll() is None  # no longer watched: the cancel did not touch it
+    finally:
+        if "proc" in seen:
+            winproc.kill_tree(seen["proc"])
+            seen["proc"].wait(10)
+        r.shutdown()

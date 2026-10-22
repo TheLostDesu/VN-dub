@@ -9,6 +9,7 @@ its declared output files still exist. ``--force`` clears the keys.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
@@ -24,24 +25,29 @@ class OpCache:
         self.path = ctx.paths.cache / "results" / f"{name}.json"
         self.values: dict[str, Any] = {} if ctx.force else (read_json(self.path, {}) or {})
         self._dirty = 0
+        self._lock = threading.RLock()  # translate drives several llama-server slots from threads
 
     def key(self, *inputs: Any, files: Iterable[str | Path] = ()) -> str:
-        return self.cache.key(*inputs, files=files)
+        with self._lock:
+            return self.cache.key(*inputs, files=files)
 
     def get(self, item_id: str, key: str, outputs: Iterable[str | Path] = ()) -> Any:
-        if item_id in self.values and self.cache.fresh(item_id, key, outputs):
-            return self.values[item_id]
-        return None
+        with self._lock:
+            if item_id in self.values and self.cache.fresh(item_id, key, outputs):
+                return self.values[item_id]
+            return None
 
     def put(self, item_id: str, key: str, value: Any) -> None:
-        self.values[item_id] = value
-        self.cache.put(item_id, key)
-        self._dirty += 1
-        if self._dirty >= 50:
-            self.save()
+        with self._lock:
+            self.values[item_id] = value
+            self.cache.put(item_id, key)
+            self._dirty += 1
+            if self._dirty >= 50:
+                self.save()
 
     def save(self) -> None:
-        if self._dirty:
-            write_json(self.path, self.values, indent=False)
-            self._dirty = 0
-        self.cache.save()
+        with self._lock:
+            if self._dirty:
+                write_json(self.path, self.values, indent=False)
+                self._dirty = 0
+            self.cache.save()

@@ -70,7 +70,7 @@ def test_presets_are_nested_and_made_of_real_backends(o_env: Path) -> None:
     roles = {registry.get(n).role for n in p["min"]}
     assert {"tts", "llm", "mos", "embedder", "asr", "ser"} <= roles  # one TTS family + translation + scoring + analysis
     tts = [n for n in p["min"] if registry.get(n).role == "tts"]
-    assert set(tts) == {"qwen3_tts", "qwen3_tts_voicedesign"} and {registry.get(n).env for n in tts} == {"hf"}  # one family, one env
+    assert set(tts) == {"qwen3_tts", "qwen3_tts_voicedesign"} and {registry.get(n).env for n in tts} == {"main"}  # one family, one env
     assert [n for n in p["min"] if registry.get(n).role == "llm"] == ["hy_mt15_7b"]  # the smallest translation model
     assert not any(n.startswith("mock_") or n == "sapi_tts" for n in p["all"])  # test-only backends are not offered
 
@@ -88,7 +88,7 @@ def test_models_endpoint_shape(o_env: Path) -> None:
     assert set(body) == {"rows", "presets", "preset_info", "disk"}
     assert body["disk"]["free_gb"] > 0 and body["disk"]["data_dir"] == str(o_env) and body["disk"]["models_dir"] == str(o_env / "models")
     row = next(r for r in body["rows"] if r["name"] == "qwen3_tts")
-    assert row["role"] == "tts" and row["env"] == "hf" and row["size_gb"] == pytest.approx(8.6) and row["vram_gb"] == 4.5
+    assert row["role"] == "tts" and row["env"] == "main" and row["size_gb"] == pytest.approx(8.6) and row["vram_gb"] == 4.5
     assert row["license"] == "Apache-2.0" and row["commercial_ok"] is True and row["present"] is False and row["usable"] is False
     assert row["reason"] in ("env_missing", "weights_missing") and row["selftest"] is None
     assert set(row["presets"]) == {"min", "recommended", "all"}
@@ -116,13 +116,13 @@ def test_table_agrees_with_vndub_models_status(o_env: Path) -> None:
 
 
 def test_present_and_usable_follow_the_weights_and_envs(o_env: Path) -> None:
-    spec = registry.get("utmos22")  # env 'score' + weights kind env
+    spec = registry.get("utmos22")  # env 'main' + weights kind env
     d = local_dir(appdirs.effective_models_dir(), spec.weights[0], spec.name)
     d.mkdir(parents=True)
     (d / MARKER).write_text("x", encoding="utf-8")
     row = next(r for r in models_api.list_models()["rows"] if r["name"] == "utmos22")
-    assert row["present"] is True and row["usable"] is False and row["reason"] == "env_missing" and row["reason_params"] == {"env": "score"}
-    envs = o_env.parent / "envs" / "score"
+    assert row["present"] is True and row["usable"] is False and row["reason"] == "env_missing" and row["reason_params"] == {"env": "main"}
+    envs = o_env.parent / "envs" / "main"
     (envs / "Scripts").mkdir(parents=True)
     (envs / "Scripts" / "python.exe").write_bytes(b"")
     (envs / "bin").mkdir(parents=True)

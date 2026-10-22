@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body
 from fastapi.responses import FileResponse
 
-from vndub_app import __version__, appdirs, jobs, pipeline, session, system
+from vndub_app import __version__, appdirs, installer, jobs, pipeline, session, system
 from vndub_app.errors import AppError
 
 log = logging.getLogger("vndub_app.routes.general")
@@ -17,7 +18,7 @@ router = APIRouter(prefix="/api")
 
 MEDIA_TYPES = {".wav": "audio/wav", ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".flac": "audio/flac", ".opus": "audio/ogg", ".m4a": "audio/mp4", ".weba": "audio/webm"}
 
-SETTINGS_KEYS = {"ui_lang", "gpu_budget_gb", "license_policy", "models_dir", "player_volume", "shutdown_when_done", "profile", "translation_llm"}
+SETTINGS_KEYS = {"ui_lang", "gpu_budget_gb", "license_policy", "models_dir", "envs_dir", "player_volume", "shutdown_when_done", "profile", "translation_llm"}
 
 
 def _bad(field: str, value: Any = None) -> AppError:
@@ -54,9 +55,63 @@ def health() -> dict[str, Any]:
     return {"ok": True, "version": __version__, "profile": s.profile, "mock": s.profile == "apptest"}
 
 
+def _check_folder(field: str, value: Any, *, busy_check: bool = False) -> str:
+    """A folder chosen in Settings: ``""`` (the default) or an absolute path the app can create and write to.
+
+    ``busy_check`` refuses (409 ``job_busy``) while any job runs: a job may be using the old folder.
+    """
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise _bad(field, value)
+    raw = value.strip()
+    if raw and not Path(raw).is_absolute():
+        raise _bad(field, raw)
+    if busy_check:
+        active = jobs.runner().list(active_only=True)
+        if active:
+            raise AppError("job_busy", params={"job_id": active[-1].id, "kind": active[-1].kind}, status=409)
+    if not raw:
+        return ""
+    p = Path(raw)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        probe = p / ".vndub_write_test"
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+    except OSError as e:
+        raise AppError("permission_denied", params={"path": raw}, action="open_data_dir", details=str(e)) from e
+    return str(p)
+
+
+def _paths_out(s: appdirs.Settings) -> dict[str, str]:
+    """Effective absolute folders: ``{data, models, envs, tools, python, uv_cache}`` (python / uv_cache are uv's, below envs).
+
+    The folders the UI offers to open are created if missing, so "Open" never fails on a fresh install.
+    """
+    envs = installer.resolve_envs_dir()  # what is in use (an outside VNDUB_ENVS_DIR wins), without exporting anything
+    uv = installer.uv_dirs(envs)
+    models = appdirs.effective_models_dir(s)
+    for p in (models, envs):
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return {
+        "data": str(appdirs.data_dir()),
+        "models": str(models),
+        "envs": str(envs),
+        "tools": str(appdirs.tools_dir()),
+        "python": uv["UV_PYTHON_INSTALL_DIR"],
+        "uv_cache": uv["UV_CACHE_DIR"],
+    }
+
+
 def _settings_out() -> dict[str, Any]:
-    d = appdirs.load_settings().model_dump(mode="json")
+    s = appdirs.load_settings()
+    d = s.model_dump(mode="json")
     d["data_dir"] = str(appdirs.data_dir())
+    d["paths"] = _paths_out(s)
     return d
 
 
@@ -88,7 +143,9 @@ def put_settings(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
             raise _bad("license_policy", body["license_policy"])
         s.license_policy = body["license_policy"]
     if "models_dir" in body:
-        s.models_dir = str(body["models_dir"] or "")
+        s.models_dir = _check_folder("models_dir", body["models_dir"])
+    if "envs_dir" in body:  # 409 while a job runs: it may be using the environments (or installing them)
+        s.envs_dir = _check_folder("envs_dir", body["envs_dir"], busy_check=True)
     if "player_volume" in body:
         if not isinstance(body["player_volume"], dict):
             raise _bad("player_volume")
@@ -105,6 +162,8 @@ def put_settings(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     if "translation_llm" in body:
         s.translation_llm = _check_translation_llm(body["translation_llm"])
     appdirs.save_settings(s)
+    if "envs_dir" in body:  # the pipeline in this process and the installer's child processes follow at once
+        installer.configure_environment(force=True)
     slug = session.current_slug()
     if slug:  # the generated pipeline.yaml carries models_dir / license / GPU budget
         try:
@@ -128,6 +187,8 @@ def set_data_dir(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         raise AppError("permission_denied", params={"path": raw}, action="open_data_dir", details=str(e)) from e
     jobs.reset_runner(None)  # the next runner() binds to the new folder
     session.reset()
+    if os.environ.get("VNDUB_ENVS_DIR"):  # already decided for the old folder: <data>/envs follows the data folder, unless Settings or an outside variable say otherwise
+        installer.configure_environment(force=True)
     from vndub_app import server
 
     server.setup_logging()

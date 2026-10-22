@@ -15,6 +15,9 @@ import { useProject } from "../state/project";
 import { stageDone } from "../util/format";
 import { useAutosave, type SaveStatus } from "../util/useAutosave";
 
+/** Languages the user can pick as the source language, next to "auto" (the order of the list). */
+const SRC_LANGS = ["ja", "en", "zh", "ko", "ru", "uk", "de", "fr", "es", "it", "pt"] as const;
+
 function SaveIndicator({ status }: { status: SaveStatus }) {
   const t = useI18n().t;
   return (
@@ -25,7 +28,7 @@ function SaveIndicator({ status }: { status: SaveStatus }) {
 }
 
 export default function TranslateScreen() {
-  const { t } = useI18n();
+  const { t, langName } = useI18n();
   const nav = useNavigate();
   const { project, reload } = useProject();
   const [tr, setTr] = useState<TranslationSettings | null>(null);
@@ -130,6 +133,16 @@ export default function TranslateScreen() {
   const translated = translatedHere || stageDone(project?.stage_status, "translate");
   const stale = translated && dirty;
   const importMode = tr.source === "import";
+  // the language the lines are in: the user's choice, or what the detector found when the choice is "auto"
+  const srcAuto = (tr.src_lang ?? "auto") === "auto";
+  const srcDetected = tr.src_lang_detected ?? null;
+  const srcCode = srcAuto ? (srcDetected?.lang ?? null) : tr.src_lang;
+  const sameLang = !!srcCode && srcCode === tr.tgt_lang;
+  const srcDetectedHint = !srcAuto
+    ? null
+    : srcDetected
+      ? t("translate.source_lang.detected", { lang: langName(srcDetected.lang), confidence: Math.round(Math.min(1, Math.max(0, srcDetected.confidence)) * 100) })
+      : t("translate.source_lang.unknown");
 
   return (
     <>
@@ -142,6 +155,19 @@ export default function TranslateScreen() {
 
       <Card testid="translate-basics">
         <SelectField
+          label={t("translate.source_lang")}
+          value={tr.src_lang ?? "auto"}
+          options={[{ value: "auto", label: t("translate.source_lang.auto") }, ...SRC_LANGS.map((c) => ({ value: c, label: langName(c) }))]}
+          onChange={(v) => updateTr({ src_lang: v })}
+          testid="translate-src-lang"
+        />
+        {srcDetectedHint ? (
+          <p className="hint src-lang-hint" data-testid="translate-src-lang-detected">
+            {srcDetectedHint}
+          </p>
+        ) : null}
+
+        <SelectField
           label={t("translate.target_lang")}
           value={tr.tgt_lang}
           options={[
@@ -151,6 +177,11 @@ export default function TranslateScreen() {
           onChange={(v) => updateTr({ tgt_lang: v })}
           testid="translate-lang"
         />
+        {sameLang ? (
+          <Callout tone="warn" testid="translate-same-lang">
+            {t("translate.same_lang")}
+          </Callout>
+        ) : null}
 
         <RadioGroup
           name="tr-source"

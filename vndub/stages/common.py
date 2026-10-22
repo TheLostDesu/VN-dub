@@ -26,7 +26,7 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
-from vndub.config import PipelineConfig, ProjectYaml, load_project_yaml
+from vndub.config import PipelineConfig, ProjectYaml, load_project_yaml, save_project_yaml
 from vndub.gpu import ModelRegistry
 from vndub.manifest.cache import FileHasher, StageCache
 from vndub.manifest.io import Character, LineRecord, iter_jsonl, load_characters, load_lines, read_json, write_json
@@ -80,6 +80,20 @@ class StageContext:
         if proj is not None and proj.game_dir:
             return Path(proj.game_dir)
         return self.project_dir
+
+    # -- languages -----------------------------------------------------------
+    @property
+    def src_lang(self) -> str:
+        """Language of the script text: ``project.yaml: src_lang`` when it is a code, else detected from the lines
+        and written back (see :func:`resolve_src_lang`); ``ja`` before any lines exist."""
+        return resolve_src_lang(self)
+
+    @property
+    def audio_lang(self) -> str:
+        """Language of the voice recordings: ``project.yaml: audio_lang`` (the config's when unset), else the text language."""
+        proj = self.project
+        code = (proj.audio_lang if proj is not None else "") or self.cfg.project.audio_lang
+        return code if code and code != "auto" else self.src_lang
 
     def engine(self):  # -> engines.base.Engine
         from vndub.engines import get_engine
@@ -209,6 +223,40 @@ class StageContext:
 # ----------------------------------------------------------------------------
 # source-text patches (mode C recovery, user edits)
 # ----------------------------------------------------------------------------
+
+
+def resolve_src_lang(ctx: StageContext, lines: list[LineRecord] | None = None, redetect: bool = False) -> str:
+    """The language of the script text.
+
+    A code in ``project.yaml`` (or, without a project file, in the config) wins. ``auto`` is resolved by
+    :func:`vndub.text.lang.detect_language` over the lines and written into ``project.yaml`` together with the
+    detection record (``src_lang_detected``), so every later stage reads the same code. ``redetect`` repeats
+    the detection for a value that came from an earlier detection (parse does that over the new lines); a code
+    the user set is never replaced. Without lines (nothing parsed yet) the legacy default ``ja`` is returned
+    and nothing is written.
+    """
+    from vndub.text.lang import AUTO, detect_language, language_name
+
+    proj = ctx.project
+    code = (proj.src_lang if proj is not None else "") or ctx.cfg.project.src_lang
+    was_detected = proj is not None and bool(getattr(proj, "src_lang_detected", None))
+    if code and code != AUTO and not (redetect and was_detected):
+        return code
+    fallback = code if code and code != AUTO else (ctx.cfg.project.src_lang if ctx.cfg.project.src_lang not in ("", AUTO) else "ja")
+    if lines is None:
+        if not ctx.paths.lines.exists():
+            return fallback
+        lines = ctx.lines(edits=False)
+    guess = detect_language(l.text_src for l in lines)
+    if not guess.lang:
+        ctx.log.warning("source language: the script text has no letters, keeping %s", fallback)
+        return fallback
+    if proj is not None:
+        proj.src_lang = guess.lang
+        proj.src_lang_detected = guess.as_dict()
+        save_project_yaml(ctx.paths.project_yaml, proj)
+    ctx.log.info("source language: %s (%s), confidence %.2f over %d lines", guess.lang, language_name(guess.lang), guess.confidence, guess.lines)
+    return guess.lang
 
 
 def apply_text_patches(paths: WorkPaths, lines: list[LineRecord], recovered: bool = True, edits: bool = True) -> list[LineRecord]:

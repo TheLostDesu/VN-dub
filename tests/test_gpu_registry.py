@@ -180,7 +180,7 @@ def _fake_weights(models: Path, name: str) -> None:
 
 def test_fallback_chain_to_usable_fallback(tmp_path: Path) -> None:
     root = tmp_path / "root"
-    _fake_env(root, "asr")
+    _fake_env(root, "main")
     _fake_weights(tmp_path / "models", "whisper_large_v3_turbo")  # anime_whisper weights absent
     reg, _ = make_reg(tmp_path, NoCuda(), check_usable=True, root=root, allow_cpu_fallback=True)
     s, sub = reg.resolve("anime_whisper")
@@ -193,7 +193,7 @@ def test_unusable_without_mock_lists_all_reasons(tmp_path: Path) -> None:
     with pytest.raises(BackendUnavailable) as ei:
         reg.resolve("anime_whisper")
     msg = str(ei.value)
-    assert "anime_whisper: env 'asr' not created" in msg and "whisper_large_v3_turbo: env 'asr' not created" in msg
+    assert "anime_whisper: env 'main' not created" in msg and "whisper_large_v3_turbo: env 'main' not created" in msg
 
 
 def test_test_profile_substitutes_mock(tmp_path: Path) -> None:
@@ -206,7 +206,7 @@ def test_test_profile_substitutes_mock(tmp_path: Path) -> None:
 
 def test_commercial_policy_filters_noncommercial(tmp_path: Path) -> None:
     root = tmp_path / "root"
-    _fake_env(root, "hf")
+    _fake_env(root, "main")
     _fake_weights(tmp_path / "models", "audeering_adv")
     reg, _ = make_reg(tmp_path, NoCuda(), check_usable=True, root=root, license_policy="commercial", allow_cpu_fallback=True)
     with pytest.raises(BackendUnavailable, match="license_policy=commercial"):
@@ -217,10 +217,65 @@ def test_commercial_policy_filters_noncommercial(tmp_path: Path) -> None:
 
 def test_heavy_needs_cuda_or_cpu_fallback_during_resolution(tmp_path: Path) -> None:
     root = tmp_path / "root"
-    _fake_env(root, "hf")
+    _fake_env(root, "main")
     _fake_weights(tmp_path / "models", "voxcpm2")  # cpu_ok=False
     reg, _ = make_reg(tmp_path, NoCuda(), check_usable=True, root=root, allow_cpu_fallback=True, fallback_to_mock=True)
     s, sub = reg.resolve("voxcpm2")
     assert s.name == "mock_tts" and "adapter needs a GPU" in sub.reason
     gpu, _ = make_reg(tmp_path, FakeCuda(), check_usable=True, root=root)
     assert gpu.resolve("voxcpm2")[0].name == "voxcpm2"
+
+
+# -- never from system RAM (2026-10-22) ---------------------------------------
+
+
+def test_dynamic_vram_estimate_grows_with_ctx_and_parallel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vndub.backends.base import estimate_vram_gb
+
+    llm = BackendSpec(
+        name="fake_llm", role="llm", env="fake", adapter="x", license="MIT", commercial_ok=True, vram_estimate_gb=6.0,
+        options={"ctx": 8192, "vram": {"weights_gib": 4.0, "kv_bytes_per_token": 131072, "overhead_gib": 1.0}},
+    )
+    monkeypatch.setattr(registry, "_SPECS", {**registry.all_specs(), "fake_llm": llm})
+    assert estimate_vram_gb(llm) == 6.0  # 4 + 1 (8K tokens x 128 KiB) + 1
+    assert estimate_vram_gb(llm, {"ctx": 16384}) == 7.0
+    assert estimate_vram_gb(llm, {"parallel": 2}) == 7.0
+    reg, _log = make_reg(tmp_path, FakeCuda(total_gb=8.0, other_gb=0.3), budget_gb=7.5)
+    reg.acquire("fake_llm")
+    ev = [json.loads(l) for l in (tmp_path / "gpu_events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert ev[-1]["vram_estimate_gb"] == 6.0
+    with pytest.raises(VramBudgetExceeded):
+        reg.acquire("fake_llm", {"parallel": 3})  # 4 + 3 + 1 = 8 GiB > 7.5 - 0.5
+
+
+class CpuTorchBackend(FakeBackend):
+    def load(self) -> dict[str, Any]:
+        self.loaded = True
+        return {"device": "cpu"}  # the env's torch has no CUDA: the adapter fell back silently
+
+
+def test_adapter_that_lands_on_cpu_is_refused_unless_allowed(tmp_path: Path, fake_specs) -> None:
+    log: list = []
+
+    def make(allow: bool) -> ModelRegistry:
+        return ModelRegistry(
+            cuda=FakeCuda(), check_usable=False, factory=lambda s, o, d: CpuTorchBackend(s, o, d, None, log),
+            models_dir=tmp_path / "m", log_dir=tmp_path / "l", allow_cpu_fallback=allow,
+        )
+
+    with pytest.raises(BackendUnavailable, match="no CUDA"):
+        make(False).acquire("big_a")
+    assert ("unload", "big_a", "cuda:0") in log  # the CPU-bound process was ended
+    reg = make(True)
+    b = reg.acquire("big_a")  # cpu_ok and the profile allows it: a warning, stays resident
+    assert reg.resident == ["big_a"] and b.loaded
+    with pytest.raises(BackendUnavailable):
+        make(True).acquire("gpu_only")  # cpu_ok=False: never
+
+
+def test_stage_level_substitution_is_recorded(tmp_path: Path, fake_specs) -> None:
+    reg, _log = make_reg(tmp_path, FakeCuda())
+    reg.acquire("big_b", substituted_for="huge", reason="huge: needs ~7.9 GB > budget")
+    assert [(s.requested, s.used) for s in reg.substitutions] == [("huge", "big_b")]
+    ev = [json.loads(l) for l in (tmp_path / "gpu_events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert ev[-1]["substituted_for"] == "huge" and ev[-1]["device_actual"] == "cuda:0"

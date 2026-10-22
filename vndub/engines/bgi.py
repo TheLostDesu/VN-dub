@@ -1,9 +1,13 @@
 """BGI / Ethornell: ``*.arc`` (BURIKO ARC20) + ``._bp`` scripts.
 
-Extraction: ``bgi-extractor -t -f json -o <out> <archive>`` (tools.yaml:
-``bgi_extractor``), which emits speaker + line + voice id per message. The JSON
-shape is not documented, so the parser is defensive: it accepts a list of
-records or a dict holding one (``lines``/``messages``/``entries``/``texts``),
+Extraction: ``bgi-extractor -t -f json --no-archive --no-single-file --no-presets
+-o <out> <archive>`` (tools.yaml: ``bgi_extractor``; the packaged app ships its own
+build), which writes one ``01_scripts/<archive>/<script>.json`` per script: a list of
+``{"type": "line"|"choice", "speaker"?, "text", "voice"?}``. Without the ``--no-*``
+switches it also writes the same records merged per archive and for the whole game,
+which would read every line three times. Choices (menu options) are not spoken and
+are skipped. The parser stays defensive for JSON from other tools: it accepts a list
+of records or a dict holding one (``lines``/``messages``/``entries``/``texts``),
 and reads speaker from ``speaker|name|character|chara``, text from
 ``text|line|message|msg``, voice from ``voice|voice_id|vo|voice_file``; voice ids
 embedded in text as ``(yuki_000003)`` are recognised too.
@@ -71,6 +75,8 @@ def _first(d: dict[str, Any], keys: tuple[str, ...]) -> str:
 def parse_bgi_json(data: Any) -> list[dict[str, str]]:
     out = []
     for r in iter_records(data):
+        if r.get("type") == "choice":
+            continue
         text = _first(r, TXT_KEYS)
         voice = _first(r, VO_KEYS)
         m = INLINE_VOICE.match(text)
@@ -99,6 +105,9 @@ class BgiEngine(BaseEngine):
         conf = 0.85 if exe else 0.7 if arcs else 0.6
         return DetectResult("bgi", conf, archives=[a.name for a in arcs], notes=["extract runs bgi-extractor -t -f json"])
 
+    # one JSON file per script (see the module docstring)
+    EXTRACT_ARGS = ("-t", "-f", "json", "--no-archive", "--no-single-file", "--no-presets")
+
     def extract(self, ctx: "StageContext") -> ExtractResult:
         game = ctx.game_dir
         raw = ctx.paths.raw / "bgi"
@@ -111,7 +120,7 @@ class BgiEngine(BaseEngine):
                 for a in sorted(game.glob("*.arc")):
                     out = raw / a.stem
                     out.mkdir(parents=True, exist_ok=True)
-                    r = ctx.tools.run("bgi_extractor", ["-t", "-f", "json", "-o", str(out), str(a)], check=False)
+                    r = ctx.tools.run("bgi_extractor", [*self.EXTRACT_ARGS, "-o", str(out), str(a)], check=False)
                     if r.returncode != 0:
                         warnings.append(f"bgi-extractor failed on {a.name}: {r.stderr.strip()[-200:]}")
             jsons = sorted(raw.rglob("*.json")) if raw.exists() else []
@@ -124,7 +133,8 @@ class BgiEngine(BaseEngine):
         notes = []
         for p in extracted.script_files:
             try:
-                data = json.loads(read_text_any(p))
+                # strict=False: bgi-extractor writes tabs and other control characters into strings unescaped
+                data = json.loads(read_text_any(p), strict=False)
             except json.JSONDecodeError as e:
                 notes.append(f"{p.name}: invalid JSON ({e})")
                 continue

@@ -6,7 +6,7 @@ SPECS = [
     BackendSpec(
         name="gigaam_v3",
         role="asr",
-        env="asr",
+        env="main",
         adapter="gigaam",
         license="MIT",
         commercial_ok=True,

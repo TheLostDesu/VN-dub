@@ -18,7 +18,7 @@ SPECS = [
     BackendSpec(
         name="torchcrepe",
         role="f0",
-        env="score",
+        env="main",
         adapter="torchcrepe",
         license="MIT",
         commercial_ok=True,
@@ -48,7 +48,7 @@ SPECS = [
     BackendSpec(
         name="silero",
         role="vad",
-        env="asr",
+        env="main",
         adapter="silero_vad",
         license="MIT",
         commercial_ok=True,
@@ -79,7 +79,7 @@ SPECS = [
     BackendSpec(
         name="ruaccent",
         role="stress",
-        env="asr",
+        env="main",
         adapter="ruaccent",
         license="MIT",
         commercial_ok=True,

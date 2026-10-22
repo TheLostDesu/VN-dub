@@ -1,8 +1,13 @@
 ﻿; VNDub installer (Inno Setup 6.3 or newer). Build: packaging\build_app.ps1 (does everything), or only the installer:
 ;   packaging\build_app.ps1 -InstallerOnly                 -> installer\VNDub-Setup.exe from the existing dist\VNDub
-;   iscc /DAppVersion=0.1.0 packaging\VNDub.iss            -> the same, by hand
-; Per-user install (no administrator rights, no UAC prompt): %LOCALAPPDATA%\Programs\VNDub, Start-menu shortcut,
-; entry under HKCU in "Apps & features". The app keeps its data (models, backend environments, projects, backups
+;   iscc /DAppVersion=0.5.0 packaging\VNDub.iss            -> the same, by hand
+; Per-user install (no administrator rights): %LOCALAPPDATA%\Programs\VNDub, Start-menu shortcut, entry under HKCU in
+; "Apps & features". The one exception is the Microsoft Visual C++ Redistributable the models need: when the runtime
+; of the machine is missing or older than 14.40, Setup runs {app}\redist\vc_redist.x64.exe, which shows Microsoft's own
+; UAC prompt (declining it, or any failure, never fails the setup; Diagnostics in the app offers it again). MinGit
+; (Git for Windows, portable) is installed to {app}\git for the environment installer, and bgi-extractor (BGI game
+; archives, built from source: upstream publishes no binaries) to {app}\bin\bgi-extractor. All of them come from
+; dist\VNDub (packaging\build_app.ps1 adds them). The app keeps its data (models, backend environments, projects, backups
 ; of game files, logs) in its own data folder (default %LOCALAPPDATA%\VNDub, see vndub_app/appdirs.py);
 ; uninstalling keeps that folder unless the user picks "delete" in the question asked by the uninstaller
 ; (silent uninstall: unins000.exe /VERYSILENT /DELETEDATA=1).
@@ -12,9 +17,21 @@
   #error VNDub.iss needs Inno Setup 6.3 or newer (UTF8Decode, x64compatible)
 #endif
 
+; These folders are added by packaging\build_app.ps1; compiling by hand without them would give an installer on which
+; no model starts (no vcruntime140.dll), no environment installs (no git) and BGI games cannot be read.
+#if !FileExists(SourcePath + "..\dist\VNDub\git\cmd\git.exe")
+  #error dist\VNDub\git\cmd\git.exe is missing: run packaging\build_app.ps1 (or -InstallerOnly) first
+#endif
+#if !FileExists(SourcePath + "..\dist\VNDub\redist\vc_redist.x64.exe")
+  #error dist\VNDub\redist\vc_redist.x64.exe is missing: run packaging\build_app.ps1 (or -InstallerOnly) first
+#endif
+#if !FileExists(SourcePath + "..\dist\VNDub\bin\bgi-extractor\bgi-extractor.exe")
+  #error dist\VNDub\bin\bgi-extractor\bgi-extractor.exe is missing: run packaging\build_app.ps1 (or -InstallerOnly) first
+#endif
+
 #define AppName "VNDub"
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.5.0"
 #endif
 #define AppPublisher "VNDub"
 #define AppExe "VNDub.exe"
@@ -62,6 +79,10 @@ english.DeleteDataInstruction=Delete the VNDub data?
 english.DeleteDataText=Data folder:%n%1%n%nIt holds the models, neural network environments, projects, backups of the original game files (needed to roll a patch back) and logs.
 english.DeleteDataKeep=Keep the data%nRecommended. The models will not have to be downloaded again, and projects can be continued after a reinstall.
 english.DeleteDataDelete=Delete the data%nEverything in the data folder will be erased permanently.
+russian.VCRedistInstalling=Установка Microsoft Visual C++ (среда выполнения, без неё не запускаются модели)...%nWindows может запросить права администратора: подтвердите запрос.
+russian.VCRedistFailed=Не удалось установить среду выполнения Microsoft Visual C++ (запрос Windows отклонён или установка не удалась).%n%nVNDub установлен. Без этой среды модели не запустятся: раздел «Диагностика» в программе предложит установить её ещё раз.
+english.VCRedistInstalling=Installing Microsoft Visual C++ (runtime; the models do not start without it)...%nWindows may ask for administrator permission: please confirm the prompt.
+english.VCRedistFailed=The Microsoft Visual C++ runtime could not be installed (the Windows prompt was declined or the installation failed).%n%nVNDub is installed. The models cannot start without this runtime: Diagnostics in the app offers to install it again.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -69,8 +90,13 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [InstallDelete]
 ; an upgrade replaces the bundled runtime wholesale (stale files of the old build must not linger)
 Type: filesandordirs; Name: "{app}\_internal"
+Type: filesandordirs; Name: "{app}\git"
+Type: filesandordirs; Name: "{app}\redist"
+Type: filesandordirs; Name: "{app}\bin"
 
 [Files]
+; the whole dist\VNDub folder: VNDub.exe, _internal, git\ (MinGit), redist\ (vc_redist.x64.exe) and bin\
+; (bgi-extractor). The redistributable stays on disk after Setup so that the app can offer to run it again.
 Source: "..\dist\VNDub\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
@@ -78,13 +104,24 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [UninstallDelete]
-; the bundled runtime may hold files created at run time (caches); the data folder is never inside it
+; the bundled runtime may hold files created at run time (caches); the data folder is never inside it.
+; Git, the redistributable and the bundled tools go with the rest of {app}; the system-wide Visual C++ runtime is never
+; uninstalled. (No folder in the data folder is called bin: the tools the app downloads live in <data>\tools.)
 Type: filesandordirs; Name: "{app}\_internal"
+Type: filesandordirs; Name: "{app}\git"
+Type: filesandordirs; Name: "{app}\redist"
+Type: filesandordirs; Name: "{app}\bin"
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+const
+  // the Visual C++ 2015-2022 runtime (HKLM, 64-bit view); binaries built with VS 2022 17.10+ (llama.cpp, torch 2.8) need 14.40+
+  VCRuntimeKey = 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64';
+  VCMinMajor = 14;
+  VCMinMinor = 40;
+
 var
   RemoveData: Boolean;
   DataDir: String;
@@ -166,6 +203,82 @@ begin
   DeleteFile(Dir + '\throughput.json');
   DeleteFile(Dir + '\model_selftests.json');
   RemoveDir(Dir);
+end;
+
+// Installed=1 and version 14.40 or newer (the same rule as vndub_app/doctor.py decide_vcruntime).
+function VCRuntimeIsCurrent(Installed, Major, Minor: Cardinal): Boolean;
+begin
+  Result := (Installed = 1) and ((Major > VCMinMajor) or ((Major = VCMinMajor) and (Minor >= VCMinMinor)));
+end;
+
+// True when vc_redist.x64.exe has to run: the runtime is not registered or is older than 14.40. The result is logged.
+function VCRuntimeMissingOrOld(): Boolean;
+var
+  Installed, Major, Minor: Cardinal;
+begin
+  Result := True;
+  if RegQueryDWordValue(HKLM64, VCRuntimeKey, 'Installed', Installed) and
+     RegQueryDWordValue(HKLM64, VCRuntimeKey, 'Major', Major) and
+     RegQueryDWordValue(HKLM64, VCRuntimeKey, 'Minor', Minor) then
+  begin
+    Log('VC++ runtime in the registry: Installed=' + IntToStr(Installed) + ' Major=' + IntToStr(Major) + ' Minor=' + IntToStr(Minor));
+    Result := not VCRuntimeIsCurrent(Installed, Major, Minor);
+  end
+  else
+    Log('VC++ runtime: no values under HKLM64\' + VCRuntimeKey);
+end;
+
+// Runs {app}\redist\vc_redist.x64.exe /install /quiet /norestart when the runtime is missing or too old. It is a
+// WiX bootstrapper that elevates itself, so Windows shows its own UAC prompt although Setup runs per user. Success
+// codes: 0, 1638 (a newer one is already installed), 3010 (done, restart advised). Declined prompt, failure or a
+// missing file are logged and never fail the setup: the app's Diagnostics offers the redistributable again.
+procedure InstallVCRuntime();
+var
+  Redist, Version: String;
+  Code: Integer;
+  Failed: Boolean;
+begin
+  if not VCRuntimeMissingOrOld() then
+  begin
+    Log('VC++ runtime check: 14.40 or newer is installed, vc_redist.x64.exe is skipped');
+    Exit;
+  end;
+  Redist := ExpandConstant('{app}\redist\vc_redist.x64.exe');
+  if not FileExists(Redist) then
+  begin
+    Log('VC++ runtime check: missing or older than 14.40, but ' + Redist + ' is not there: nothing to run');
+    Exit;
+  end;
+  if not GetVersionNumbersString(Redist, Version) then
+    Version := 'unknown';
+  Log('VC++ runtime check: missing or older than 14.40, running ' + Redist + ' (file version ' + Version + ') /install /quiet /norestart');
+  if not WizardSilent then
+  begin
+    WizardForm.StatusLabel.Caption := CustomMessage('VCRedistInstalling');
+    WizardForm.FilenameLabel.Caption := '';
+  end;
+  Failed := True;
+  if Exec(Redist, '/install /quiet /norestart', '', SW_HIDE, ewWaitUntilTerminated, Code) then
+  begin
+    if (Code = 0) or (Code = 1638) or (Code = 3010) then
+    begin
+      Failed := False;
+      Log('vc_redist.x64.exe exit code ' + IntToStr(Code) + ': success (1638 = a newer runtime is installed, 3010 = a restart is advised)');
+    end
+    else
+      Log('vc_redist.x64.exe exit code ' + IntToStr(Code) + ': the runtime was not installed (prompt declined or install failed); Setup continues');
+  end
+  else
+    Log('vc_redist.x64.exe could not be started: ' + SysErrorMessage(Code) + '; Setup continues');
+  if Failed then
+    SuppressibleMsgBox(CustomMessage('VCRedistFailed'), mbInformation, MB_OK, IDOK);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  // the files (and so the redistributable) are in place; the finish page comes next
+  if CurStep = ssPostInstall then
+    InstallVCRuntime();
 end;
 
 // Setup closes a running VNDub by itself (CloseApplications); Uninstall does not, and the app has no AppMutex, so

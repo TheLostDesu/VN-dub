@@ -11,6 +11,7 @@ import { Button, Callout, Card, Checkbox, Chip, Dialog, TextField } from "./ui";
 
 /** Plain-words names of the detected kinds (`models.hf.kind.<kind>`). */
 const KIND_TONE = { builtin: "neutral", gguf_llm: "accent", rvc: "info", files: "neutral" } as const;
+const ADD_JOBS = ["models_hf_add"];
 
 /** "Add a model by link" card of the Models screen: paste a Hugging Face link, check it, pick files, download. */
 export function HfModelCard({ onBuiltin, onAdded }: { onBuiltin: (name: string) => void; onAdded: () => void }) {
@@ -22,7 +23,6 @@ export function HfModelCard({ onBuiltin, onAdded }: { onBuiltin: (name: string) 
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [reco, setReco] = useState<HfRecommended[]>([]);
   const [custom, setCustom] = useState<CustomModel[]>([]);
-  const [added, setAdded] = useState<string | null>(null);
   const input = useRef<HTMLDivElement>(null);
 
   const loadCustom = useCallback(async () => {
@@ -41,21 +41,21 @@ export function HfModelCard({ onBuiltin, onAdded }: { onBuiltin: (name: string) 
       .catch(() => setReco([]));
   }, [loadCustom]);
 
+  // kinds: the download keeps running when the user leaves the Models screen; the card picks it up again on return
   const add = useJobTracker({
     onFinal: () => void loadCustom(),
-    onDone: (job) => {
-      const entry = job.result.entry as { label?: string } | undefined;
-      setAdded(entry?.label ?? ins?.repo ?? "");
-      onAdded();
-    },
+    onDone: () => onAdded(),
+    kinds: ADD_JOBS,
   });
+  // derived from the job (not from an onDone callback) so that a job picked up after a visit elsewhere also shows it
+  const addedEntry = add.job?.result.entry as { label?: string } | undefined;
+  const added = add.job?.state === "done" && !add.starting ? addedEntry?.label ?? (typeof add.job.params.repo === "string" ? add.job.params.repo : ins?.repo ?? "") : null;
 
   const inspect = async (text = url) => {
     const value = text.trim();
     if (!value) return;
     setInspecting(true);
     setError(null);
-    setAdded(null);
     setIns(null);
     add.reset();
     try {
@@ -84,7 +84,6 @@ export function HfModelCard({ onBuiltin, onAdded }: { onBuiltin: (name: string) 
   const downloadable = ins !== null && ins.kind !== "builtin";
   const startAdd = () => {
     if (!ins) return;
-    setAdded(null);
     void add.start(() => api.hfAdd({ repo: ins.repo, revision: ins.revision, files: chosen.map((f) => f.name), kind: ins.kind }));
   };
   const toggle = (name: string, on: boolean) =>
@@ -217,7 +216,7 @@ export function HfModelCard({ onBuiltin, onAdded }: { onBuiltin: (name: string) 
         </>
       ) : null}
       {add.error && !add.job ? <ErrorPanel error={add.error} onRetry={startAdd} /> : null}
-      {added !== null && add.job?.state === "done" ? (
+      {added !== null ? (
         <Callout tone="good" testid="models-hf-done" role="status">
           {t("models.hf.added", { label: added })}
         </Callout>

@@ -140,7 +140,7 @@
     },
     {
       "name": "bgi_extractor",
-      "version": "source",
+      "version": "1.0.0+68b2603",
       "kind": "download",
       "manual": true,
       "platforms": ["win32", "linux"],
@@ -154,10 +154,11 @@
       "size": null,
       "sha256": null,
       "verify": "none",
-      "unverified_reason": "the project publishes no release binaries (source only): build it yourself or ask a friend, then put bgi-extractor.exe into the folder shown",
+      "unverified_reason": "the project publishes no release binaries (source only): the Windows app ships its own build; elsewhere build it yourself, then put bgi-extractor.exe into the folder shown",
       "provides": {"bgi_extractor": "bgi-extractor.exe"},
+      "bundled": {"bgi_extractor": "bin/bgi-extractor/bgi-extractor.exe"},
       "extra": [],
-      "notes": "No GitHub releases exist on 2026-10-21; manual card only."
+      "notes": "No GitHub releases exist on 2026-10-21. packaging/build_app.ps1 compiles commit 68b260331fae9c91f9aa5262bdb9d2b741bc007b (2026-10-12) with MSVC and an embedded UTF-8 code page manifest, and the installer puts it into {app}\\bin\\bgi-extractor; that copy counts as installed. Dev runs and Linux keep the manual card."
     },
     {
       "name": "unrpa",

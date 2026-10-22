@@ -236,6 +236,21 @@ export function useGpu(): GpuReading | null {
   return g;
 }
 
+/**
+ * The job a screen should show for the given kinds: the newest active one (queued / running / paused), else the
+ * newest final one (done / failed / cancelled / interrupted). `accept` narrows the candidates (e.g. to one project).
+ * Pure: takes the `jobs` map of the store (or any list of jobs).
+ */
+export function latestJobOfKinds(jobs: Readonly<Record<string, JobInfo>> | readonly JobInfo[], kinds: readonly string[], accept?: (job: JobInfo) => boolean): JobInfo | null {
+  const list: readonly JobInfo[] = Array.isArray(jobs) ? (jobs as readonly JobInfo[]) : Object.values(jobs as Record<string, JobInfo>);
+  const mine = list.filter((j) => kinds.includes(j.kind) && (!accept || accept(j)));
+  const newest = (when: (j: JobInfo) => string) => (a: JobInfo, b: JobInfo) => (when(a) < when(b) ? 1 : when(a) > when(b) ? -1 : 0);
+  const active = mine.filter((j) => ACTIVE_STATES.includes(j.state)).sort(newest((j) => j.created));
+  if (active.length > 0) return active[0] as JobInfo;
+  const over = mine.filter((j) => FINAL_STATES.includes(j.state)).sort(newest((j) => j.finished ?? j.created));
+  return over[0] ?? null;
+}
+
 export interface JobTracker {
   job: JobInfo | null;
   starting: boolean;
@@ -248,26 +263,66 @@ export interface JobTracker {
   reset: () => void;
 }
 
+export interface JobTrackerOptions {
+  /** fires once when the tracked job ends in `done` */
+  onDone?: (job: JobInfo) => void;
+  /** fires once for any final state */
+  onFinal?: (job: JobInfo) => void;
+  /**
+   * Follow the server's jobs of these kinds by itself, so a screen that was left (a route change unmounts it) shows its
+   * job again when it is opened: an active job first, else the newest finished one that this UI session has seen.
+   * A job that is already over when it is picked up does NOT fire `onDone` / `onFinal` (it was reported, or the screen
+   * reloads its data on mount anyway). The history is not fetched from the server on purpose: the store learns about
+   * active jobs from the `hello` event and about the rest from live events, so a failed job from last week never
+   * reappears after a page reload.
+   */
+  kinds?: readonly string[];
+  /** with `kinds`: only jobs of this project (`null` = jobs without a project); a tracked job of another project is dropped */
+  project?: string | null;
+  /**
+   * with `kinds`: pick up running jobs only, never a finished one. For a control that exists in several places at once
+   * (the "report a problem" button sits in Settings and in every error panel) a finished job must stay where it was started.
+   */
+  activeOnly?: boolean;
+}
+
 /**
  * Start a job and follow it. `onDone` fires once when the tracked job ends in `done`;
- * `onFinal` fires once for any final state.
+ * `onFinal` fires once for any final state. With `kinds` it also re-attaches to the screen's job by itself.
  */
-export function useJobTracker(opts?: { onDone?: (job: JobInfo) => void; onFinal?: (job: JobInfo) => void }): JobTracker {
+export function useJobTracker(opts?: JobTrackerOptions): JobTracker {
   const [jobId, setJobId] = useState<string | null>(null);
   const [initial, setInitial] = useState<JobInfo | null>(null);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<ErrorInfo | null>(null);
   const job = useJob(jobId, initial);
+  const jobs = useProgressState().jobs;
   const optsRef = useRef(opts);
   optsRef.current = opts;
+  const jobIdRef = useRef(jobId);
+  jobIdRef.current = jobId;
   const firedFor = useRef<string | null>(null);
+  // jobs the screen cleared with reset(): auto-attach must not pull them back
+  const dismissed = useRef<Set<string>>(new Set());
+  const kindsKey = opts?.kinds ? opts.kinds.join("|") : null;
+  const scope = opts?.project;
+  const activeOnly = !!opts?.activeOnly;
 
   const attach = useCallback((j: JobInfo) => {
     ingestJob(j);
+    dismissed.current.delete(j.id);
     setInitial(j);
     setJobId(j.id);
     setStartError(null);
     firedFor.current = null;
+  }, []);
+
+  /** Attach a job the store already knows. A job that is over is marked as reported: no onDone / onFinal for it. */
+  const follow = useCallback((j: JobInfo) => {
+    setInitial(j);
+    setJobId(j.id);
+    setStartError(null);
+    firedFor.current = FINAL_STATES.includes(j.state) ? `${j.id}:${j.state}` : null;
   }, []);
 
   const start = useCallback(
@@ -288,12 +343,38 @@ export function useJobTracker(opts?: { onDone?: (job: JobInfo) => void; onFinal?
     [attach],
   );
 
-  const reset = useCallback(() => {
+  const clear = useCallback(() => {
     setJobId(null);
     setInitial(null);
     setStartError(null);
     firedFor.current = null;
   }, []);
+
+  const reset = useCallback(() => {
+    // with `kinds` the cleared panel must stay cleared: remember the shown job and the finished ones the store holds
+    const kinds = optsRef.current?.kinds;
+    if (kinds) {
+      for (const j of Object.values(state.jobs)) if (kinds.includes(j.kind) && FINAL_STATES.includes(j.state)) dismissed.current.add(j.id);
+    }
+    if (jobIdRef.current) dismissed.current.add(jobIdRef.current);
+    clear();
+  }, [clear]);
+
+  // Auto-attach (only with `kinds`): nothing attached -> the most relevant job; a finished job attached -> a newer active one.
+  useEffect(() => {
+    if (kindsKey === null) return;
+    const inScope = (j: JobInfo) => scope === undefined || (j.project ?? null) === scope;
+    const cand = latestJobOfKinds(jobs, kindsKey.split("|"), (j) => inScope(j) && !dismissed.current.has(j.id) && (!activeOnly || ACTIVE_STATES.includes(j.state)));
+    if (job && !inScope(job)) {
+      // the open project changed under a tracked job of the old one
+      if (cand) follow(cand);
+      else clear();
+      return;
+    }
+    if (!cand || cand.id === jobId) return;
+    const attachedIsOver = !!job && FINAL_STATES.includes(job.state);
+    if (!jobId || (attachedIsOver && ACTIVE_STATES.includes(cand.state))) follow(cand);
+  }, [jobs, kindsKey, scope, activeOnly, jobId, job, follow, clear]);
 
   useEffect(() => {
     if (!job || !FINAL_STATES.includes(job.state)) return;

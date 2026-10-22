@@ -15,7 +15,7 @@ SPECS = [
     BackendSpec(
         name="qwen2_audio",
         role="caption",
-        env="hf",
+        env="main",
         adapter="qwen2_audio",
         license="Apache-2.0",
         commercial_ok=True,

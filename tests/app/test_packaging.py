@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import shutil
@@ -98,6 +99,83 @@ def test_iss_installer_contract() -> None:
     assert "Удалить данные" in text and "Оставить данные" in text
 
 
+def _section(text: str, name: str) -> str:
+    m = re.search(rf"^\[{name}\]\s*\n(.*?)(?=^\[|\Z)", text, re.M | re.S)
+    assert m, name
+    return m.group(1)
+
+
+def test_iss_carries_git_and_the_redistributable_and_removes_them_with_the_app() -> None:
+    text = _iss_text()
+    # both folders come from dist\VNDub (build_app.ps1 adds them): the one recursive Source picks them up
+    files = _section(text, "Files")
+    assert r'Source: "..\dist\VNDub\*"; DestDir: "{app}"' in files and "recursesubdirs" in files and "createallsubdirs" in files
+    assert "git" in files and "redist" in files  # named in the comment; nothing excludes them
+    assert "Excludes" not in files
+    # compiling without them is an error, not an installer on which no model starts
+    assert r'FileExists(SourcePath + "..\dist\VNDub\git\cmd\git.exe")' in text
+    assert r'FileExists(SourcePath + "..\dist\VNDub\redist\vc_redist.x64.exe")' in text
+    # an upgrade replaces them, an uninstall removes them (the redistributable stays on disk in between for the app to run again)
+    for section in ("InstallDelete", "UninstallDelete"):
+        body = _section(text, section)
+        for folder in ("git", "redist"):
+            assert f'Type: filesandordirs; Name: "{{app}}\\{folder}"' in body, (section, folder)
+    # the system-wide runtime is never uninstalled, and the file is not deleted after the install
+    assert "/uninstall" not in text.lower() and "vc_redist" not in text.split("procedure CurUninstallStepChanged", 1)[1]
+    assert "deleteafterinstall" not in text.lower()
+
+
+def test_iss_carries_the_bundled_bgi_extractor() -> None:
+    """bin\\bgi-extractor (compiled by build_app.ps1) ships like Git: required to compile, replaced on upgrade, removed on uninstall."""
+    text = _iss_text()
+    assert r'FileExists(SourcePath + "..\dist\VNDub\bin\bgi-extractor\bgi-extractor.exe")' in text
+    for section in ("InstallDelete", "UninstallDelete"):
+        assert 'Type: filesandordirs; Name: "{app}\\bin"' in _section(text, section), section
+    # the app looks where the manifest says, and that folder is one the data folder never uses: a data folder the
+    # user put inside {app} must survive an upgrade
+    manifest = json.loads((ROOT / "app" / "tools_manifest.json").read_text(encoding="utf-8"))
+    bundled = [rel for e in manifest["tools"] for rel in (e.get("bundled") or {}).values()]
+    assert bundled and all(rel.startswith("bin/") for rel in bundled)
+    data_names = set(re.findall(r"(?:DelTree|DeleteFile)\(Dir \+ '\\([A-Za-z0-9_.]+)'", text.split("[Code]", 1)[1]))
+    assert "tools" in data_names and "bin" not in data_names
+
+
+def test_iss_runs_the_redistributable_only_when_the_runtime_is_missing_or_old() -> None:
+    text = _iss_text()
+    code = text.split("[Code]", 1)[1]
+    # the check: HKLM, 64-bit view, VS 14.0 Runtimes\x64; Installed = 1 and Major.Minor >= 14.40
+    assert "HKLM64" in code and r"VCRuntimeKey = 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64'" in code
+    assert "VCMinMajor = 14;" in code and "VCMinMinor = 40;" in code
+    assert "(Installed = 1) and ((Major > VCMinMajor) or ((Major = VCMinMajor) and (Minor >= VCMinMinor)))" in code
+    for value in ("'Installed'", "'Major'", "'Minor'"):
+        assert f"VCRuntimeKey, {value}" in code
+    body = code.split("procedure InstallVCRuntime();", 1)[1].split("procedure CurStepChanged", 1)[0]
+    # the run is behind the check: the missing-or-old branch is the only one that gets to Exec
+    check = body.index("if not VCRuntimeMissingOrOld() then")
+    skipped = body.index("vc_redist.x64.exe is skipped")
+    run = body.index("Exec(Redist, '/install /quiet /norestart', '', SW_HIDE, ewWaitUntilTerminated, Code)")
+    assert check < skipped < run and "Exit;" in body[check:run]
+    assert "ExpandConstant('{app}\\redist\\vc_redist.x64.exe')" in body and "FileExists(Redist)" in body
+    # success = 0, 1638 (a newer one is installed), 3010 (restart advised); anything else is logged and the setup goes on
+    assert "(Code = 0) or (Code = 1638) or (Code = 3010)" in body
+    for word in ("RaiseException", "Abort", "WizardForm.Close", "Halt", "ExitSetupMsgBox"):
+        assert word not in body, word
+    assert body.count("Log(") >= 6 and "IntToStr(Code)" in body  # the decision and the exit code are in the install log
+    # it runs after the files are in place, with a status message in both languages
+    assert re.search(r"procedure CurStepChanged\(CurStep: TSetupStep\);\s*begin.*?\n\s*if CurStep = ssPostInstall then\s*InstallVCRuntime\(\);", code, re.S)
+    assert "WizardForm.StatusLabel.Caption := CustomMessage('VCRedistInstalling')" in body and "not WizardSilent" in body
+    for lang in ("russian", "english"):
+        for msg in ("VCRedistInstalling", "VCRedistFailed"):
+            assert f"{lang}.{msg}=" in text, (lang, msg)
+    assert "Visual C++" in text and "администратора" in text and "administrator" in text
+    # per-user setup stays: the redistributable elevates itself, Setup does not
+    assert "PrivilegesRequired=lowest" in text and "PrivilegesRequiredOverridesAllowed" not in text
+    # the decision is the one of the Doctor row (same key, same minimum)
+    from vndub_app import doctor
+
+    assert doctor.VC_REG_KEY in code and f"VCMinMinor = {doctor.VC_MIN[1]};" in code
+
+
 def test_iss_data_list_covers_what_the_app_writes() -> None:
     """The uninstaller removes a fixed list of data entries: a new top-level folder/file of the app must be added to it."""
     code = _iss_text().split("[Code]", 1)[1]
@@ -141,6 +219,128 @@ def test_build_script_installer_only_switch() -> None:
     assert "LastWriteTime -lt $tc" in text
 
 
+def _build_script() -> str:
+    return (PKG / "build_app.ps1").read_text(encoding="utf-8")
+
+
+def test_build_script_bundles_the_vc_redistributable_with_a_signature_check() -> None:
+    text = _build_script()
+    # the permalink serves the latest build, so no hash is pinned: the Microsoft signature is the check
+    assert "https://aka.ms/vs/17/release/vc_redist.x64.exe" in text
+    assert "Get-AuthenticodeSignature" in text and '$sig.Status -ne "Valid"' in text and "CN=Microsoft Corporation" in text
+    check = text.split("function Get-SignatureProblem", 1)[1].split("function Get-VcRedist", 1)[0]
+    assert "not by Microsoft Corporation" in check and "return $null" in check
+    # a rejected download is deleted and fails the build; the copy in dist\VNDub is checked again
+    fetch = text.split("function Get-VcRedist", 1)[1].split("function Test-MinGitZip", 1)[0]
+    assert "Remove-Item -Force $new; throw" in fetch and "Get-SignatureProblem $file" in fetch
+    assert "Get-SignatureProblem $redistDst" in text
+    # cached in the git-ignored staging folder (-RefreshRedist downloads again); the file version is recorded
+    assert 'Join-Path $staging "redist"' in text and "[switch]$RefreshRedist" in text and "Test-Path $file" in fetch
+    assert "VersionInfo.FileVersion" in text and 'Join-Path $dist "redist"' in text
+    assert "packaging/_staging/" in (ROOT / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_build_script_pins_mingit_by_url_size_and_sha256() -> None:
+    text = _build_script()
+    block = text.split("$MinGit = @{", 1)[1].split("}", 1)[0]
+    url = re.search(r'Url\s*=\s*"([^"]+)"', block)
+    assert url and url.group(1).startswith("https://github.com/git-for-windows/git/releases/download/v")
+    assert url.group(1).endswith("-64-bit.zip") and "busybox" not in url.group(1) and "MinGit-" in url.group(1)
+    version = re.search(r'Version\s*=\s*"([\d.]+)"', block)
+    git_version = re.search(r'GitVersion\s*=\s*"([\w.]+)"', block)
+    assert version and git_version and git_version.group(1).startswith(version.group(1).rsplit(".", 1)[0])
+    assert f"MinGit-{version.group(1)}-64-bit.zip" in url.group(1)
+    sha = re.search(r'Sha256\s*=\s*"([0-9a-f]{64})"', block)
+    size = re.search(r"Size\s*=\s*(\d{7,})", block)
+    assert sha and size
+    # verified after every download and for the cached copy; a mismatch is an error
+    assert "Get-FileHash $file -Algorithm SHA256" in text and "$MinGit.Sha256" in text and "$MinGit.Size" in text
+    assert "does not match the pinned size" in text
+    # extracted to dist\VNDub\git, the version it reports is checked, the GPL notice must be there
+    assert 'Join-Path $dist "git"' in text and r'"cmd\git.exe"' in text and "$MinGit.GitVersion" in text
+    assert "LICENSE.txt" in text and "ExtractToDirectory" in text
+    # if an earlier build left the zip in the staging folder, it is still the pinned one
+    cached = ROOT / "packaging" / "_staging" / "mingit" / url.group(1).rsplit("/", 1)[1]
+    if cached.is_file():
+        import hashlib
+
+        assert cached.stat().st_size == int(size.group(1))
+        assert hashlib.sha256(cached.read_bytes()).hexdigest() == sha.group(1)
+
+
+def test_build_script_adds_the_runtime_after_pyinstaller_and_also_for_installer_only() -> None:
+    text = _build_script()
+    only, full = text.split("if ($InstallerOnly) {", 1)[1].split("} else {", 1)
+    assert "Add-BundledRuntime" in only  # the folder may predate this change: fill what is missing, keep what is there
+    assert full.index('Run "pyinstaller"') < full.index("Add-BundledRuntime") < full.index("--selfcheck")  # PyInstaller recreates dist\VNDub
+    assert text.index("function Add-BundledRuntime") < text.index("Add-BundledRuntime\n")  # defined before the first call
+    summary = text.split('Step "summary"', 1)[1]
+    assert "VC++ redist" in summary and "git        :" in summary
+
+
+def test_build_script_compiles_bgi_extractor_from_a_pinned_commit() -> None:
+    text = _build_script()
+    block = text.split("$BgiExtractor = @{", 1)[1].split("\n}", 1)[0]
+    assert 'Repo    = "https://github.com/mirinnano/bgi-extractor.git"' in block
+    assert re.search(r'Commit\s*=\s*"[0-9a-f]{40}"', block)
+    # fetched by commit id, then it must be an unmodified checkout of that commit (cached in the git-ignored staging folder)
+    assert '"fetch", "-q", "--depth", "1", $BgiExtractor.Repo, $BgiExtractor.Commit' in text
+    assert '"rev-parse", "HEAD"' in text and '"status", "--porcelain"' in text and 'Join-Path $staging "bgi-extractor\\src"' in text
+    # MSVC via vcvars64.bat: static C runtime, UTF-8 sources, the UTF-8 code page manifest embedded; the MIT notice ships along
+    flags = set(re.search(r'ClFlags\s*=\s*"([^"]+)"', block).group(1).split())
+    assert {"/MT", "/utf-8", "/std:c++17", "/EHsc", "/O2"} <= flags
+    assert "vswhere.exe" in text and "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" in text and "vcvars64.bat" in text
+    assert "/MANIFEST:EMBED /MANIFESTINPUT:" in text and '"LICENSE.txt"' in text
+    # a change of commit, flags, sources or manifest compiles again
+    stamp = text.split("function Get-BgiStamp", 1)[1].split("function Build-BgiExtractor", 1)[0]
+    for part in ("$BgiExtractor.Commit", "$BgiExtractor.ClFlags", "$BgiExtractor.Sources", "bgi-extractor.manifest"):
+        assert part in stamp, part
+    # every build checks the copy in dist: it starts, and it opens an archive in a folder with Japanese characters
+    check = text.split("function Get-BgiExtractorProblem", 1)[1].split("function Add-BundledTools", 1)[0]
+    assert "--help" in check and "0x30C6" in check and "BURIKO ARC20" in check and r"\(0 entries\)" in check
+    assert "Get-BgiExtractorProblem $exe" in text and 'Join-Path $Root "dist\\VNDub\\bin\\bgi-extractor"' in text
+    # after MinGit (it can fetch the source), before the self-check (which looks for it), also for -InstallerOnly
+    only, full = text.split("if ($InstallerOnly) {", 1)[1].split("} else {", 1)
+    assert only.index("Add-BundledRuntime") < only.index("Add-BundledTools")
+    assert full.index("Add-BundledRuntime") < full.index("Add-BundledTools") < full.index("--selfcheck")
+    assert "bgi-extractor" in text.split('Step "summary"', 1)[1]
+
+
+def test_bgi_extractor_manifest_sets_the_utf8_code_page() -> None:
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(PKG / "bgi-extractor.manifest").getroot()
+    ns = "{http://schemas.microsoft.com/SMI/2019/WindowsSettings}"
+    assert [el.text for el in root.iter(f"{ns}activeCodePage")] == ["UTF-8"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win") or shutil.which("powershell") is None, reason="needs Windows PowerShell")
+def test_signature_check_accepts_microsoft_and_rejects_everything_else(tmp_path: Path) -> None:
+    """Run the build script's own Get-SignatureProblem on files with and without a (Microsoft Corporation) signature."""
+    func = re.search(r"function Get-SignatureProblem.*?\n\}\n", _build_script(), re.S)
+    assert func
+    system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    windows_signed = system32 / "notepad.exe"  # signed by "Microsoft Windows": a Microsoft certificate, but not Microsoft Corporation
+    unsigned = tmp_path / "plain.exe"
+    unsigned.write_bytes(b"MZ not signed")
+    staged = PKG / "_staging" / "redist" / "vc_redist.x64.exe"  # present after one build; signed by Microsoft Corporation
+    files = [windows_signed, unsigned] + ([staged] if staged.is_file() else [])
+    script = tmp_path / "check.ps1"
+    script.write_text(
+        func.group(0)
+        + "\n$ErrorActionPreference = 'Stop'\n"
+        + "foreach ($f in $args) { if (Test-Path $f) { $p = Get-SignatureProblem $f; Write-Output ('[' + (Split-Path -Leaf $f) + '] ' + $(if ($p) { $p } else { 'OK' })) } }\n",
+        encoding="utf-8",
+    )
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), *map(str, files)], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[plain.exe] signature status is " in r.stdout  # not Valid: refused
+    if windows_signed.is_file():
+        assert "[notepad.exe] OK" not in r.stdout  # only "Microsoft Corporation" passes
+    if staged.is_file():
+        assert "[vc_redist.x64.exe] OK" in r.stdout
+
+
 def test_installer_version_is_the_app_version() -> None:
     import tomllib
 
@@ -179,17 +379,22 @@ def test_installer_script_compiles(tmp_path: Path) -> None:
     """Compile packaging/VNDub.iss for real (a tiny payload instead of dist\\VNDub, so it takes seconds): no errors, no warnings."""
     iscc = _find_iscc()
     assert iscc
-    payload = tmp_path / "payload"
+    # the same layout as the repository: <root>/packaging/VNDub.iss next to <root>/dist/VNDub (with the bundled runtime)
+    pkg = tmp_path / "packaging"
+    payload = tmp_path / "dist" / "VNDub"
     (payload / "_internal").mkdir(parents=True)
+    (payload / "git" / "cmd").mkdir(parents=True)
+    (payload / "redist").mkdir()
+    (payload / "bin" / "bgi-extractor").mkdir(parents=True)
+    pkg.mkdir()
     (payload / "VNDub.exe").write_bytes(b"MZ")
     (payload / "_internal" / "a.txt").write_text("x", encoding="utf-8")
-    text = _iss_text()
-    files_line = 'Source: "..\\dist\\VNDub\\*"'
-    icon_line = "SetupIconFile=VNDub.ico"
-    assert files_line in text and icon_line in text
-    text = text.replace(files_line, f'Source: "{payload}\\*"').replace(icon_line, f"SetupIconFile={PKG / 'VNDub.ico'}")
-    script = tmp_path / "VNDub.iss"
-    script.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))  # keep the BOM: the Russian messages depend on it
+    (payload / "git" / "cmd" / "git.exe").write_bytes(b"MZ")
+    (payload / "redist" / "vc_redist.x64.exe").write_bytes(b"MZ")
+    (payload / "bin" / "bgi-extractor" / "bgi-extractor.exe").write_bytes(b"MZ")
+    shutil.copy(PKG / "VNDub.ico", pkg / "VNDub.ico")
+    script = pkg / "VNDub.iss"
+    script.write_bytes(b"\xef\xbb\xbf" + _iss_text().encode("utf-8"))  # keep the BOM: the Russian messages depend on it
     out = tmp_path / "out"
     r = subprocess.run([iscc, f"/O{out}", "/DAppVersion=9.9.9", str(script)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
     log = r.stdout + r.stderr
@@ -199,6 +404,13 @@ def test_installer_script_compiles(tmp_path: Path) -> None:
     assert not warnings, warnings
     setup = out / "VNDub-Setup.exe"
     assert setup.is_file() and setup.stat().st_size > 1_000_000
+    # a payload without Git (or without the redistributable, or bgi-extractor) is refused: no installer on which clean machines break
+    (payload / "bin" / "bgi-extractor" / "bgi-extractor.exe").unlink()
+    r = subprocess.run([iscc, f"/O{out}", "/DAppVersion=9.9.9", str(script)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
+    assert r.returncode != 0 and "bgi-extractor.exe is missing" in r.stdout + r.stderr
+    (payload / "git" / "cmd" / "git.exe").unlink()
+    r = subprocess.run([iscc, f"/O{out}", "/DAppVersion=9.9.9", str(script)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
+    assert r.returncode != 0 and "git.exe is missing" in r.stdout + r.stderr
 
 
 @pytest.mark.skipif(not sys.platform.startswith("win") or shutil.which("powershell") is None, reason="needs Windows PowerShell")

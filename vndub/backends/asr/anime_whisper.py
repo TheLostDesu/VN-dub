@@ -11,7 +11,7 @@ SPECS = [
     BackendSpec(
         name="anime_whisper",
         role="asr",
-        env="asr",
+        env="main",
         adapter="faster_whisper",
         license="MIT",
         commercial_ok=True,

@@ -284,6 +284,12 @@ def _build_import(slug: str, p: dict[str, Any]) -> FlowFn:
         names = available_stages(["detect", "extract", "parse", "link", "analyze", "text_emotion"])
         job.set_stages(names)
         extra = {"engine": p["engine"]} if p.get("engine") else None
+        # the languages of an existing project file follow the Step 2 choices before detect keeps them
+        # (a code that was never detected and no longer chosen becomes "auto": parse detects it over the lines)
+        from vndub_app import translation
+
+        tr = appdirs.read_app_state(h).get("translation", {})
+        translation._sync_project_lang(h, tr.get("tgt_lang", "ru"), str(tr.get("src_lang") or "auto"))
         with pipeline_ctx(h, job, force=bool(p.get("force")), extra=extra) as ctx:
             run_stages(ctx, job, names)
         snap = viewdata.snapshot(h)

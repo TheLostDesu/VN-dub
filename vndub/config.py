@@ -40,7 +40,10 @@ class ProjectSection(_Section):
     work_dir: str = "work"
     out_dir: str = "out"
     models_dir: str = "models"
-    src_lang: str = "ja"
+    # auto = detect the language of the script text (parse writes it into work/project.yaml), or a code: ja, en, zh, ko, ru ...
+    src_lang: str = "auto"
+    # language of the voice recordings when it differs from the text (a translated release with the original voices); "" = same
+    audio_lang: str = ""
     tgt_lang: str = "ru"
 
 
@@ -203,10 +206,17 @@ class LlmOpts(_Section):
     backend: str = "gemma4_12b"
     fallbacks: list[str] = Field(default_factory=lambda: ["qwen35_9b", "hy_mt15_7b"])
     ctx: int = 16384
+    # -1 = every layer on the GPU and never a silent partial offload (llama-server's own --fit is switched off; a
+    # model that does not fit fails over to the next fallback); a number = that many layers, a partial offload on purpose
     n_gpu_layers: int = -1
     temperature: float = 0.3
     port: int = 8089
     max_retries: int = 2
+    # more llama-server flags, e.g. ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"] (a quantized KV cache: half the size)
+    extra_args: list[str] = Field(default_factory=list)
+    # llama-server slots: this many scenes are translated at the same time (continuous batching). The KV cache
+    # grows with ctx x parallel, so 2 needs a card with VRAM to spare beyond the model (12 GB+ for the 12B model).
+    parallel: int = 1
     # used by `vndub translate --real` when backend is the mock (test profile)
     real_backend: str = "gemma4_12b"
 
@@ -479,7 +489,10 @@ class ProjectYaml(_Open):
     game_dir: str
     engine: str = "generic"
     engine_version: str = ""
-    src_lang: str = "ja"
+    src_lang: str = "auto"
+    # written by parse when src_lang was detected: {lang, confidence, letters, lines, scripts}; absent for a user-set code
+    src_lang_detected: dict | None = None
+    audio_lang: str = ""
     tgt_lang: str = "ru"
     voice_codec: VoiceCodec = Field(default_factory=VoiceCodec)
     encrypted: bool = False

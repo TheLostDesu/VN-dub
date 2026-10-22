@@ -26,6 +26,8 @@ BIG = os.urandom(300_000) + b"tail"
 def o_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     data = make_env(monkeypatch, tmp_path)
     fresh_runner()
+    # install_envs / ensure_pytools first make sure of a managed Python (uv python install): not in these tests
+    monkeypatch.setattr(installer, "ensure_python", lambda version, ctx: Path("python"))
     yield data
     installer.set_manifest_override(None)
     doctor.set_probes(None)
@@ -349,7 +351,7 @@ def test_endpoint_validation(o_env: Path, tmp_path: Path) -> None:
     assert r.status_code == 422 and r.json()["error"]["code"] == "bad_request"
     assert c.post("/api/tools/install", json={"names": []}).status_code == 422
     assert c.post("/api/envs/install", json={"envs": ["nope"]}).status_code == 422
-    assert c.post("/api/envs/install", json={"envs": ["asr"], "torch": "tpu"}).status_code == 422
+    assert c.post("/api/envs/install", json={"envs": ["main"], "torch": "tpu"}).status_code == 422
 
 
 def test_wrapper_launcher_runs_the_script_with_the_tools_python(o_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -432,13 +434,14 @@ def test_pip_failure_is_mapped(o_env: Path, tmp_path: Path, monkeypatch: pytest.
 
 def test_env_listing_matches_the_requirement_files(o_env: Path) -> None:
     names = installer.env_names()
-    assert "asr" in names and "hf" in names and "llm" not in names  # llm.txt installs nothing
+    assert "main" in names and "funasr" in names and "llm" not in names  # llm.txt installs nothing
+    assert not {"asr", "hf", "score"} & set(names)  # merged into main (one torch 2.8 env) on 2026-10-22
     assert all("+" not in n and "." not in n for n in names)
     c = client_for(installer)
     rows = {r["name"]: r for r in c.get("/api/envs").json()}
     assert set(rows) == set(names) and all(r["present"] is False and r["torch"] is None for r in rows.values())
-    assert rows["rvc"]["needs_git"] is True and rows["asr"]["needs_git"] is False
-    assert "qwen3_tts" in rows["hf"]["backends"]
+    assert rows["rvc"]["needs_git"] is True and rows["main"]["needs_git"] is False  # main clones only in its optional extras
+    assert {"qwen3_tts", "anime_whisper", "utmos22"} <= set(rows["main"]["backends"])  # tts + asr + scoring share the env
 
 
 def fake_make_envs(tmp_path: Path, *, fail: bool = False):
@@ -460,7 +463,7 @@ def fake_make_envs(tmp_path: Path, *, fail: bool = False):
         encoding="utf-8",
     )
 
-    def build(envs: list[str], torch: str, envs_path: Path) -> tuple[list[str], dict[str, str]]:
+    def build(envs: list[str], torch: str, envs_path: Path, python: Path | None = None) -> tuple[list[str], dict[str, str]]:
         return [sys.executable, str(script), str(envs_path), torch, "1" if fail else "0", *envs], {}
 
     return build
@@ -476,36 +479,36 @@ def run_env_job(envs: list[str], torch: str) -> dict[str, Any]:
 def test_env_install_streams_the_script_output_and_reports_per_env(o_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(installer, "build_make_envs_command", fake_make_envs(tmp_path))
     monkeypatch.setattr(installer, "find_uv", lambda: Path("uv"))
-    done = run_env_job(["asr", "score"], "cpu")
+    done = run_env_job(["main", "funasr"], "cpu")
     assert done["state"] == "done", done.get("error")
-    assert done["result"]["envs"] == ["asr", "score"] and done["result"]["torch"] == "cpu"
+    assert done["result"]["envs"] == ["main", "funasr"] and done["result"]["torch"] == "cpu"
     assert [f["state"] for f in done["result"]["files"]] == ["done", "done"]
     log = "\n".join(done["log_tail"])
-    assert "== env asr (CPU)" in log and "== env score (CPU)" in log and "score: ok" in log
+    assert "== env main (CPU)" in log and "== env funasr (CPU)" in log and "funasr: ok" in log
     assert done["done"] == 2 and done["total"] == 2  # envs are the progress unit
     rows = {r["name"]: r for r in installer.list_envs()}
-    assert rows["asr"]["present"] and rows["asr"]["torch"] == "cpu" and rows["score"]["present"] and not rows["hf"]["present"]
+    assert rows["main"]["present"] and rows["main"]["torch"] == "cpu" and rows["funasr"]["present"] and not rows["chatterbox"]["present"]
 
 
 def test_env_install_auto_torch_follows_doctor(o_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(installer, "build_make_envs_command", fake_make_envs(tmp_path))
     monkeypatch.setattr(installer, "find_uv", lambda: Path("uv"))
     doctor.set_probes(doctor.Probes(gpu=lambda: None))
-    assert run_env_job(["asr"], "auto")["result"]["torch"] == "cpu"
+    assert run_env_job(["main"], "auto")["result"]["torch"] == "cpu"
     doctor.set_probes(doctor.Probes(gpu=lambda: doctor.GpuInfo("NVIDIA X", 8.0, "572.16", "12.8")))
-    done = run_env_job(["score"], "auto")
-    assert done["result"]["torch"] == "cuda" and installer.list_envs()[installer.env_names().index("score")]["torch"] == "cuda"
-    assert run_env_job(["hf"], "cpu")["result"]["torch"] == "cpu"  # explicit choice wins
+    done = run_env_job(["funasr"], "auto")
+    assert done["result"]["torch"] == "cuda" and installer.list_envs()[installer.env_names().index("funasr")]["torch"] == "cuda"
+    assert run_env_job(["chatterbox"], "cpu")["result"]["torch"] == "cpu"  # explicit choice wins
 
 
 def test_env_install_failure_is_an_error_with_the_log(o_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(installer, "find_uv", lambda: Path("uv"))
     monkeypatch.setattr(installer, "build_make_envs_command", fake_make_envs(tmp_path, fail=True))
-    done = run_env_job(["asr"], "cpu")
+    done = run_env_job(["main"], "cpu")
     assert done["state"] == "failed" and done["error"]["code"] == "download_unreachable"  # dns error in the output
     assert [f["state"] for f in done["result"]["files"]] == ["failed"]
     monkeypatch.setattr(installer, "run_stream", lambda cmd, ctx, **kw: (1, ["error: build failed for numpy"]))
-    done = run_env_job(["asr"], "cpu")
+    done = run_env_job(["main"], "cpu")
     assert done["error"]["code"] == "env_install_failed" and done["error"]["params"]["exit_code"] == 1 and "numpy" in done["error"]["details"]
 
 
@@ -515,26 +518,26 @@ def test_env_install_needs_git_for_checkout_envs(o_env: Path, tmp_path: Path, mo
     real_which = shutil.which
     monkeypatch.setattr(shutil, "which", lambda name, *a, **k: None if name == "git" else real_which(name, *a, **k))
     monkeypatch.setattr(installer, "find_uv", lambda: Path("uv"))
-    done = run_env_job(["rvc", "asr"], "cpu")
+    done = run_env_job(["rvc", "main"], "cpu")
     assert done["state"] == "failed" and done["error"]["code"] == "git_missing" and done["error"]["params"]["envs"] == ["rvc"]
     assert done["error"]["action"] == "show_manual"
 
 
 def test_env_install_needs_uv(o_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(installer, "find_uv", lambda: None)
-    done = run_env_job(["asr"], "cpu")
+    done = run_env_job(["main"], "cpu")
     assert done["error"]["code"] == "tool_missing" and done["error"]["params"]["tool"] == "uv"
 
 
 def test_make_envs_command_line(o_env: Path) -> None:
-    cmd, extra = installer.build_make_envs_command(["asr", "score"], "cpu", Path("E:/envs"))
+    cmd, extra = installer.build_make_envs_command(["main", "funasr"], "cpu", Path("E:/envs"))
     if os.name == "nt":
         assert cmd[0].lower().endswith("powershell.exe") or cmd[0].lower().endswith("powershell")
         assert "-File" in cmd and cmd[cmd.index("-File") + 1].endswith("make_envs.ps1")
-        assert cmd[cmd.index("-Env") + 1] == "asr,score" and cmd[cmd.index("-EnvsDir") + 1] == str(Path("E:/envs")) and "-Cpu" in cmd
-        assert "-Cpu" not in installer.build_make_envs_command(["asr"], "cuda", Path("E:/envs"))[0]
+        assert cmd[cmd.index("-Env") + 1] == "main,funasr" and cmd[cmd.index("-EnvsDir") + 1] == str(Path("E:/envs")) and "-Cpu" in cmd
+        assert "-Cpu" not in installer.build_make_envs_command(["main"], "cuda", Path("E:/envs"))[0]
     else:
-        assert cmd[0] == "bash" and cmd[-2:] == ["asr", "score"] and extra == {"ENVS_DIR": str(Path("E:/envs")), "CPU": "1"}
+        assert cmd[0] == "bash" and cmd[-2:] == ["main", "funasr"] and extra == {"ENVS_DIR": str(Path("E:/envs")), "CPU": "1"}
 
 
 def test_make_envs_script_accepts_the_envs_dir_parameter() -> None:
@@ -552,13 +555,48 @@ def test_runner_and_adapters_honour_vndub_envs_dir(o_env: Path, monkeypatch: pyt
 
     envs = o_env.parent / "envs"
     assert runner.envs_root() == envs
-    assert runner.env_python("asr") == envs / "asr" / ("Scripts/python.exe" if sys.platform.startswith("win") else "bin/python")
+    assert runner.env_python("main") == envs / "main" / ("Scripts/python.exe" if sys.platform.startswith("win") else "bin/python")
     explicit = o_env.parent / "checkout"
     assert runner.envs_root(explicit) == explicit / ".venvs"  # an explicit root always means <root>/.venvs
     assert rpc.env_src_dir("rvc", "Applio") == envs / "rvc" / "src" / "Applio"
     monkeypatch.delenv("VNDUB_ENVS_DIR")
     assert runner.envs_root() == Path(runner.__file__).resolve().parents[2] / ".venvs"
     assert rpc.env_src_dir("rvc", "Applio").parts[-4:] == (".venvs", "rvc", "src", "Applio")
+
+
+def test_adapter_processes_start_the_env_the_installer_created(o_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The interpreter of an adapter process is looked up where env_exists() and the installer look (regression:
+    it was always <repo>/.venvs, so every env the app installed into <data>/envs was "not created")."""
+    from vndub.backends import registry, runner
+
+    envs = o_env.parent / "envs"
+    exe = "Scripts/python.exe" if sys.platform.startswith("win") else "bin/python"
+    assert runner.AdapterProcess("main", "x").python == envs / "main" / exe
+    assert runner.AdapterProcess("main", "x").root == runner.repo_root()  # adapters still run from the checkout
+    explicit = tmp_path / "checkout"
+    assert runner.AdapterProcess("main", "x", root=explicit).python == explicit / ".venvs" / "main" / exe
+    seen: dict[str, Any] = {}
+
+    def factory(env: str, name: str, **kw: Any) -> Any:
+        seen.update(kw)
+        return runner.AdapterProcess(env, name, **kw)
+
+    spec = next(s for s in registry.all_specs().values() if s.env == "main")
+    b = runner.RemoteBackend(spec, {}, process_factory=factory)
+    assert seen["root"] is None and b.proc.python == envs / "main" / exe
+
+
+def test_adapters_root_is_a_folder_of_its_own_when_frozen(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Packaged app: adapters run from <bundle>/backend, not from the bundle folder whose CPython DLLs and
+    extension modules (_ssl.pyd, _ctypes.pyd ...) an env interpreter would load ahead of its own."""
+    from vndub.backends import runner
+
+    assert runner.adapters_root() == runner.repo_root()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert runner.adapters_root() == tmp_path / "backend"
+    spec = (Path(__file__).resolve().parents[2] / "packaging" / "vndub_app.spec").read_text(encoding="utf-8")
+    assert 'tree(ROOT / "adapters", "backend/adapters")' in spec
 
 
 def test_configure_environment(o_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:

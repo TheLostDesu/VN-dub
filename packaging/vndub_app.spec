@@ -6,7 +6,7 @@ pydantic ...) plus the API server and the window shell. Backend venvs, models an
 installed into the data folder by the in-app installer, so torch and every ML package are excluded.
 
 Bundled as data (``appdirs.resource_root()`` = the bundle folder): ``configs/``, ``app/`` (i18n,
-tools manifest), ``docs/``, ``README.md`` (in-app help), ``adapters/`` (sources: they run inside the backend envs), ``envs/``
+tools manifest), ``docs/``, ``README.md`` (in-app help), ``backend/adapters/`` (sources: they run inside the backend envs), ``envs/``
 (requirement files), ``scripts/make_envs.*``, ``vndub_app/web/dist`` (when the SPA is built),
 ``vndub/report/templates`` and ``bin/uv.exe`` (copied to ``packaging/_staging`` by build_app.ps1).
 
@@ -45,7 +45,9 @@ datas = []
 datas += tree(ROOT / "configs", "configs")
 datas += tree(ROOT / "app", "app")
 datas += tree(ROOT / "docs", "docs")
-datas += tree(ROOT / "adapters", "adapters")
+# adapters run inside the backend envs from a folder of their own: the bundle folder is full of the core's CPython
+# DLLs and extension modules, which an env interpreter would pick up ahead of its own (vndub.backends.runner.adapters_root)
+datas += tree(ROOT / "adapters", "backend/adapters")
 datas += tree(ROOT / "envs", "envs")
 datas += tree(ROOT / "vndub" / "report" / "templates", "vndub/report/templates")
 datas += tree(ROOT / "vndub_app" / "web" / "dist", "vndub_app/web/dist")

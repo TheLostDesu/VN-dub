@@ -123,6 +123,27 @@ class BackendSpec:
         return self.env is None
 
 
+def estimate_vram_gb(spec: BackendSpec, options: dict[str, Any] | None = None) -> float:
+    """What loading ``spec`` with ``options`` needs in GiB: the static ``vram_estimate_gb``, or a model.
+
+    A spec whose ``options["vram"]`` is ``{weights_gib, kv_bytes_per_token, kv_fixed_gib?, overhead_gib?}``
+    (the LLMs) is costed for the context it will really get: ``options["ctx"]`` tokens (the spec's own ctx
+    when the caller sets none) times ``options["parallel"]`` slots. Without the model the static number is it.
+    """
+    vram = (spec.options or {}).get("vram")
+    if not isinstance(vram, dict):
+        return float(spec.vram_estimate_gb)
+    opts = {**(spec.options or {}), **(options or {})}
+    try:
+        ctx = max(0, int(opts.get("ctx", 0) or 0))
+        parallel = max(1, int(opts.get("parallel", 1) or 1))
+    except (TypeError, ValueError):
+        ctx, parallel = 0, 1
+    kv = float(vram.get("kv_bytes_per_token", 0.0)) * ctx * parallel / float(1024**3)
+    total = float(vram.get("weights_gib", spec.vram_estimate_gb)) + kv + float(vram.get("kv_fixed_gib", 0.0)) + float(vram.get("overhead_gib", 0.0))
+    return round(total, 2)
+
+
 class BackendUnavailable(RuntimeError):
     """The backend cannot run here (env missing, weights missing, no CUDA ...)."""
 
@@ -213,8 +234,9 @@ class _RoleMixin:
     def convert(self, items: list[VCItem], **opts: Any) -> list[dict[str, Any]]:
         return self.call("convert", items, **opts)
 
-    def train(self, job: dict[str, Any]) -> dict[str, Any]:
-        return self.call("train", None, job=job)
+    def train(self, job: dict[str, Any], **opts: Any) -> dict[str, Any]:
+        """``opts``: ``timeout_s`` for the remote call (a training runs for hours; the per-item default is minutes)."""
+        return self.call("train", None, job=job, **opts)
 
     # llm
     def chat(self, messages: list[dict[str, str]], **opts: Any) -> str:
@@ -238,6 +260,7 @@ class LocalBackend(_RoleMixin):
         self.loaded = False
 
     def call(self, op: str, items: list[dict[str, Any]] | None = None, **kwargs: Any) -> Any:
+        kwargs.pop("timeout_s", None)  # a remote-call setting; nothing to time out in-process
         fn = getattr(self, f"op_{op}", None)
         if fn is None:
             raise NotImplementedError(f"{self.spec.name} does not support op '{op}'")

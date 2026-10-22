@@ -10,7 +10,7 @@ SPECS = [
     BackendSpec(
         name="audeering_adv",
         role="adv",
-        env="hf",
+        env="main",
         adapter="audeering_adv",
         license="CC-BY-NC-SA-4.0",
         commercial_ok=False,

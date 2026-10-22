@@ -11,7 +11,7 @@ SPECS = [
     BackendSpec(
         name="voxcpm2",
         role="tts",
-        env="hf",
+        env="main",
         adapter="voxcpm2",
         license="Apache-2.0",
         commercial_ok=True,

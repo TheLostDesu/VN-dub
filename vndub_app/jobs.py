@@ -8,6 +8,9 @@
   block while the job is paused and raise :class:`JobCancelled` once it is cancelled, so a
   pipeline stage that calls ``ctx.progress()`` (``StageContext.extra["progress_cb"]``,
   installed via :meth:`JobContext.stage_progress_cb`) is pausable and cancellable per line.
+* A job that runs a child process (``uv``, ``make_envs``, ``vc_redist``) registers it with
+  :meth:`JobContext.watch_process`: cancelling the job (the Cancel button, or the app closing)
+  kills the whole process tree at once instead of waiting for its next line of output.
 * ETA: :class:`EtaEstimator` (EMA of seconds per item inside the current stage) plus
   :class:`ThroughputStore` (measured seconds per line for every stage, persisted in
   ``<data>/throughput.json``) for the stages still ahead.
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import subprocess
 import threading
 import time
 import uuid
@@ -30,6 +34,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from vndub.util import now_iso
+
+from vndub_app import winproc
 
 log = logging.getLogger("vndub_app.jobs")
 
@@ -175,6 +181,8 @@ class JobContext:
         self.eta = EtaEstimator()
         self._stage_t0: float | None = None
         self.n_items_hint: int = 0  # lines the job will process (for future-stage ETA)
+        self._procs: list["subprocess.Popen[Any]"] = []
+        self._procs_lock = threading.Lock()
 
     # -- control (called by the runner) -------------------------------------
     def _set_paused(self, paused: bool) -> None:
@@ -186,6 +194,30 @@ class JobContext:
     def _set_cancelled(self) -> None:
         self._cancel.set()
         self._pause.set()
+        with self._procs_lock:
+            procs = list(self._procs)
+        for p in procs:  # outside the lock: taskkill takes a moment
+            winproc.kill_tree(p)
+
+    def watch_process(self, proc: "subprocess.Popen[Any]") -> Callable[[], None]:
+        """Kill ``proc`` and everything it started the moment this job is cancelled.
+
+        Returns a function that stops watching (call it once the process has ended). A process registered
+        after the cancel is killed at once. Thread-safe; watching the same process twice is harmless.
+        """
+        with self._procs_lock:
+            if proc not in self._procs:
+                self._procs.append(proc)
+            cancelled = self._cancel.is_set()
+        if cancelled:
+            winproc.kill_tree(proc)
+
+        def unwatch() -> None:
+            with self._procs_lock:
+                if proc in self._procs:
+                    self._procs.remove(proc)
+
+        return unwatch
 
     @property
     def cancelled(self) -> bool:

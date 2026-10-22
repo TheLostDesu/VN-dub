@@ -66,6 +66,18 @@ def envs_root(root: Path | None = None) -> Path:
     return root / ".venvs"
 
 
+def adapters_root() -> Path:
+    """Folder that holds the ``adapters`` package: the adapter processes run there (cwd, ``PYTHONPATH``).
+
+    The repo root from a checkout. In the packaged app (PyInstaller) a folder that holds nothing but
+    ``adapters/`` (``<bundle>/backend``): the bundle folder itself is full of the core's CPython DLLs and
+    extension modules, which a backend env's interpreter must not pick up ahead of its own.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "backend"
+    return repo_root()
+
+
 def env_python(env: str, root: Path | None = None) -> Path:
     base = envs_root(root) / env
     if sys.platform.startswith("win"):
@@ -94,8 +106,10 @@ class AdapterProcess:
     ) -> None:
         self.env = env
         self.name = name
-        self.root = root or repo_root()
-        self.python = python or env_python(env, self.root)
+        self.root = root or adapters_root()
+        # the interpreter follows envs_root(): an explicit root means <root>/.venvs, else $VNDUB_ENVS_DIR (the
+        # desktop app's <data>/envs), else <repo>/.venvs -- the same place env_exists() and the installer use
+        self.python = python or env_python(env, root)
         self.module = module or f"adapters.{env}.main"
         self.log_path = log_path
         self.extra_env = extra_env or {}
@@ -170,6 +184,23 @@ class AdapterProcess:
         with open(self.log_path, "ab") as f:
             f.write(f"[{self.name}] ".encode() + raw + b"\n")
 
+    def _kill_tree(self) -> None:
+        """Kill the adapter AND everything it started (an Applio training, a tool): ``Popen.kill`` alone would
+        orphan the grandchild, which then keeps its VRAM while the next model loads next to it."""
+        assert self.proc is not None
+        if sys.platform.startswith("win"):
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(self.proc.pid)], capture_output=True, timeout=30,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            self.proc.kill()
+        except OSError:
+            pass
+
     def close(self, timeout: float = 15.0) -> None:
         if self.proc is None:
             return
@@ -180,7 +211,7 @@ class AdapterProcess:
             except Exception:
                 pass
         if self.alive:
-            self.proc.kill()
+            self._kill_tree()
             try:
                 self.proc.wait(timeout=5)
             except Exception:
@@ -257,7 +288,7 @@ class RemoteBackend(_RoleMixin):
         self.options = {**spec.options, **(options or {})}
         self.device = device
         self.models_dir = models_dir
-        self.root = root or repo_root()
+        self.root = root or adapters_root()
         log_path = (log_dir / f"adapter_{spec.env}.log") if log_dir else None
         # run time is offline: weights come only from models/ (pulled once)
         extra = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"}
@@ -267,7 +298,7 @@ class RemoteBackend(_RoleMixin):
             extra.setdefault("MODELSCOPE_CACHE", str(models_dir / "modelscope"))
             extra.setdefault("TORCH_HOME", str(models_dir / "torch_home"))
         factory = process_factory or AdapterProcess
-        self.proc = factory(spec.env, spec.name, root=self.root, log_path=log_path, extra_env=extra)
+        self.proc = factory(spec.env, spec.name, root=root, log_path=log_path, extra_env=extra)
         self.load_info: dict[str, Any] = {}
         self._loaded = False
         self.timeout_load = float(self.options.get("timeout_load_s", 1800))

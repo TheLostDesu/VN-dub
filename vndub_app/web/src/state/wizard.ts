@@ -27,6 +27,7 @@ export function stepForJobKind(kind: string): StepId | null {
       return "game";
     case "translate":
       return "translate";
+    case "casting_auto":
     case "casting_generate":
     case "casting_listen":
     case "tuning_listen":
@@ -43,9 +44,22 @@ export function stepForJobKind(kind: string): StepId | null {
     case "install_rollback":
     case "install_zip":
       return "install";
+    case "ffmpeg_download":
+    case "vcredist_install":
+      return "doctor";
     default:
       return null;
   }
+}
+
+/** Route that shows a job of this kind: a wizard step or one of the plain pages (the "show" button of the job bar). */
+export function pathForJobKind(kind: string): string | null {
+  const step = stepForJobKind(kind);
+  if (step) return stepPath(step);
+  if (kind.startsWith("models")) return "/models"; // models_download, models_check, models_hf_add
+  if (kind.startsWith("tools") || kind.startsWith("envs")) return "/tools"; // tools_install, envs_install
+  if (kind === "report") return "/settings"; // the report button of the Settings screen
+  return null;
 }
 
 /** Furthest step the user may open: everything before it, plus the next one after the last completed. */

@@ -146,9 +146,9 @@ def test_inject_tools() -> None:
 def test_rpc_cli_params_prefers_named_backend(tmp_path: Path) -> None:
     from adapters.common.rpc import _cli_params
 
-    p = _cli_params("whisper_tiny", "asr", tmp_path, "cpu")
+    p = _cli_params("whisper_tiny", "main", tmp_path, "cpu")
     assert p["name"] == "whisper_tiny" and p["model"] == "faster_whisper"
-    p2 = _cli_params("faster_whisper", "asr", tmp_path, "cpu")
+    p2 = _cli_params("faster_whisper", "main", tmp_path, "cpu")
     assert p2["model"] == "faster_whisper"
 
 
@@ -163,5 +163,5 @@ def test_models_selftest_reports_missing_pieces_cleanly(tmp_path: Path, monkeypa
     assert res["ok"] is False and res["error"] == "weights missing: run `vndub models pull qwen3_tts`"
     monkeypatch.setattr("vndub.backends.runner.env_exists", lambda env, root=None: False)
     res = models.selftest(cfg, "voxcpm2")
-    assert res["ok"] is False and "env 'hf' not created" in res["error"] and "make_envs" in res["hint"]
+    assert res["ok"] is False and "env 'main' not created" in res["error"] and "make_envs" in res["hint"]
     assert models.selftest(cfg, "no_such_backend")["ok"] is False

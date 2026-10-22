@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +171,23 @@ def test_extra_files_are_validated(manifest: dict[str, Any]) -> None:
     bad = copy.deepcopy(manifest)
     entry(bad, "llama_server")["extra"][0]["sha256"] = None
     assert any("extra[0]" in p and "sha256 is null" in p for p in problems(bad))
+
+
+def test_bgi_extractor_ships_with_the_app(manifest: dict[str, Any]) -> None:
+    """Upstream publishes no binaries: build_app.ps1 compiles the commit the version names, the app finds it next to VNDub.exe."""
+    e = entry(manifest, "bgi_extractor")
+    assert e["manual"] and e["bundled"] == {"bgi_extractor": "bin/bgi-extractor/bgi-extractor.exe"}
+    block = (REPO / "packaging" / "build_app.ps1").read_text(encoding="utf-8").split("$BgiExtractor = @{", 1)[1].split("\n}", 1)[0]
+    commit = re.search(r'Commit\s*=\s*"([0-9a-f]{40})"', block)
+    version = re.search(r'Version\s*=\s*"([^"]+)"', block)
+    assert commit and version
+    assert e["version"] == version.group(1) and version.group(1).endswith("+" + commit.group(1)[:7])
+    assert commit.group(1) in e["notes"]
+
+
+@pytest.mark.parametrize("value", [["bin/x.exe"], {}, {"ffmpeg": "bin/x.exe"}, {"bgi_extractor": "../x.exe"}, {"bgi_extractor": "C:/x.exe"}, {"bgi_extractor": "bin\\x.exe"}])
+def test_bundled_paths_are_validated(manifest: dict[str, Any], value: Any) -> None:
+    assert any("bundled" in p for p in problems(mutated(manifest, "bgi_extractor", bundled=value))), value
 
 
 def test_manual_entries_cannot_claim_a_hash(manifest: dict[str, Any]) -> None:

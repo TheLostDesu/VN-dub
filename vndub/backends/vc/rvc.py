@@ -21,7 +21,7 @@ SPECS = [
         vram_estimate_gb=2.0,
         cpu_ok=True,
         weights=(WeightSpec("env", subdir="applio_prerequisites", post="applio_prerequisites", size_gb=1.5),),
-        options={"index_rate": 0.5, "protect": 0.33, "f0_method": "rmvpe", "train_vram_gb": 6.0, "timeout_item_s": 600, "tool_dir": "applio_dir"},
+        options={"index_rate": 0.5, "protect": 0.33, "f0_method": "rmvpe", "train_vram_gb": 6.0, "timeout_item_s": 600, "timeout_train_s": 6 * 3600, "tool_dir": "applio_dir"},
         caps={"trainable": True, "zero_shot": False, "keeps_prosody": True},
         mock="mock_vc",
         description="Per-character timbre model; primary VC for route B",

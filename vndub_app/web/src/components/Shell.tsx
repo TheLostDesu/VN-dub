@@ -6,7 +6,7 @@ import { STEP_IDS, type ErrorInfo, type StepId } from "../api/types";
 import { useI18n } from "../i18n";
 import { useActiveJob, ingestJob } from "../state/progress";
 import { useProject } from "../state/project";
-import { furthestStep, STEP_NUMBER, stepForJobKind, stepPath, useWizard } from "../state/wizard";
+import { furthestStep, pathForJobKind, STEP_NUMBER, stepForJobKind, stepPath, useWizard } from "../state/wizard";
 import { ErrorPanel } from "./ErrorPanel";
 import { Button, Dialog, ProgressBar } from "./ui";
 
@@ -102,13 +102,16 @@ export function Stepper({ current }: { current: StepId }) {
 export function ActiveJobBar({ currentStep }: { currentStep: StepId | null }) {
   const { t, tOr } = useI18n();
   const nav = useNavigate();
+  const loc = useLocation();
   const job = useActiveJob();
   if (!job) return null;
   const target = stepForJobKind(job.kind);
   if (target && target === currentStep) return null;
+  const dest = pathForJobKind(job.kind);
+  // already on the page that shows this job (Models / Tools tab, Settings): the page has its own progress panel
+  if (!target && dest && loc.pathname === dest) return null;
   const frac = job.total > 0 ? job.done / job.total : null;
   const label = tOr(job.title_key, t(`jobs.${job.kind}`));
-  const dest = target ? stepPath(target) : job.kind.startsWith("models") ? "/models" : job.kind.startsWith("tools") || job.kind.startsWith("envs") ? "/tools" : null;
   return (
     <div className="active-job-bar" role="status" data-testid="active-job-bar">
       <span className="active-job-title">{t("job.running_now", { title: label })}</span>

@@ -51,10 +51,11 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 | `nav-wizard`, `nav-models`, `nav-settings`, `nav-help`, `nav-doctor` | top bar links |
 | `stepper` | the step list; `step-<doctor|game|translate|casting|preview|run|review|install>` buttons (`aria-current=step` on the current one) |
 | `nav-back`, `nav-next` | step footer buttons (`nav-next` is `preview-approve` on Step 4); `nav-next-hint` explains a disabled Next |
-| `active-job-bar`, `active-job-show` | banner for a job running on another screen |
+| `active-job-bar`, `active-job-show` | banner for a job running on another screen; "show" opens the page that has the job (wizard step, `/models`, `/tools`, `/#/step/doctor` for ffmpeg / Visual C++, `/settings` for the problem report); the bar is hidden on that page |
 | `resume-dialog`, `resume-continue`, `resume-dismiss` | "Продолжить с того места, где остановились?" |
 | `toasts` | live region of short messages |
 | `splash` | start screen while settings load / when the server is unreachable |
+| `settings-paths` | Settings: the "Folders" card; rows `settings-path-<data|models|envs|tools>` with the path in `settings-path-<key>-value`; `settings-open-<models|envs|tools>` opens the folder; `settings-change-<models|envs>` picks a new one (dialog `settings-path-dialog`, `settings-path-confirm`; without a native dialog the text field `settings-path-input` + `settings-path-apply`); `settings-reset-<models|envs>` goes back to the default |
 
 ## Shared pieces
 
@@ -187,7 +188,15 @@ They use physical keys (`event.code`), so they also work on the Russian layout.
 added models: `models-custom-list` (`<ul>`; `models-custom-empty` instead when there are none), `models-custom-row-<id>` (`data-kind`, `data-present`), `models-custom-delete-<id>`,
 `models-custom-delete-dialog`, `models-custom-delete-confirm`, `models-custom-in-use` (delete refused: a job uses it);
 `tools-card`, `tools-table`, `tool-row-<name>` (`data-present`), `tools-install`, `tools-install-job`, `tools-manual-toggle`,
-`envs-card`, `envs-list`, `env-row-<name>`, `envs-torch`, `envs-install`, `envs-install-job`.
+`envs-card`, `envs-list`, `env-row-<name>`, `envs-torch`, `envs-torch-<auto|cuda|cpu>` (radio buttons), `envs-install`, `envs-install-job`.
+
+**UI persistence** (leaving a screen must not lose its work; `tests/app/test_ui_persistence_e2e.py`): `/#/models` and `/#/tools` are two
+routes, so switching the tab unmounts the tab. Jobs live on the server and in the global progress store, therefore the job panels
+(`models-download-job`, `models-check-job`, `models-envs-job`, `tools-install-job`, `envs-install-job`, `models-hf-job` and `models-hf-done`,
+`game-job`, `install-*-job`, the Diagnostics fix job, `report-done`) come back by themselves when the screen is opened again:
+a running job first, else the finished panel (done / failed) the UI has seen in this session. The ticked `model-check-<name>` boxes and the
+`envs-torch-*` choice are kept in memory until the page is reloaded; the pre-selection of the missing recommended models happens only on the
+first visit. A page reload keeps only jobs that are still active on the server.
 
 ## Settings and help
 

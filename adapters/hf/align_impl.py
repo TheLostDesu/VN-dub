@@ -13,7 +13,7 @@ from __future__ import annotations
 import unicodedata
 from typing import Any
 
-from adapters.common.rpc import ModelImpl, lang_name, load_audio, weight_dir
+from adapters.common.rpc import ModelImpl, audio_seconds, lang_name, load_audio, load_audios, run_in_batches, weight_dir
 
 
 def _split_unit(text: str, t0: float, t1: float) -> list[dict[str, Any]]:
@@ -48,6 +48,41 @@ class Qwen3Aligner(ModelImpl):
         for u in units:
             chars += _split_unit(str(u.text), float(u.start_time) * scale, float(u.end_time) * scale)
         return {"chars": chars, "backend": "qwen3_aligner"}
+
+    def batch_align(self, items: list[dict[str, Any]], **kw: Any) -> list[dict[str, Any]]:
+        """Several clips per ``Qwen3ForcedAligner.align(audio=[(y, sr)], text=[...], language=[...])`` call.
+
+        ``align`` runs ONE forward pass over the whole list (processor ``padding=True`` with attention masks,
+        argmax of the thinker logits at the ``<timestamp>`` tokens of each clip), so lengths are masked by the
+        model itself; the list is therefore cut into sub-batches of ``options['batch_size']`` (default 8) to
+        bound memory. Clips are loaded with :func:`load_audio` exactly like :meth:`op_align` (an unreadable clip
+        only fails itself), sorted by duration, and the ms/s unit guard is applied per clip. The timestamps are
+        discrete (80 ms steps), so the result equals the single-clip call except for rare argmax ties under
+        bf16. A failing sub-batch (incl. CUDA OOM) is redone clip by clip with :meth:`op_align`.
+        """
+        return run_in_batches(items, self.sub_batch_size(), self._align_chunk, lambda it: self.op_align(it, **kw), label=self.name, sort_key=audio_seconds)
+
+    def _align_chunk(self, items: list[dict[str, Any]]) -> list[Any]:
+        ys, out = load_audios(items)
+        ok = [i for i, e in enumerate(out) if e is None]
+        if ok:
+            res = self.model.align(
+                audio=[(ys[i], 16000) for i in ok],
+                text=[items[i].get("text") or "" for i in ok],
+                language=[lang_name(items[i].get("lang", "ja")) for i in ok],
+            )
+            if len(res) != len(ok):
+                raise RuntimeError(f"Qwen3-ForcedAligner returned {len(res)} results for {len(ok)} clips")
+            for units, i in zip(res, ok):
+                dur = len(ys[i]) / 16000
+                scale = 1.0
+                if len(units) and float(units[-1].end_time) > dur * 20:  # milliseconds
+                    scale = 0.001
+                chars: list[dict[str, Any]] = []
+                for u in units:
+                    chars += _split_unit(str(u.text), float(u.start_time) * scale, float(u.end_time) * scale)
+                out[i] = {"chars": chars, "backend": "qwen3_aligner"}
+        return out
 
 
 class CTCAligner(ModelImpl):

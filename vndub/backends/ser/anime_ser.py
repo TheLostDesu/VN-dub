@@ -22,7 +22,7 @@ SPECS = [
     BackendSpec(
         name="anime_ser",
         role="ser",
-        env="hf",
+        env="main",
         adapter="anime_ser",
         license="MIT",
         commercial_ok=True,

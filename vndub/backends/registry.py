@@ -155,7 +155,8 @@ def custom_spec(entry: dict[str, Any]) -> BackendSpec | None:
             ),
         ),
         profiles=("optional",),
-        options={"ctx": 8192, "chat_template_kwargs": {}},
+        # thinking off for templates that know the switch (Gemma 4, Qwen 3.x); others ignore the variable
+        options={"ctx": 8192, "chat_template_kwargs": {"enable_thinking": False}},
         mock="mock_translator",
         description=f"{label} (added by the user)",
         homepage=f"https://huggingface.co/{repo}",
@@ -250,7 +251,8 @@ def instantiate(
         if not spec.local_impl:
             raise BackendUnavailable(spec.name, "local backend without implementation")
         cls = load_class(spec.local_impl)
-        ctx = {"models_dir": models_dir, "log_dir": log_dir, **(context or {})}
+        # the registry's device too: an in-process backend (llama-server) must know whether the GPU was wanted
+        ctx = {"models_dir": models_dir, "log_dir": log_dir, **(context or {}), "device": device}
         inst: LocalBackend = cls(spec, options, ctx)
         return inst  # type: ignore[return-value]
     from vndub.backends.runner import RemoteBackend

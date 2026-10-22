@@ -21,6 +21,7 @@ const FALLBACK: Settings = {
   gpu_budget_gb: 7.5,
   license_policy: "research",
   models_dir: "",
+  envs_dir: "",
   player_volume: {},
   last_project: null,
   shutdown_when_done: false,

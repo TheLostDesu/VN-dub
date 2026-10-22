@@ -17,7 +17,7 @@ SPECS = [
     BackendSpec(
         name="ecapa",
         role="embedder",
-        env="score",
+        env="main",
         adapter="ecapa",
         license="Apache-2.0",
         commercial_ok=True,
@@ -33,7 +33,7 @@ SPECS = [
     BackendSpec(
         name="wavlm_sv",
         role="embedder",
-        env="score",
+        env="main",
         adapter="wavlm_sv",
         license="MIT",
         commercial_ok=True,

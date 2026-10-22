@@ -6,7 +6,7 @@ SPECS = [
     BackendSpec(
         name="utmosv2",
         role="mos",
-        env="score",
+        env="main",
         adapter="utmosv2",
         license="MIT",
         commercial_ok=True,
@@ -21,7 +21,7 @@ SPECS = [
     BackendSpec(
         name="utmos22",
         role="mos",
-        env="score",
+        env="main",
         adapter="utmos22",
         license="MIT",
         commercial_ok=True,

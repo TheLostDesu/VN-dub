@@ -8,6 +8,9 @@ import { Button, Callout, Card, Dialog, PageTitle, RadioGroup, SelectField, Slid
 import { useI18n, type Lang } from "../i18n";
 import { useSettings } from "../state/settings";
 
+/** The two folders that can be moved away from the data folder; "" as a path means "the default". */
+type PathKind = "models" | "envs";
+
 export default function SettingsScreen() {
   const { t, tOr } = useI18n();
   const toast = useToast();
@@ -19,6 +22,10 @@ export default function SettingsScreen() {
   const [showPath, setShowPath] = useState(false);
   const [newDir, setNewDir] = useState("");
   const [confirmDir, setConfirmDir] = useState<string | null>(null);
+  // models / environments folders: the text field shown when there is no native folder dialog, and the pending change
+  const [pathInput, setPathInput] = useState<PathKind | null>(null);
+  const [newPath, setNewPath] = useState("");
+  const [confirmPath, setConfirmPath] = useState<{ kind: PathKind; path: string } | null>(null);
   const [gpu, setGpu] = useState(settings.gpu_budget_gb);
   const gpuTimer = useRef<number | null>(null);
 
@@ -82,6 +89,50 @@ export default function SettingsScreen() {
     }
   };
 
+  const pickPath = async (kind: PathKind) => {
+    setError(null);
+    try {
+      const res = await api.pickFolder(kind === "models" ? "models_dir" : "envs_dir");
+      if (res.unsupported) {
+        setNewPath("");
+        setPathInput(kind);
+      } else if (res.path) setConfirmPath({ kind, path: res.path });
+    } catch (e) {
+      setError(toErrorInfo(e));
+    }
+  };
+
+  // not through update(): that swallows errors, and a refused change (a job is running, a folder that cannot be written) must be shown
+  const applyPath = async (change: { kind: PathKind; path: string }) => {
+    setConfirmPath(null);
+    try {
+      await api.putSettings(change.kind === "models" ? { models_dir: change.path } : { envs_dir: change.path });
+      await reload();
+      setPathInput(null);
+      setNewPath("");
+      toast.show(t("settings.paths.changed"));
+    } catch (e) {
+      setError(toErrorInfo(e));
+    }
+  };
+
+  const paths = settings.paths;
+  const pathRows: { key: "data" | "models" | "envs" | "tools"; label: string; hint: string; path: string; kind?: PathKind; custom?: boolean }[] = paths
+    ? [
+        { key: "data", label: t("settings.paths.data"), hint: t("settings.paths.data_hint"), path: paths.data },
+        { key: "models", label: t("settings.paths.models"), hint: t("settings.paths.models_hint"), path: paths.models, kind: "models", custom: !!settings.models_dir },
+        {
+          key: "envs",
+          label: t("settings.paths.envs"),
+          hint: t("settings.paths.envs_hint", { python: paths.python, cache: paths.uv_cache }),
+          path: paths.envs,
+          kind: "envs",
+          custom: !!settings.envs_dir,
+        },
+        { key: "tools", label: t("settings.paths.tools"), hint: t("settings.paths.tools_hint"), path: paths.tools },
+      ]
+    : [];
+
   return (
     <>
       <PageTitle title={t("settings.title")} intro={t("settings.intro")} testid="settings-title" />
@@ -110,6 +161,56 @@ export default function SettingsScreen() {
           </div>
         ) : null}
       </Card>
+
+      {paths ? (
+        <Card testid="settings-paths">
+          <h2>{t("settings.paths.title")}</h2>
+          <p className="hint">{t("settings.paths.hint")}</p>
+          {pathRows.map((r, i) => (
+            <div key={r.key} data-testid={`settings-path-${r.key}`}>
+              {i > 0 ? <hr /> : null}
+              <h3>{r.label}</h3>
+              <p>
+                <code data-testid={`settings-path-${r.key}-value`}>{r.path}</code>
+              </p>
+              <p className="hint">{r.hint}</p>
+              {/* the data folder is opened and changed in the card above (its test ids stay unique) */}
+              {r.key !== "data" ? (
+                <div className="row-actions">
+                  <Button onClick={() => void api.openFolder("path", r.path).catch((e) => setError(toErrorInfo(e)))} data-testid={`settings-open-${r.key}`}>
+                    {t("settings.paths.open")}
+                  </Button>
+                  {r.kind ? (
+                    <Button onClick={() => void pickPath(r.kind as PathKind)} data-testid={`settings-change-${r.key}`}>
+                      {t("settings.paths.change")}
+                    </Button>
+                  ) : null}
+                  {r.kind && r.custom ? (
+                    <Button onClick={() => setConfirmPath({ kind: r.kind as PathKind, path: "" })} data-testid={`settings-reset-${r.key}`}>
+                      {t("settings.paths.reset")}
+                    </Button>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          ))}
+          {pathInput ? (
+            <div className="path-row">
+              <TextField
+                label={pathInput === "models" ? t("settings.paths.input_models") : t("settings.paths.input_envs")}
+                value={newPath}
+                onChange={setNewPath}
+                testid="settings-path-input"
+                className="grow"
+                onEnter={() => newPath.trim() && setConfirmPath({ kind: pathInput, path: newPath.trim() })}
+              />
+              <Button variant="primary" disabled={!newPath.trim()} onClick={() => setConfirmPath({ kind: pathInput, path: newPath.trim() })} data-testid="settings-path-apply">
+                {t("settings.paths.apply")}
+              </Button>
+            </div>
+          ) : null}
+        </Card>
+      ) : null}
 
       <Card testid="settings-language">
         <SelectField
@@ -185,6 +286,28 @@ export default function SettingsScreen() {
           <code>{confirmDir}</code>
         </p>
         <p>{t("settings.data_dir.confirm_text")}</p>
+      </Dialog>
+
+      <Dialog
+        open={confirmPath !== null}
+        onClose={() => setConfirmPath(null)}
+        title={t("settings.paths.confirm_title")}
+        testid="settings-path-dialog"
+        actions={
+          <>
+            <Button onClick={() => setConfirmPath(null)}>{t("common.cancel")}</Button>
+            <Button variant="primary" data-autofocus onClick={() => confirmPath && void applyPath(confirmPath)} data-testid="settings-path-confirm">
+              {confirmPath && !confirmPath.path ? t("settings.paths.reset") : t("settings.paths.apply")}
+            </Button>
+          </>
+        }
+      >
+        {confirmPath ? (
+          <>
+            <p>{confirmPath.path ? <code>{confirmPath.path}</code> : t("settings.paths.confirm_default")}</p>
+            <p>{confirmPath.kind === "models" ? t("settings.paths.confirm_models") : t("settings.paths.confirm_envs")}</p>
+          </>
+        ) : null}
       </Dialog>
     </>
   );

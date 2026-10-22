@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator
@@ -15,6 +16,8 @@ from vndub_app import appdirs, doctor, installer, openers
 GOOD_TOOLS = {"ffmpeg": {"present": True, "path": "C:/t/ffmpeg.exe", "required": True}, "ffprobe": {"present": True, "path": "C:/t/ffprobe.exe", "required": True}, "rubberband": {"present": False, "path": None, "required": False}}
 ALL_ENVS = {"needed": ["asr", "hf", "score"], "present": ["asr", "hf", "score"]}
 FULL_MODELS = {"default_present": 31, "default_total": 31, "default_missing_gb": 0.0, "min_present": 7, "min_total": 7}
+GOOD_VC = doctor.VcRuntime(True, "14.44.35211", "registry")
+GOOD_GIT = {"path": "C:/Program Files/Git/cmd/git.exe", "source": "system", "frozen": False, "envs": ["funasr", "hf", "rvc", "score", "seedvc"]}
 
 
 def gpu(name: str = "NVIDIA GeForce RTX 4070", mib: int = 12282, driver: str = "572.16", cuda: str | None = "12.8", count: int = 1) -> doctor.GpuInfo:
@@ -27,6 +30,9 @@ def probes(**kw: Any) -> doctor.Probes:
         disk_free_gb=lambda p: 500.0,
         internet=lambda: True,
         tools=lambda: GOOD_TOOLS,
+        vcredist=lambda: GOOD_VC,
+        vcredist_bundled=lambda: True,
+        git=lambda: GOOD_GIT,
         envs=lambda: ALL_ENVS,
         models=lambda: FULL_MODELS,
         data_dir=lambda: Path("C:/VNDub"),
@@ -152,6 +158,118 @@ def test_missing_ffmpeg_is_red_with_a_download_fix(o_env: Path) -> None:
     only_probe = {**GOOD_TOOLS, "ffprobe": {"present": False, "path": None, "required": True}}
     assert rows(probes(tools=lambda: only_probe))["ffmpeg"]["params"]["missing"] == "ffprobe"
     assert rows(probes())["ffmpeg"]["status"] == "green"
+
+
+def reg_reader(**values: int):  # type: ignore[no-untyped-def]
+    return values.get
+
+
+def dlls(**versions: tuple[int, int, int, int]):  # type: ignore[no-untyped-def]
+    return lambda name: versions.get(name)
+
+
+NEW_DLLS = {"msvcp140.dll": (14, 44, 35211, 0), "vcruntime140_1.dll": (14, 44, 35211, 0)}
+
+
+@pytest.mark.parametrize(
+    ("registry", "files", "ok", "version", "source"),
+    [
+        ({"Installed": 1, "Major": 14, "Minor": 44, "Bld": 35211}, {}, True, "14.44.35211", "registry"),
+        ({"Installed": 1, "Major": 14, "Minor": 40, "Bld": 33807}, {}, True, "14.40.33807", "registry"),  # the lowest accepted
+        ({"Installed": 1, "Major": 14, "Minor": 39, "Bld": 33519}, {}, False, "14.39.33519", "registry"),  # VS 2022 17.9: too old
+        ({"Installed": 1, "Major": 14, "Minor": 29, "Bld": 30133}, {}, False, "14.29.30133", "registry"),  # VS 2019
+        ({"Installed": 1, "Major": 15, "Minor": 0, "Bld": 1}, {}, True, "15.0.1", "registry"),  # a future major version
+        ({"Installed": 1, "Major": 14, "Minor": 51}, {}, True, "14.51.0", "registry"),  # Bld may be absent
+        ({"Installed": 0, "Major": 14, "Minor": 44, "Bld": 35211}, {}, False, None, "none"),  # Installed=0 is not installed
+        ({"Installed": 1, "Major": 14, "Minor": 44}, {}, True, "14.44.0", "registry"),
+        ({}, {}, False, None, "none"),  # nothing at all
+        # the registry says nothing (or something old) but the DLLs are new: accepted through System32
+        ({}, NEW_DLLS, True, "14.44.35211", "files"),
+        ({"Installed": 1, "Major": 14, "Minor": 38, "Bld": 1}, NEW_DLLS, True, "14.44.35211", "files"),
+        # one DLL missing / old: the fallback does not accept it
+        ({}, {"msvcp140.dll": (14, 44, 35211, 0)}, False, "14.44.35211", "files"),
+        ({}, {"msvcp140.dll": (14, 44, 35211, 0), "vcruntime140_1.dll": (14, 29, 30133, 0)}, False, "14.29.30133", "files"),
+    ],
+)
+def test_vc_runtime_decision(registry: dict[str, int], files: dict[str, tuple[int, int, int, int]], ok: bool, version: str | None, source: str) -> None:
+    rt = doctor.decide_vcruntime(reg_reader(**registry), dlls(**files))
+    assert (rt.ok, rt.version, rt.source) == (ok, version, source)
+
+
+def test_vc_runtime_threshold_is_the_one_of_the_installer_script() -> None:
+    """The Doctor row and VNDub.iss decide with the same key and the same minimum version."""
+    iss = (Path(__file__).resolve().parents[2] / "packaging" / "VNDub.iss").read_bytes().decode("utf-8-sig")
+    assert f"VCRuntimeKey = '{doctor.VC_REG_KEY}'" in iss
+    assert f"VCMinMajor = {doctor.VC_MIN[0]};" in iss and f"VCMinMinor = {doctor.VC_MIN[1]};" in iss
+
+
+def test_vcredist_row_is_green_when_the_runtime_is_there(o_env: Path) -> None:
+    r = rows(probes())["vcredist"]
+    assert r["status"] == "green" and r["value"] == "14.44.35211" and r["fix"] is None
+    assert r["params"]["version"] == "14.44.35211" and r["params"]["min_version"] == "14.40"
+
+
+def test_vcredist_row_is_red_with_the_bundled_installer_as_the_fix(o_env: Path) -> None:
+    missing = probes(vcredist=lambda: doctor.VcRuntime(False, None, "none"), vcredist_bundled=lambda: True)
+    r = rows(missing)["vcredist"]
+    assert r["status"] == "red" and r["params"]["reason"] == "missing" and r["value"] is None
+    assert r["fix"] == {"action": "install_vcredist", "label_key": "doctor.fix.install_vcredist"}
+    rep = doctor.run_doctor(missing)
+    assert rep["summary"] == "fail"  # no model starts without it
+    old = probes(vcredist=lambda: doctor.VcRuntime(False, "14.29.30133", "registry"))
+    r = rows(old)["vcredist"]
+    assert r["status"] == "red" and r["params"]["reason"] == "too_old" and r["params"]["version"] == "14.29.30133"
+
+
+def test_vcredist_row_opens_the_microsoft_page_in_a_dev_run(o_env: Path) -> None:
+    dev = probes(vcredist=lambda: doctor.VcRuntime(False, None, "none"), vcredist_bundled=lambda: False)
+    r = rows(dev)["vcredist"]
+    assert r["status"] == "red" and r["fix"] == {"action": "open_vcredist_page", "label_key": "doctor.fix.open_vcredist_page"}
+
+
+def test_vcredist_row_is_not_a_thing_off_windows_and_yellow_when_the_probe_fails(o_env: Path) -> None:
+    lin = rows(probes(platform="linux", vcredist=lambda: doctor.VcRuntime(False, None, "none")))["vcredist"]
+    assert lin["status"] == "green" and lin["fix"] is None and lin["params"]["reason"] == "not_applicable"
+
+    def boom() -> doctor.VcRuntime:
+        raise OSError("registry unavailable")
+
+    unknown = rows(probes(vcredist=boom))["vcredist"]
+    assert unknown["status"] == "yellow" and unknown["fix"] is None  # unknown, never an HTTP 500
+    assert doctor.run_doctor(probes(vcredist=boom))["summary"] == "warn"
+
+
+def test_git_row_says_where_git_comes_from(o_env: Path) -> None:
+    sysgit = rows(probes())["git"]
+    assert sysgit["status"] == "green" and sysgit["value"] == GOOD_GIT["path"] and sysgit["params"]["source"] == "system" and "reason" not in sysgit["params"]
+    bundled = rows(probes(git=lambda: {**GOOD_GIT, "path": "C:/VNDub/git/cmd/git.exe", "source": "bundled", "frozen": True}))["git"]
+    assert bundled["status"] == "green" and bundled["params"]["source"] == "bundled" and bundled["params"]["reason"] == "bundled"
+
+
+def test_git_row_is_a_warning_naming_the_envs_that_need_it(o_env: Path) -> None:
+    none = {"path": None, "source": None, "frozen": False, "envs": ["rvc", "seedvc", "hf"]}
+    r = rows(probes(git=lambda: none))["git"]
+    assert r["status"] == "yellow" and r["value"] is None and r["fix"] is None
+    assert r["params"] == {"envs": "rvc, seedvc, hf"}
+    assert doctor.run_doctor(probes(git=lambda: none))["summary"] == "warn"  # a warning, not a failure
+    lost = rows(probes(git=lambda: {**none, "frozen": True}))["git"]  # the packaged app should have carried it
+    assert lost["status"] == "yellow" and lost["params"]["reason"] == "bundled_missing"
+
+
+def test_real_runtime_probes_run_here(o_env: Path) -> None:
+    """The real registry / version.dll / PATH probes on this machine (any answer is fine, a crash is not)."""
+    import sys
+
+    rt = doctor.probe_vcredist()
+    assert isinstance(rt, doctor.VcRuntime)
+    if sys.platform.startswith("win"):
+        assert rt.applicable and (rt.ok or rt.version is None or rt.version.count(".") == 2)
+        k32 = doctor._file_version(str(Path(os.environ["SystemRoot"]) / "System32" / "kernel32.dll"))
+        assert k32 is not None and k32[0] >= 6
+        assert doctor._file_version(str(Path(os.environ["SystemRoot"]) / "System32" / "no-such-file.dll")) is None
+    g = doctor.probe_git()
+    assert set(g) == {"path", "source", "frozen", "envs"} and g["source"] in (None, "system", "bundled")
+    assert "rvc" in g["envs"] and "asr" not in g["envs"]
 
 
 @pytest.mark.parametrize(("free", "status"), [(500.0, "green"), (95.0, "green"), (70.0, "yellow"), (30.0, "red"), (4.0, "red")])

@@ -74,7 +74,7 @@ class VoxCPM2TTS(TTSImpl):
     # -- route C -----------------------------------------------------------------
     def op_train_lora(self, job: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
         job = job or {}
-        repo = Path(self.options.get("repo_dir") or env_src_dir("hf", "VoxCPM"))
+        repo = Path(self.options.get("repo_dir") or env_src_dir("main", "VoxCPM"))
         script = repo / "scripts" / "train_voxcpm_finetune.py"
         template = repo / "conf" / "voxcpm_v2" / "voxcpm_finetune_lora.yaml"
         if not script.exists():

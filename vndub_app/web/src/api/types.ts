@@ -15,12 +15,26 @@ export interface ErrorInfo {
 
 // ---- settings -------------------------------------------------------------------------------
 
+/** Effective absolute folders (GET /api/settings → `paths`); `python` / `uv_cache` are uv's, always below `envs`. */
+export interface SettingsPaths {
+  data: string;
+  models: string;
+  envs: string;
+  tools: string;
+  python: string;
+  uv_cache: string;
+}
+
 export interface Settings {
   ui_lang: string;
   profile: string;
   gpu_budget_gb: number;
   license_policy: string;
+  /** "" = <data>/models */
   models_dir: string;
+  /** "" = <data>/envs (uv's Python builds and download cache live in <envs>/_uv) */
+  envs_dir?: string;
+  paths?: SettingsPaths;
   player_volume: Record<string, number>;
   last_project: string | null;
   shutdown_when_done: boolean;
@@ -78,6 +92,8 @@ export interface AppState {
   completed: StepId[];
   translation: {
     tgt_lang: string;
+    /** "auto" (detect from the game text) or a language code */
+    src_lang: string;
     source: "auto" | "import";
     import_path: string;
     honorifics: "drop" | "keep" | "adapt";
@@ -181,6 +197,16 @@ export interface ProjectSummary {
   no_text_lines: string[] | number;
   problem_files: ProblemFile[];
   analysis: { audio_passports: number; text_passports: number };
+  /** languages of the game: `src` is null before the import, `src_detected` is true when it came from the detector */
+  languages?: { src: string | null; src_detected: boolean; audio: string | null; tgt: string };
+}
+
+/** What the language detector found in the parsed script lines. */
+export interface SrcLangDetected {
+  lang: string;
+  confidence: number;
+  letters: number;
+  lines: number;
 }
 
 // ---- translation & settings -----------------------------------------------------------------
@@ -196,6 +222,12 @@ export interface BackendRow {
 
 export interface TranslationSettings {
   tgt_lang: string;
+  /** the user's choice: "auto" or a language code (auto, ja, en, zh, ko, ru, uk, de, fr, es, it, pt) */
+  src_lang: string;
+  /** the code the pipeline uses right now (the detected one when the choice is auto) */
+  src_lang_effective: string;
+  /** null before the game was imported or when nothing could be detected */
+  src_lang_detected: SrcLangDetected | null;
   source: "auto" | "import";
   import_path: string;
   honorifics: "drop" | "keep" | "adapt";

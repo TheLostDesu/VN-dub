@@ -331,6 +331,7 @@ def test_endpoints_before_the_game_is_imported(client: Any, project: dict[str, A
     """A freshly opened project answers every read endpoint with empty data, never with a crash."""
     s = client.get("/api/project/summary").json()
     assert s["engine"]["id"] is None and s["lines_total"] == 0 and s["characters"] == [] and s["voice_files"] == 0
+    assert s["languages"] == {"src": None, "src_detected": False, "audio": None, "tgt": "ru"}
     assert s["mapping"]["ok"] == 0 and s["no_text_lines"] == 0 and s["problem_files"] == [] and s["analysis"] == {"audio_passports": 0, "text_passports": 0}
     assert [t["tool"] for t in s["tools_missing"]] == [] or all({"tool", "url"} <= set(t) for t in s["tools_missing"])
     assert client.get("/api/characters").json() == []
@@ -340,6 +341,7 @@ def test_endpoints_before_the_game_is_imported(client: Any, project: dict[str, A
     assert client.get("/api/preview/items").json() == {"line_ids": [], "items": []}
     t = client.get("/api/project/translation").json()
     assert t["tgt_lang"] == "ru" and t["llm_available"] is True
+    assert t["src_lang"] == "auto" and t["src_lang_effective"] == "" and t["src_lang_detected"] is None
     assert client.get("/api/project/delivery-cues").status_code == 200
     assert client.get("/api/voices").json() == []
     assert_error(client.post("/api/preview/run", json={"mode": "first_scene"}), "import_required", 400)
@@ -508,11 +510,11 @@ def test_gpu_query_parses_nvidia_smi(monkeypatch: pytest.MonkeyPatch) -> None:
         returncode = 0
         stdout = "NVIDIA GeForce RTX 4060, 8188, 1024\n"
 
-    monkeypatch.setattr(gpuinfo.shutil, "which", lambda n: "nvidia-smi")
+    monkeypatch.setattr(gpuinfo, "find_nvidia_smi", lambda: "nvidia-smi")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
     monkeypatch.setattr(gpuinfo, "_CACHE", (0.0, None))
     assert gpuinfo.query(max_age=0) == {"name": "NVIDIA GeForce RTX 4060", "total_gb": 8.0, "used_gb": 1.0}
-    monkeypatch.setattr(gpuinfo.shutil, "which", lambda n: None)
+    monkeypatch.setattr(gpuinfo, "find_nvidia_smi", lambda: None)
     assert gpuinfo.query(max_age=0) is None
 
 

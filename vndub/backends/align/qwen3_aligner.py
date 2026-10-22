@@ -6,7 +6,7 @@ SPECS = [
     BackendSpec(
         name="qwen3_aligner",
         role="align",
-        env="hf",
+        env="main",
         adapter="qwen3_aligner",
         license="Apache-2.0",
         commercial_ok=True,

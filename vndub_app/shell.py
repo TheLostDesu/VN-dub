@@ -8,15 +8,19 @@
   from a thread; the window opens at once with a tiny loading page and switches to the SPA when
   ``/api/health`` answers (the first screen is not blocked by the server import);
 * ``vndub_app.system.set_window(window)`` gives the server the native file dialogs;
-* closing the window stops the job runner (an active job is stopped cleanly - adapter processes and
-  ``llama-server`` are closed - and recorded as ``interrupted`` so the next start offers to continue);
+* closing the window stops the job runner (an active job is stopped cleanly - adapter processes, install
+  scripts and ``llama-server`` are closed - and recorded as ``interrupted`` so the next start offers to continue)
+  within one shared deadline (``JOBS_STOP_TIMEOUT_S``) however many jobs were active, then the process ends
+  itself with a direct ``os._exit`` (see :func:`main`): pythonnet / WebView2 threads can keep a normally returning
+  process alive for good, and while ``VNDub.exe`` lives every child it started lives too. A watchdog thread
+  (``EXIT_WATCHDOG_S``), started before the cleanup, forces the same exit if the cleanup itself hangs;
 * if pywebview cannot start (no WebView2, no GUI) the app logs it and falls back to the default
   browser; in browser mode the process ends when the tab is closed (no open connection, no active job,
   idle for ``--idle-exit`` seconds) because there is no window to close;
 * one instance per data folder: a second start opens the running instance in the browser and exits
   (``VNDUB_NO_BROWSER=1`` never opens a browser: tests, headless runs);
 * console programs started by the pipeline (ffmpeg, nvidia-smi ...) get ``CREATE_NO_WINDOW``, and processes the app starts die with it
-  (Windows Job Object, ``vndub_app.winproc``);
+  (Windows Job Object, ``vndub_app.winproc``; whether it could be installed is written to ``app.log`` at start);
 * hidden ``--selfcheck [--selfcheck-out FILE]``: starts the server on a throw-away data folder, checks
   ``/api/health`` and the bundled resources/imports, prints one JSON line and exits 0 (ok) / 1 (verifies
   the packaged exe; a windowed exe has no console, so the line is also written to ``FILE``).
@@ -52,7 +56,8 @@ WINDOW_SIZE = (1280, 820)
 WINDOW_MIN = (1000, 650)
 HEALTH_TIMEOUT_S = 90.0
 IDLE_EXIT_DEFAULT_S = 180.0
-JOBS_STOP_TIMEOUT_S = 25.0
+JOBS_STOP_TIMEOUT_S = 25.0  # one shared budget for all active jobs when the app closes
+EXIT_WATCHDOG_S = JOBS_STOP_TIMEOUT_S + 20.0  # stop_jobs + server stop (10 s) + slack; then the exit is forced
 
 
 # ----------------------------------------------------------------------------
@@ -351,6 +356,17 @@ class ServerState:
                 log.warning("server stop failed: %s", e)
 
 
+def _log_job_object_status() -> None:
+    """Say in ``app.log`` whether the "children die with the app" Job Object is in place (silent when it was never tried)."""
+    from vndub_app import winproc
+
+    st = winproc.job_object_status()
+    if st["installed"]:
+        log.info("Job Object installed: child processes end with the app")
+    elif st["error"]:
+        log.warning("Job Object NOT installed (%s): child processes may outlive a crashed or hung app", st["error"])
+
+
 def start_server_async(
     port: int = 0,
     app_factory: Callable[[], Any] | None = None,
@@ -368,6 +384,7 @@ def start_server_async(
 
             installer.configure_environment()
             server.setup_logging()
+            _log_job_object_status()  # the Job Object is installed before there is a log to write to
             app = (app_factory or server.create_app)()
             srv = None
             for attempt in range(3):  # the chosen port may be taken between the check and the bind
@@ -416,26 +433,115 @@ def wait_for_health(state: ServerState, timeout: float = HEALTH_TIMEOUT_S) -> st
 
 
 def stop_jobs(timeout: float = JOBS_STOP_TIMEOUT_S) -> list[str]:
-    """Stop the job runner for app exit; jobs that were active come back ``interrupted`` (offer to continue)."""
+    """Stop the job runner for app exit; jobs that were active come back ``interrupted`` (offer to continue).
+
+    ``timeout`` is one deadline for the whole call, not per job: every active job is cancelled at once (a cancel also
+    kills the child processes the job watches), so the jobs wind down side by side and N stuck jobs must not cost
+    N x ``timeout``. Jobs still active when the deadline passes are logged and left behind: the process is about to end.
+    """
     from vndub_app import jobs
 
     r = jobs.runner()
     active = [j.id for j in r.list(active_only=True)]
     r.shutdown()
+    deadline = time.monotonic() + timeout
     for jid in active:
         try:
-            r.wait(jid, timeout)
+            r.wait(jid, max(0.0, deadline - time.monotonic()))
         except Exception:
             pass
+    stuck: list[str] = []
     for jid in active:
         try:
             rec = r.get(jid)
-            if rec.state == "cancelled":  # cancelled by the exit, not by the user
+            if rec.state in jobs.ACTIVE:
+                stuck.append(f"{rec.kind} {rec.id} ({rec.state})")
+            elif rec.state == "cancelled":  # cancelled by the exit, not by the user
                 rec.state = "interrupted"
         except Exception:
             pass
+    if stuck:
+        log.warning("%d of %d job(s) still active %.0f s after the app asked them to stop: %s", len(stuck), len(active), timeout, ", ".join(stuck))
+    elif active:
+        log.info("stopped %d active job(s)", len(active))
     r._save(force=True)  # noqa: SLF001
     return active
+
+
+# ----------------------------------------------------------------------------
+# ending the process
+# ----------------------------------------------------------------------------
+
+
+def _hard_exit(code: int) -> None:
+    """End the process now, without interpreter finalization (tests replace this or ``os._exit``).
+
+    Returning from ``main`` and ``sys.exit`` run finalization, which waits for non-daemon threads and for pythonnet's
+    CLR shutdown; a WebView2 / .NET thread that never ends keeps the process (and so its Job Object handle and every
+    child) alive. ``os._exit`` skips all of that: the OS then closes the handles and the Job Object kills the children.
+    Without a Job Object (it could not be installed, which app.log says) the descendants are terminated here instead.
+    """
+    from vndub_app import winproc
+
+    if os.name == "nt" and not winproc.job_object_status()["installed"]:
+        n = winproc.kill_descendants()
+        if n:
+            log.info("no Job Object: terminated %d child process(es) before the exit", n)
+    os._exit(code)
+
+
+class ExitWatchdog(threading.Thread):
+    """Forces the exit if the cleanup in :func:`main` hangs (a daemon: it never keeps the app alive on its own).
+
+    It is started at the *beginning* of the cleanup, while the interpreter is fully alive: a daemon thread that is only
+    created at the very end can no longer run Python code once finalization has begun, which is how the old
+    "sleep, then ``os._exit``" thread silently never fired. :meth:`disarm` exists for tests (the real app never
+    outlives the watchdog: the direct ``os._exit`` after the cleanup ends the process and the thread with it).
+    """
+
+    def __init__(self, code: int, delay: float) -> None:
+        super().__init__(name="vndub-exit-watchdog", daemon=True)
+        self.code = code
+        self.delay = delay
+        self._disarmed = threading.Event()
+
+    def disarm(self) -> None:
+        self._disarmed.set()
+
+    def run(self) -> None:
+        if self._disarmed.wait(self.delay):
+            return
+        # the log call may block on a lock the stuck cleanup holds: it gets a couple of seconds, the exit does not wait for it
+        msg = threading.Thread(target=log.error, args=("exit cleanup still running after %.0f s: forcing the exit", self.delay), daemon=True)
+        msg.start()
+        msg.join(2.0)
+        _hard_exit(self.code)
+
+
+def _start_exit_watchdog(code: int, delay: float | None = None) -> ExitWatchdog:
+    wd = ExitWatchdog(code, EXIT_WATCHDOG_S if delay is None else delay)
+    wd.start()
+    return wd
+
+
+_CLOSE_WATCHDOG: ExitWatchdog | None = None  # armed by the window's closed event (run_window), disarmed by main()
+
+
+def _arm_close_watchdog() -> None:
+    """The window was closed: should ``webview.start()`` fail to return (a stuck WebView2 / .NET teardown), the process
+    still ends after ``EXIT_WATCHDOG_S``, children included. ``main()`` disarms it when it takes over, so the two never race."""
+    global _CLOSE_WATCHDOG
+    if _CLOSE_WATCHDOG is None:
+        _CLOSE_WATCHDOG = _start_exit_watchdog(0, EXIT_WATCHDOG_S)
+
+
+def _cleanup_for_exit(state: ServerState, lock: InstanceLock) -> None:
+    """The ordered shutdown of :func:`main`; a failing step is logged and never skips the next one."""
+    for what, step in (("stopping jobs", stop_jobs), ("stopping the server", state.stop), ("releasing the instance lock", lock.release)):
+        try:
+            step()
+        except Exception as e:
+            log.warning("%s failed: %s", what, e)
 
 
 # ----------------------------------------------------------------------------
@@ -449,8 +555,7 @@ REQUIRED_RESOURCES = (
     ("app", "tools_manifest.json"),
     ("scripts", "make_envs.ps1"),
     ("scripts", "make_envs.sh"),
-    ("envs", "asr.txt"),
-    ("adapters", "common", "rpc.py"),
+    ("envs", "main.txt"),
 )
 UV_RESOURCES = (("bin", "uv.exe"), ("uv.exe",))
 
@@ -458,12 +563,26 @@ UV_RESOURCES = (("bin", "uv.exe"), ("uv.exe",))
 def _check_resources() -> dict[str, Any]:
     from vndub_app import appdirs
 
+    from vndub.backends.runner import adapters_root
+
     missing = [str(Path(*p)) for p in REQUIRED_RESOURCES if not appdirs.resource(*p).exists()]
+    rpc = adapters_root() / "adapters" / "common" / "rpc.py"  # <bundle>/backend/adapters when frozen
+    if not rpc.is_file():
+        missing.append(str(rpc.relative_to(appdirs.resource_root())) if rpc.is_relative_to(appdirs.resource_root()) else str(rpc))
     out: dict[str, Any] = {"missing": missing, "root": str(appdirs.resource_root())}
     if getattr(sys, "frozen", False) and os.name == "nt":
         out["uv"] = any(appdirs.resource(*p).is_file() for p in UV_RESOURCES)
         if not out["uv"]:
             missing.append("bin/uv.exe")
+        from vndub_app import installer
+
+        # tools that packaging/build_app.ps1 puts next to VNDub.exe (manifest "bundled")
+        out["bundled_tools"] = {}
+        for e in installer.entries():
+            if e.get("bundled"):
+                have = installer.bundled_paths(e)
+                out["bundled_tools"][e["name"]] = len(have) == len(e["bundled"])
+                missing += [rel for key, rel in e["bundled"].items() if key not in have]
     out["web_dist"] = (appdirs.web_dist() / "index.html").exists()
     if not getattr(sys, "frozen", False):
         from vndub_app import webbuild
@@ -649,6 +768,11 @@ def run_window(state: ServerState, debug: bool = False) -> int:
             log.error("window boot failed: %s", detail)
             window.load_html(error_html(detail, lang))
 
+    try:
+        window.events.closed += lambda *a: _arm_close_watchdog()  # see _arm_close_watchdog
+    except Exception as e:  # an older pywebview without the event: the regular exit path still works
+        log.debug("no window.events.closed (%s)", e)
+
     gui = "edgechromium" if sys.platform.startswith("win") else None  # never the old MSHTML fallback
     from vndub_app import appdirs
 
@@ -700,16 +824,32 @@ def main(argv: list[str] | None = None, *, hard_exit: bool = True) -> int:
                 args.browser = True
         if args.browser:
             code = run_browser(state, None if args.no_idle_exit else args.idle_exit)
+    except BaseException as e:  # the window / browser loop died: still clean up, and end with a failing code
+        code = 130 if isinstance(e, KeyboardInterrupt) else 1
+        if not isinstance(e, KeyboardInterrupt):
+            log.exception("the app stopped unexpectedly")
+        if not hard_exit:
+            raise
     finally:
+        # Every way out of the window / browser loop lands here. With hard_exit the process must really end afterwards
+        # (see _hard_exit), so the watchdog starts first, while the interpreter is alive, and covers all the cleanup.
+        if hard_exit:
+            _start_exit_watchdog(code)
+        if _CLOSE_WATCHDOG is not None:  # main() is in charge from here on: its own watchdog covers the cleanup
+            _CLOSE_WATCHDOG.disarm()
         try:
-            stop_jobs()
-        except Exception as e:
-            log.warning("stopping jobs failed: %s", e)
-        state.stop()
-        lock.release()
-        logging.shutdown()
-        if hard_exit:  # pythonnet / GUI threads must not keep a closed app alive
-            threading.Thread(target=lambda: (time.sleep(10.0), os._exit(code)), name="vndub-hard-exit", daemon=True).start()
+            _cleanup_for_exit(state, lock)
+        finally:
+            if hard_exit:  # pythonnet / GUI threads must not keep a closed app (and its children) alive
+                log.info("cleanup done: ending the process now with code %s", code)
+            logging.shutdown()  # flushes app.log, the "ending" line included
+            if hard_exit:
+                for stream in (sys.stdout, sys.stderr):  # os._exit does not flush them (a stuck flush is the watchdog's job)
+                    try:
+                        stream.flush()
+                    except Exception:
+                        pass
+                _hard_exit(code)
     return code
 
 

@@ -28,6 +28,10 @@ def funasr_model(local_dir: Path, device: str):
 
 
 class Emotion2Vec(ModelImpl):
+    """No ``batch_emotion`` on purpose: ``AutoModel.generate(input=[paths])`` ends up in ``Emotion2vec.inference``,
+    which loops over the clips one by one (``extract_features`` on a single (1, T) tensor), so a list call gives
+    identical outputs and no speed-up."""
+
     selftest_op = "emotion"
 
     def load(self) -> dict[str, Any]:

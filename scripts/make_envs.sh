@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Create backend virtual environments .venvs/<env> from envs/<env>.txt (uv, Python 3.11).
 #
-#   scripts/make_envs.sh asr score          # CUDA torch
-#   CPU=1 scripts/make_envs.sh asr score    # CPU torch
+#   scripts/make_envs.sh main funasr        # CUDA torch
+#   CPU=1 scripts/make_envs.sh main funasr  # CPU torch
 #   scripts/make_envs.sh all
 #
 # Env vars: CPU=1 (CPU torch), SKIP_EXTRAS=1, STRICT=1 (extras failures are fatal),
-# RECREATE=1, PYTHON=3.11, ENVS_DIR=<dir> (where the venvs go; default $VNDUB_ENVS_DIR, else <repo>/.venvs).
+# RECREATE=1, PYTHON=3.11 (a version or the path of an interpreter), ENVS_DIR=<dir> (where the venvs go; default $VNDUB_ENVS_DIR, else <repo>/.venvs).
 # Directive format: see envs/README.md.
 set -euo pipefail
 
@@ -18,7 +18,7 @@ BUILD_CONS="$REQ_DIR/build.constraints.txt"  # build-time pins for sdist-only pa
 command -v uv >/dev/null || { echo "uv not found on PATH" >&2; exit 1; }
 
 envs=("$@")
-[ ${#envs[@]} -eq 0 ] && envs=(asr)
+[ ${#envs[@]} -eq 0 ] && envs=(main)
 if [ "${envs[0]}" = "all" ]; then
   envs=()
   for f in "$REQ_DIR"/*.txt; do b="$(basename "$f" .txt)"; [[ "$b" == *[+.]* ]] || envs+=("$b"); done

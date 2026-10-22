@@ -115,7 +115,7 @@ the job's `result` when `state == "done"`. Audio URLs are always produced by the
 | Method | Path | Body → Response |
 |---|---|---|
 | GET | `/api/health` | `{ok, version, profile, mock: bool}` |
-| GET/PUT | `/api/settings` | `Settings` + `{data_dir}` (PUT partial). `translation_llm`: `""` = the default (`gemma4_12b`), or the name of a non-mock `llm` backend (built in, or `hf_<slug>` of a model added by link; anything else → 422); a non-default value is written to every project's `pipeline.yaml` as `translate.llm.backend` |
+| GET/PUT | `/api/settings` | `Settings` + `{data_dir, paths}` (PUT partial). `paths` = `{data, models, envs, tools, python, uv_cache}`, the effective absolute folders (`python` / `uv_cache` are uv's CPython builds and download cache, always `<envs>/_uv/python` and `<envs>/_uv/cache`, so the cache and the venvs share a volume and uv can hardlink wheels). `models_dir` / `envs_dir`: `""` = the default (`<data>/models`, `<data>/envs`), else an absolute folder the app can create and write to (relative / not a string → 422 `bad_request`, not creatable or writable → `permission_denied` with action `open_data_dir`); nothing is moved. `envs_dir` is refused with 409 `job_busy` while any job is active, and takes effect at once (`VNDUB_ENVS_DIR` is re-exported for the pipeline and the installer); a `VNDUB_ENVS_DIR` set from outside the app (shell, tests) wins over it, and a dev checkout that already has `<repo>/.venvs` keeps it while no `envs_dir` is set (`paths.envs` always shows what is in use). `translation_llm`: `""` = the default (`gemma4_12b`), or the name of a non-mock `llm` backend (built in, or `hf_<slug>` of a model added by link; anything else → 422); a non-default value is written to every project's `pipeline.yaml` as `translate.llm.backend` |
 | POST | `/api/settings/data-dir` | `{path}` → Settings |
 | POST | `/api/system/pick-folder` | `{purpose}` → `{path: str|null, unsupported?: true}` (native dialog via pywebview; browser mode → unsupported, UI shows a path field) |
 | POST | `/api/system/pick-file` | `{purpose, filters?: ["*.wav", ...]}` → `{path|null, unsupported?}` |
@@ -136,11 +136,11 @@ the job's `result` when `state == "done"`. Audio URLs are always produced by the
 | POST | `/api/project/import` | Step 1 → Job (detect, extract, parse, link no_asr, analyze, text_emotion) |
 | POST | `/api/project/recover-text` | mode C → Job (link with `recover_text`) |
 | POST | `/api/project/asr-check` | → Job (link with `mode: asr`) |
-| GET | `/api/project/summary` | Step 1 summary: `{engine: {id, label, version, encrypted, drm[], warnings[]}, tools_missing: [{tool, url, pip?, manual_key?}], voice_files, lines_total, voiced, unvoiced, characters: [{speaker_id, name_src, name_tgt, lines, voiced_lines, unvoiced_lines, minutes, mode: voiced|unvoiced|mixed}], mapping: {mode, ok, review, unmatched, confidence, suggest_asr_check}, no_text_lines, problem_files: [{line_id, status, reasons[]}], analysis: {audio_passports, text_passports}}` |
+| GET | `/api/project/summary` | Step 1 summary: `{engine: {id, label, version, encrypted, drm[], warnings[]}, tools_missing: [{tool, url, pip?, manual_key?}], voice_files, lines_total, voiced, unvoiced, characters: [{speaker_id, name_src, name_tgt, lines, voiced_lines, unvoiced_lines, minutes, mode: voiced|unvoiced|mixed}], mapping: {mode, ok, review, unmatched, confidence, suggest_asr_check}, no_text_lines, problem_files: [{line_id, status, reasons[]}], analysis: {audio_passports, text_passports}, languages: {src: code|null, src_detected: bool, audio: code|null, tgt: code}}`. `languages.src` is the language of the script text (null before the import; `src_detected` is true when it came from the language detector, false when the user chose it), `audio` the language of the voice recordings when known (the UI shows it only when it differs from `src`), `tgt` the target language; codes: ja, en, zh, ko, ru, uk, de, fr, es, it, pt |
 | POST | `/api/stages/{name}/run` | `{only?: [ids], limit?, force?, sets?: {dotted: value}}` → Job |
 
 ### Translation & settings — Step 2 (S)
-| GET/PUT | `/api/project/translation` | `{tgt_lang, source: auto|import, import_path, honorifics: drop|keep|adapt, address_default: ты|вы, license_policy, llm_available: bool, advanced: {n_candidates, routes: {A,B,C}, asr_check, backends: [{name, enabled, vram_gb, license, commercial_ok, role}]}}` |
+| GET/PUT | `/api/project/translation` | `{tgt_lang, src_lang: auto|ja|en|zh|ko|ru|uk|de|fr|es|it|pt, src_lang_effective, src_lang_detected: {lang, confidence: 0..1, letters, lines}|null, source: auto|import, import_path, honorifics: drop|keep|adapt, address_default: ты|вы, license_policy, llm_available: bool, advanced: {n_candidates, routes: {A,B,C}, asr_check, backends: [{name, enabled, vram_gb, license, commercial_ok, role}]}}`. `src_lang` is the user's choice (`auto` by default: the pipeline detects the language of the script text; PUT accepts one of the listed codes); `src_lang_effective` is the code the pipeline uses right now (the detected one when the choice is `auto`, else the choice); `src_lang_detected` is the detection record over the parsed lines (`lang`, `confidence`, number of `letters` and `lines` it is based on), null before the game was imported or when nothing could be detected. When the source language equals `tgt_lang` the lines are kept as they are and the translation model is not started. `tgt_lang` stays as before. The same `src_lang` (default `auto`) is kept in `app_state.translation` |
 | POST | `/api/project/translation/preview-import` | `{path}` → `translate.preview_import` result |
 | GET/PUT | `/api/project/glossary` | `{characters: [{speaker_id, src, tgt, gender: m|f|unknown}], terms: [{src, tgt, note}]}` (writes characters.yaml names/gender + project glossary.yaml) |
 | POST | `/api/project/translate` | → Job (translate, text_emotion) |
@@ -182,11 +182,11 @@ Mapping lives in `vndub_app/verdicts.py` (unit-tested) and uses the same thresho
 `why[].key` (i18n `why.<key>`): `cer`, `utmos`, `spk_sim`, `dur_ratio`, `text_from_asr`, `no_candidates`, `override`.
 
 ### Doctor, installer, models, patch install (task O)
-| GET | `/api/doctor` | `{summary: ok|warn|fail, gpu: {name, vram_gb, driver, cuda}|null, rows: [{id, status: green|yellow|red, value, params, fix: {action, label_key}|null}]}` — row ids: `gpu`, `driver`, `vram`, `disk`, `ffmpeg`, `internet`, `defender`, `envs`, `models` (i18n `doctor.<id>.title`, `doctor.<id>.<status>`) |
-| POST | `/api/doctor/fix/{action}` | `download_ffmpeg | open_data_dir | open_driver_page | add_defender_exclusion_help` → Job or `{ok}` |
-| GET | `/api/tools` | `[{name, version, present, required_for: [engines], size_mb, url, filename, sha256, manual: bool}]` |
+| GET | `/api/doctor` | `{summary: ok|warn|fail, gpu: {name, vram_gb, driver, cuda}|null, rows: [{id, status: green|yellow|red, value, params, fix: {action, label_key}|null}]}` — row ids: `gpu`, `driver`, `vram`, `disk`, `ffmpeg`, `vcredist`, `git`, `internet`, `defender`, `envs`, `models` (i18n `doctor.<id>.title`, `doctor.<id>.<status>`, and with `params.reason` also `doctor.<id>.<status>.<reason>`). `vcredist` (Windows only): green when the Microsoft Visual C++ 2015-2022 runtime is 14.40+ (HKLM 64-bit view of `SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64`, else `msvcp140.dll` + `vcruntime140_1.dll` in System32), red (`reason` `missing` / `too_old`) otherwise, with fix `install_vcredist` (runs the bundled `redist\vc_redist.x64.exe`) or, without that file (a dev run), `open_vcredist_page`; `git`: green (`params.source` `system` or `bundled`: PATH first, then `<exe dir>\git\cmd\git.exe`), yellow with `params.envs` (the envs whose installation clones repositories) otherwise |
+| POST | `/api/doctor/fix/{action}` | `download_ffmpeg | install_vcredist | open_data_dir | open_driver_page | open_vcredist_page | add_defender_exclusion_help` → Job (`download_ffmpeg` → `ffmpeg_download`, `install_vcredist` → `vcredist_install`, result `{exit_code, reboot_required}`) or `{ok, ...}` (`url` for the two `open_*_page` actions: the SPA opens it) |
+| GET | `/api/tools` | `[{name, version, present, required_for: [engines], size_mb, url, filename, sha256, manual: bool}]` (a tool the packaged app bundles, manifest `bundled`, is `present` with `path` next to `VNDub.exe` unless the tools folder holds an own copy) |
 | POST | `/api/tools/install` | `{names}` → Job (per-file progress in `result.files`; unreachable URL → error `download_unreachable` params `{url, filename}` action `show_manual`) |
-| GET | `/api/envs` | `[{name, present, size_gb, torch: cuda|cpu|null}]`; POST `/api/envs/install` `{envs, torch: auto|cuda|cpu}` → Job |
+| GET | `/api/envs` | `[{name, present, size_gb, torch: cuda|cpu|null}]`; POST `/api/envs/install` `{envs, torch: auto|cuda|cpu}` → Job (first installs CPython 3.11 with uv into `<envs>/_uv/python` and hands that interpreter to `scripts/make_envs.*`; a Windows refusal to follow uv's link folder, os error 448, is the error `python_junction_blocked` with `params.path` = that folder) |
 | GET | `/api/models` | `{rows: [{name, role, env, size_gb, vram_gb, license, commercial_ok, present, usable, reason, presets: [min|recommended|all], selftest: {ok, peak_vram_gb, at}|null}], presets: {min: [..], recommended: [..], all: [..]}, disk: {free_gb, data_dir}}` (i18n `models.<name>.name`, `models.<name>.purpose`) |
 | POST | `/api/models/download` | `{names}` → Job (resume-capable, per-file progress in `result.files`) |
 | POST | `/api/models/check` | `{names}` → Job (selftest; result rows with `peak_vram_gb`) |
@@ -209,7 +209,7 @@ Mapping lives in `vndub_app/verdicts.py` (unit-tested) and uses the same thresho
 `{"type": "hello", "jobs": [JobInfo active]}` on connect.
 Job kinds (i18n `jobs.<kind>`): `import, recover_text, asr_check, translate, stage, casting_generate, casting_auto,
 casting_listen, tuning_listen, rvc_train, preview, full, review_apply, report, models_download,
-models_check, models_hf_add, tools_install, envs_install, install_apply, install_rollback, install_zip, ffmpeg_download`.
+models_check, models_hf_add, tools_install, envs_install, install_apply, install_rollback, install_zip, ffmpeg_download, vcredist_install`.
 Stage names for progress labels: i18n `stages.<name>`.
 
 ## 5. i18n
@@ -224,7 +224,8 @@ Stage names for progress labels: i18n `stages.<name>`.
   weights_missing, env_missing, backend_unavailable, stage_failed, file_not_found, permission_denied,
   project_not_found, no_project, job_not_found, job_busy, sample_too_short, sample_too_long,
   sample_bad_format, download_unreachable, checksum_mismatch, install_manual_only, no_gpu, low_vram,
-  disk_full, game_dir_invalid, nothing_to_review, nothing_to_install, hf_bad_url, hf_not_found, hf_gated`.
+  disk_full, game_dir_invalid, nothing_to_review, nothing_to_install, hf_bad_url, hf_not_found, hf_gated, vcredist_failed,
+  python_junction_blocked`.
 
 ## 6. Tests
 

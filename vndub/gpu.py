@@ -16,8 +16,10 @@ reported by CUDA, and records load/unload timings and peak VRAM for the report.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -25,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Protocol
 
 from vndub.backends import registry
-from vndub.backends.base import Backend, BackendSpec, BackendUnavailable
+from vndub.backends.base import Backend, BackendSpec, BackendUnavailable, estimate_vram_gb
 from vndub.manifest.io import append_jsonl
 from vndub.util import get_logger, now_iso, repo_root
 
@@ -40,12 +42,29 @@ class CudaProbe(Protocol):
     def empty_cache(self) -> None: ...
 
 
+def find_nvidia_smi() -> str | None:
+    """``nvidia-smi`` on PATH, else where the driver installs it (an app started with a stripped PATH would
+    otherwise decide "no CUDA" and run everything it may on the CPU; the Doctor looks in the same places)."""
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    if sys.platform.startswith("win"):
+        candidates = (
+            Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe",
+        )
+        for p in candidates:
+            if p.exists():
+                return str(p)
+    return None
+
+
 class SystemCuda:
     """CUDA info without torch in the core env: ``nvidia-smi`` query (cached briefly)."""
 
     def __init__(self, device_index: int = 0) -> None:
         self.index = device_index
-        self._exe = shutil.which("nvidia-smi")
+        self._exe = find_nvidia_smi()
         self._cache: tuple[float, tuple[int, int]] | None = None
 
     def available(self) -> bool:
@@ -178,9 +197,17 @@ class ModelRegistry:
         return self.allow_cpu_fallback and spec.cpu_ok
 
     # -- acquire / release ----------------------------------------------------
-    def acquire(self, name: str, options: dict[str, Any] | None = None) -> Backend:
+    def acquire(self, name: str, options: dict[str, Any] | None = None, *, substituted_for: str | None = None, reason: str = "") -> Backend:
+        """Load ``name`` (or what its fallback chain resolves to) and make it resident.
+
+        ``substituted_for`` / ``reason``: a stage that walked its own list of candidates (the translator's
+        ``fallbacks``) names the backend it wanted first, so the substitution is logged and lands in the report
+        like one the registry made itself.
+        """
         spec, sub = self.resolve(name)
         options = dict(options or {})
+        if substituted_for and substituted_for != spec.name:
+            sub = Substitution(substituted_for, spec.name, reason or (sub.reason if sub else ""))
         key = repr(sorted(options.items()))
         for res in ([self.heavy] if self.heavy else []) + list(self.light.values()):
             if res.name == spec.name and res.options_key == key:
@@ -189,10 +216,11 @@ class ModelRegistry:
             self.substitutions.append(sub)
             self.log.warning("backend substitution: %s -> %s (%s)", sub.requested, sub.used, sub.reason)
         device = "cpu"
+        need = estimate_vram_gb(spec, options)
         if spec.heavy:
             self.release_heavy()
             if self._cuda_ok():
-                self._check_budget(spec)
+                self._check_budget(spec, need)
                 device = self.device
             elif not self._cpu_allowed(spec):
                 raise BackendUnavailable(spec.name, "CUDA not available", "set gpu.allow_cpu_fallback: true to run on CPU (slow)")
@@ -200,23 +228,54 @@ class ModelRegistry:
             self.release(spec.name)
         backend = self._make(spec, options, device)
         t0 = time.perf_counter()
-        info = backend.load() or {}
+        try:
+            info = backend.load() or {}
+        except BaseException:
+            try:
+                backend.unload()  # a failed load must not leave the adapter process (and its CUDA context) behind
+            except Exception:
+                pass
+            raise
         load_s = time.perf_counter() - t0
+        self._check_device(spec, backend, device, info)
         res = Resident(spec.name, spec, backend, key, time.time(), load_s, sub.requested if sub else None)
         if spec.heavy:
             self.heavy = res
         else:
             self.light[spec.name] = res
-        self._event("load", spec, load_s=round(load_s, 2), device=device, info=info, substituted_for=res.substituted_for)
+        self._event(
+            "load", spec, load_s=round(load_s, 2), device=device, device_actual=info.get("device"), vram_estimate_gb=need,
+            info=info, substituted_for=res.substituted_for,
+        )
         return backend
+
+    def _check_device(self, spec: BackendSpec, backend: Backend, device: str, info: dict[str, Any]) -> None:
+        """A GPU was asked for but the adapter reports the CPU: a CPU-only torch in its env (or a CUDA that does not
+        start there). Silently running a heavy model from system RAM is 10-100x slower than the GPU and was invisible
+        before; it is an error unless the profile allows CPU runs."""
+        actual = str(info.get("device") or "")
+        if not (device.startswith("cuda") and actual.startswith("cpu")):
+            return
+        why = f"loaded on the CPU although {device} was requested: the torch of env '{spec.env or 'core'}' has no CUDA"
+        if self._cpu_allowed(spec):
+            self.log.warning("%s %s (gpu.allow_cpu_fallback is on: running slowly)", spec.name, why)
+            return
+        try:
+            backend.unload()
+        except Exception:
+            pass
+        raise BackendUnavailable(
+            spec.name, why, "reinstall that environment with CUDA torch (Models -> environments), or set gpu.allow_cpu_fallback: true to run on CPU (slow)"
+        )
 
     def _make(self, spec: BackendSpec, options: dict[str, Any], device: str) -> Backend:
         if self.factory is not None:
             return self.factory(spec, options, device)
         return registry.instantiate(spec, options=options, device=device, models_dir=self.models_dir, log_dir=self.log_dir, context=self.context, root=self.root)
 
-    def _check_budget(self, spec: BackendSpec) -> None:
-        need = spec.vram_estimate_gb
+    def _check_budget(self, spec: BackendSpec, need: float | None = None) -> None:
+        """``need`` = what this load costs (``estimate_vram_gb`` with the options: an LLM grows with ctx x parallel)."""
+        need = spec.vram_estimate_gb if need is None else need
         limit = self.budget_gb - self.safety_margin_gb
         if need > limit:
             raise VramBudgetExceeded(spec.name, f"needs ~{need:.1f} GB > budget {self.budget_gb:.1f} - margin {self.safety_margin_gb:.1f} GB", "raise gpu.vram_budget_gb only if the GPU really has the memory")

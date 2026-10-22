@@ -45,7 +45,11 @@ backends run `adapters/<env>/main.py` inside `.venvs/<env>` and speak JSON-RPC o
 
 `-32001` = weights missing ("run `vndub models pull <name>`"), `-32002` = unavailable
 (import error, no CUDA, missing binary). Audio always travels by file path. A crashed
-adapter is restarted once and the call retried; timeouts kill the process. Role operations:
+adapter is restarted once and the call retried; timeouts kill the process. An adapter handles
+the items of a `run` call one by one (`op_<name>`) or, where the library takes a batch, all at
+once (`batch_<name>` built on `rpc.run_in_batches`: sub-batches of `options.batch_size`, a
+failing sub-batch redone item by item, results in item order; SenseVoice, anime-SER, Qwen3-ASR,
+the Qwen3 aligner and UTMOSv2 do, see DECISIONS.md "Batched adapters"). Role operations:
 
 | role | op | item -> result |
 |---|---|---|
@@ -69,9 +73,15 @@ adapter is restarted once and the call retried; timeouts kill the process. Role 
 
 ### detect
 In: `--project` (game dir, or a dir with a hand-written `project.yaml` containing `game_dir`).
-Out: `work/project.yaml` (`ProjectYaml`: engine, engine_version, voice_codec {container,
-codec, sr, ch, bitrate_k}, encrypted, drm, archives, warnings). Engine by file signatures
-(see ENGINES.md); `--engine` forces one. Encryption and DRM markers produce warnings.
+Out: `work/project.yaml` (`ProjectYaml`: engine, engine_version, src_lang, audio_lang, tgt_lang,
+voice_codec {container, codec, sr, ch, bitrate_k}, encrypted, drm, archives, warnings). Engine by
+file signatures (see ENGINES.md); `--engine` forces one. Encryption and DRM markers produce warnings.
+Languages come from the config: `project.src_lang` (`auto` by default: `parse` detects it from the
+script text and writes the code plus a `src_lang_detected` record `{lang, confidence, letters,
+lines, scripts}` into `project.yaml`), `project.audio_lang` (`""` = the voices speak the text's
+language; set a code for a translated release that kept the original voices) and `project.tgt_lang`.
+Re-running detect keeps the languages of an existing `project.yaml` (a detected code is kept only
+while the config still says `auto`; a code set by the user is never replaced).
 Config: `parse.engine` (auto = trust detect).
 
 ### extract
@@ -104,6 +114,11 @@ prefix check; flag `speaker_from_voice`). Voiced narrator-box lines that no pref
 cast, translated and dubbed like any character; a `？？？` line no prefix names keeps its own speaker.
 Unvoiced narration is never touched and never dubbed. `off` keeps the script's speaker (a voiced narrator
 then has no performer and only route A).
+Source language (`project.src_lang: auto`): after the lines are written parse runs `text/lang.detect_language`
+over them (letters counted by script: kana among the CJK letters = ja, han alone = zh, hangul = ko, Cyrillic =
+ru / uk, Latin = en / de / fr / es / it / pt by a stop-word vote; no model) and stores the code with the
+`src_lang_detected` record in `project.yaml`; every later stage reads `StageContext.src_lang` (and
+`audio_lang`). A code set by hand is kept, with a warning when the text clearly looks like another language.
 Config: `parse.engine_opts.<engine>.*`, `parse.import_vntextpatch`, `parse.narrator_names`, `parse.hidden_speakers`.
 
 ### link
@@ -115,13 +130,18 @@ status ok|review|unmatched, reasons, relinked_from; extras `signals` (no_asr) an
 The script text is the source of truth; the original audio is only an intonation reference.
 `link.mode` selects how the line <-> voice mapping is verified:
 
-* `asr` (CLI default): the steps below. `link.recover_text` aside, behaviour is unchanged.
+* `asr` (CLI default): the steps below. `link.recover_text` aside, behaviour is unchanged. The ASR runs in
+  the voices' language (`audio_lang`); a backend built for one language (`anime_whisper`, `options.language:
+  ja`) is skipped for voices in another one. When `audio_lang` differs from `src_lang` (a translated release
+  that kept the original voices) the ASR text cannot be compared with the script: the stage falls back to the
+  cheap signals below and says so (summary `note`, `mode: no_asr`).
 * `no_asr` ("intonation-check only", the desktop app's default): **no ASR backend is acquired**
   (not even the mock; `work/gpu_events.jsonl` shows no `role: asr` load). Cheap signals only:
   1. speaker-embedding consistency (`link.speaker_embedder`, steps 3 below; reasons
      `spk_outlier:<cosine>` below `outlier_consistency`, `spk_cluster:<speaker>` when the clip
      clusters with another speaker),
-  2. duration vs text length: morae of the (sustain-extended) text (`text/ja.count_morae`) against the
+  2. duration vs text length: morae of the (sustain-extended) text (`text/ja.count_morae`; for a text in
+     another language mora equivalents = estimated syllables x 1.5, `text/lang.speech_units`) against the
      file duration; `ratio = duration / (morae / sqrt(rate_min * rate_max))`, 1.0 = typical rate;
      implausible when shorter than `morae / rate_max` or longer than `max(morae / rate_min, 1.5 s) +
      silence_tolerance_s` (reason `duration_implausible:<ratio>`; defaults 3 and 13 mora/s, 1.0 s),
@@ -203,14 +223,25 @@ In: lines, passports (emotion per line), `configs/glossary.yaml`. Out:
 `work/translation/lines.<tgt>.jsonl` (`TranslationRecord`: text_tgt, text_tgt_short,
 text_tts, text_tts_short, text_plain (stress-free CER reference), syllables, notes,
 source import|llm:<model>|mock, glossary_hits, flags).
+- The source language is `StageContext.src_lang` (detected by parse, see above): the prompt says
+  "translating a visual novel from <language>"; the import readers also accept the code / name of
+  that language as the source column. A script that already is in the target language is kept as it
+  is (`source: same_lang`), no model is started.
 - `translate.import`: VNTextPatch JSON/XLSX dir or a line_id -> text map; skips the LLM.
 - Else `llama-server` with `translate.llm.backend` (Gemma 4 12B IQ4_XS; fallbacks), per scene,
   batches of `batch_lines` as JSON `[{id, speaker, gender, emotion, text}]` with the last
   `context_window_lines` translations and a scene summary; system prompt = glossary (names,
   terms present in the batch, honorific policy, ты/вы matrix, genders) + rules. Output JSON
   `{"lines":[{"id","ru","ru_short","notes"}]}`, validated strictly; retry at temperature 0,
-  then halve the batch.
-- Interjections (`configs/interjections.yaml`) map to natural equivalents.
+  then halve the batch. An answer cut off by the token budget (`finish_reason: length`) keeps
+  the lines that were complete, only the rest is retried; thinking is switched off in the chat
+  template (`enable_thinking: false`, Gemma 4 / Qwen 3.x) so the budget goes to the answer.
+  Every incomplete answer is appended raw to `work/logs/llm_answers.jsonl` (ids, coverage,
+  finish reason, reasoning chars, content). `translate.llm.parallel: N` starts llama-server with
+  `N` slots (`-np N`, context `ctx x N`) and translates `N` scenes at once from threads (continuous
+  batching on the GPU); the default 1 fits an 8 GB card with the 12B model.
+- Interjections (`configs/interjections.yaml`, Japanese -> Russian) map to natural equivalents;
+  the lexicon and the kana-only interjection flag apply to Japanese scripts only.
 - Post-processing: ruaccent stress (+ yo), numbers -> words, abbreviations expanded.
 - `--seed-glossary` writes/extends `configs/glossary.yaml` from `characters.yaml`.
 - **Unvoiced speaker lines** (mode B): `translate.include_unvoiced` (default `auto` = on only when
@@ -433,13 +464,13 @@ set_ref|keep_original, payload, ts).
 | Section | Keys |
 |---|---|
 | top level | `profile`, `extends`, `fallback_to_mock` (test only), `license_policy` research/commercial, `tools_file`, `tools` |
-| `project` | `game_dir`, `work_dir`, `out_dir`, `models_dir`, `src_lang`, `tgt_lang` |
+| `project` | `game_dir`, `work_dir`, `out_dir`, `models_dir`, `src_lang` (`auto` = detected by parse \| a code), `audio_lang` (`""` = the text's language), `tgt_lang` |
 | `gpu` | `vram_budget_gb`, `safety_margin_gb`, `device`, `allow_cpu_fallback` |
 | `extract` | `keep_stereo_copy`, `analysis_sr`, `workers`, `voice_exts`, `vgmstream_exts`, `voice_dirs` |
 | `parse` | `engine`, `engine_opts.{kag,nscripter,renpy,tyrano,generic}`, `import_vntextpatch`, `narrator_names`, `hidden_speakers` |
 | `link` | `asr`, `asr_fallback`, `asr_compute`, `accept_score`, `review_score`, `neighbour_window`, `global_topk`, `auto_repair`, `speaker_embedder`, `cluster_distance`, `outlier_consistency`, `mode` (`asr` \| `no_asr`), `recover_text`, `recover_asr`, `rate_min`, `rate_max`, `silence_tolerance_s`, `suggest_asr_share` |
 | `analyze` | `e2v`, `anime_ser`, `adv`, `events`, `aligner`, `aligner_fallback`, `f0`, `vad`, `caption`, `caption_backend`, `ref_candidates_per_emotion`, `e2v_weight`, `anime_weight` |
-| `translate` | `import`, `llm.{backend,fallbacks,ctx,n_gpu_layers,temperature,port,max_retries,real_backend}`, `batch_lines`, `context_window_lines`, `glossary`, `short_variant_min_words`, `stress.{tool,model,yo,format}`, `interjections`, `mock_dictionary`, `include_unvoiced` (`on` default \| `off` \| `auto`) |
+| `translate` | `import`, `llm.{backend,fallbacks,ctx,n_gpu_layers,temperature,port,max_retries,parallel,real_backend}`, `batch_lines`, `context_window_lines`, `glossary`, `short_variant_min_words`, `stress.{tool,model,yo,format}`, `interjections`, `mock_dictionary`, `include_unvoiced` (`on` default \| `off` \| `auto`) |
 | `text_emotion` | `enabled`, `cues`, `narration_window`, `llm` (`auto` \| `on` \| `off`), `llm_context_lines`, `min_confidence`, `only_unvoiced` |
 | `voicebank` | `refs.*`, `performer.{kind,backend,n_designs,test_sentences,max_f0_delta_semitones,reference_dir,sample_lines,offer_clone}`, `rvc.*`, `route_c.*`, `calibrate_spk`, `min_minutes_for_voicebank` |
 | `synth` | `n_candidates`, `n_candidates_short`, `routes` (A, B, C, P), `backends.<name>.{enabled,...}`, `vc.{primary,fallback,rvc,seedvc}`, `keep_original_for_interjections`, `use_short_text_if_ratio_above`, `interjection_max_syllables`, `high_arousal`, `seed_base`, `voice_unvoiced` |

@@ -133,6 +133,7 @@ def test_02_summary(flow: Flow) -> None:
     flow.needs("import")
     s = flow.get("/api/project/summary")
     assert s["engine"] == {"id": "renpy", "label": "Ren'Py", "version": s["engine"]["version"], "encrypted": False, "drm": [], "warnings": []}
+    assert s["languages"] == {"src": "ja", "src_detected": True, "audio": "ja", "tgt": "ru"}  # detected from the script text
     assert s["tools_missing"] == [] or all({"tool", "url"} <= set(t) for t in s["tools_missing"])
     assert s["voice_files"] == 20
     assert s["lines_total"] == s["voiced"] + s["unvoiced"] and s["voiced"] == 20
@@ -174,6 +175,17 @@ def test_04_translation_settings_roundtrip(flow: Flow) -> None:
     t = flow.get("/api/project/translation")
     assert (t["tgt_lang"], t["source"], t["honorifics"], t["address_default"], t["license_policy"]) == ("ru", "auto", "drop", "ты", "research")
     assert t["llm_available"] is True  # the mock translator
+    # the source language: detected from the script text unless the user picks one
+    assert t["src_lang"] == "auto" and t["src_lang_effective"] == "ja" and t["src_lang_detected"]["lang"] == "ja" and t["src_lang_detected"]["confidence"] > 0.8
+    t = flow.put("/api/project/translation", {"src_lang": "en"})
+    assert (t["src_lang"], t["src_lang_effective"], t["src_lang_detected"]) == ("en", "en", None)
+    py = yaml.safe_load((flow.data / "projects" / flow.slug / "work" / "project.yaml").read_text(encoding="utf-8"))
+    assert py["src_lang"] == "en" and not py.get("src_lang_detected")
+    assert "src_lang: en" in (flow.data / "projects" / flow.slug / "pipeline.yaml").read_text(encoding="utf-8")
+    t = flow.put("/api/project/translation", {"src_lang": "auto"})
+    assert t["src_lang"] == "auto" and t["src_lang_effective"] == "ja" and t["src_lang_detected"]["lang"] == "ja"  # detected again
+    py = yaml.safe_load((flow.data / "projects" / flow.slug / "work" / "project.yaml").read_text(encoding="utf-8"))
+    assert py["src_lang"] == "ja" and py["src_lang_detected"]["lang"] == "ja"
     adv = t["advanced"]
     assert adv["n_candidates"] == 2 and adv["routes"] == {"A": True, "B": True, "C": False} and adv["asr_check"] is False
     assert {"name", "enabled", "vram_gb", "license", "commercial_ok", "role"} == set(adv["backends"][0])
@@ -211,7 +223,7 @@ def test_04_translation_settings_roundtrip(flow: Flow) -> None:
 def test_05_translation_settings_validation(flow: Flow) -> None:
     flow.needs("import")
     bad = [
-        {"tgt_lang": "de"}, {"source": "magic"}, {"honorifics": "x"}, {"address_default": "ну"}, {"license_policy": "free"},
+        {"tgt_lang": "de"}, {"src_lang": "xx"}, {"source": "magic"}, {"honorifics": "x"}, {"address_default": "ну"}, {"license_policy": "free"},
         {"advanced": {"n_candidates": 0}}, {"advanced": {"n_candidates": 99}}, {"advanced": {"n_candidates": "many"}},
         {"advanced": {"routes": {"Z": True}}}, {"advanced": {"routes": {"A": False, "B": False, "C": False}}}, {"advanced": {"backends": [{"name": "nope", "enabled": True}]}},
     ]

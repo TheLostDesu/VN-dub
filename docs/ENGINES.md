@@ -26,7 +26,7 @@ case-insensitively, extension-less and with `\` or `/` separators
 | KiriKiri 2/Z | `*.xp3`, loose `.ks`, `.scn` | built-in XP3 reader (unencrypted); dump folders; FreeMote for `.scn` | KAG macros + conventions; `.scn` JSON | `patchN.xp3` (built-in writer or Xp3Pack), or `unencrypted/` | complete |
 | NScripter / ONScripter | `nscript.dat`, `0.txt`, `arc*.nsa`, `*.sar`, `*.ns2` | built-in XOR 0x84 decoder, NSA/SAR/NS2 reader | `dwave CH,"file"` -> next text line | loose beside the exe | complete |
 | Siglus | `Scene.pck` + `Gameexe.dat`, `koe_master.csv` | `siglus-ssu -k` / `-x` | `koe_master.csv` | dump layout + instructions (`.ovk` repack not available) | parser complete, pack manual |
-| BGI / Ethornell | `*.arc` + `._bp` / `BGI.exe`, `bgi_json/` | `bgi-extractor -t -f json` | JSON speaker/text/voice id | loose + instructions | parser complete (defensive JSON), pack manual |
+| BGI / Ethornell | `*.arc` + `._bp` / `BGI.exe`, `bgi_json/` | `bgi-extractor -t -f json` (bundled with the app) | JSON speaker/text/voice id | loose + instructions | parser complete (tested with the bundled exe on a synthetic archive), pack manual |
 | CatSystem2 | `*.int` (KIF) + `*.cst` | TriggersTools CLI / `exkifint` | decompiled CST (0x21 name, 0x20 text, 0x30 `pcm`) | loose + CatSceneEditor instructions | parser defensive (voice command UNVERIFIED) |
 | Artemis | `*.pfs` | `pfs-rs` / `pfs_unpacker` | Lua `.ast` (`text.ja`, `name`, `{"vo", file=}`) | `files/` + pfs pack command | parser complete (voice key layout UNVERIFIED) |
 | YU-RIS | `*.ypf` | `yrt` | TODO `.yst` parser -> use VNTextPatch import | instructions | thin wrapper |
@@ -207,12 +207,19 @@ writes the dump layout (`out/siglus/koe_dump/`) and INSTALL.md lists the options
 
 ## BGI / Ethornell
 
-`bgi-extractor -t -f json -o <out> <archive>` for every `*.arc`. The JSON shape
-is undocumented, so the parser accepts a list or `{lines|messages|entries|texts:
-[...]}` with speaker in `speaker|name|character|chara`, text in
-`text|line|message|msg`, voice in `voice|voice_id|vo|voice_file`, and voice ids
-embedded as `(yuki_000003)` at the start of the text. Already-exported JSON in
-`bgi_json/` (or anywhere in the game dir) is used without the tool. Repacking is
+`bgi-extractor -t -f json --no-archive --no-single-file --no-presets -o <out>
+<archive>` for every `*.arc` (the packaged app ships its own build of the tool:
+upstream publishes source only). That writes one
+`01_scripts/<archive>/<script>.json` per script, a list of `{"type":
+"line"|"choice", "speaker"?, "text", "voice"?}`; without the `--no-*` switches
+the same records are also merged per archive and for the whole game, and every
+line would be read three times. Choices are skipped; the JSON is read with
+`strict=False` (the tool writes tabs into strings unescaped). For JSON from
+other tools the parser also accepts `{lines|messages|entries|texts: [...]}` with
+speaker in `speaker|name|character|chara`, text in `text|line|message|msg`,
+voice in `voice|voice_id|vo|voice_file`, and voice ids embedded as
+`(yuki_000003)` at the start of the text. Already-exported JSON in `bgi_json/`
+(or anywhere in the game dir) is used without the tool. Repacking is
 weak (BGIKit/EthornellTools archived): loose files + instructions.
 
 ## CatSystem2

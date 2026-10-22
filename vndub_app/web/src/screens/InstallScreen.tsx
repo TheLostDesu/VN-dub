@@ -9,11 +9,18 @@ import { StepFooter } from "../components/StepFooter";
 import { Button, Callout, Card, Checkbox, Chip, Collapsible, Dialog, PageTitle, SelectField, Spinner, useToast } from "../components/ui";
 import { useI18n } from "../i18n";
 import { useJobTracker } from "../state/progress";
+import { useProject } from "../state/project";
 import { dirname, fmtDate } from "../util/format";
+
+const APPLY_JOBS = ["install_apply"];
+const ROLLBACK_JOBS = ["install_rollback"];
+const ZIP_JOBS = ["install_zip"];
 
 export default function InstallScreen() {
   const { t, tOr, has, lang } = useI18n();
   const toast = useToast();
+  const { project } = useProject();
+  const slug = project?.slug ?? null;
   const [plan, setPlan] = useState<InstallPlan | null>(null);
   const [error, setError] = useState<ErrorInfo | null>(null);
   const [loading, setLoading] = useState(true);
@@ -39,9 +46,10 @@ export default function InstallScreen() {
     void load();
   }, [load]);
 
-  const apply = useJobTracker({ onDone: () => void load() });
-  const rollback = useJobTracker({ onDone: () => { toast.show(t("install.rollback_done")); void load(); } });
-  const zip = useJobTracker();
+  // kinds + project: the jobs keep running when the screen is left; each tracker picks up its job of this project again
+  const apply = useJobTracker({ onDone: () => void load(), kinds: APPLY_JOBS, project: slug });
+  const rollback = useJobTracker({ onDone: () => { toast.show(t("install.rollback_done")); void load(); }, kinds: ROLLBACK_JOBS, project: slug });
+  const zip = useJobTracker({ kinds: ZIP_JOBS, project: slug });
 
   const zipPath = typeof zip.job?.result?.path === "string" ? (zip.job.result.path as string) : "";
   const installed = apply.job?.state === "done";

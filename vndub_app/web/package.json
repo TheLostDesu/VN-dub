@@ -1,7 +1,7 @@
 {
   "name": "vndub-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "VNDub desktop app: single-page wizard (React + Vite + TypeScript)",
   "scripts": {

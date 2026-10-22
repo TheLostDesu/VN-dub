@@ -310,7 +310,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
     voiced_ids = {l.line_id for l in ctx.voiced_lines(apply_only=False)}
     chars = ctx.characters()
     proj = ctx.project
-    src_lang = (proj.src_lang if proj else None) or ctx.cfg.project.src_lang
+    src_lang = ctx.src_lang
     tgt_lang = (proj.tgt_lang if proj else None) or ctx.cfg.project.tgt_lang
 
     cpath = cues_path(ctx.cfg)

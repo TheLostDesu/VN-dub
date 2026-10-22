@@ -47,6 +47,24 @@ def test_bgi_json_shapes() -> None:
     assert parse_bgi_json({"entries": data[:1]})[0]["voice"] == "yuki_000003"
 
 
+def test_bgi_extractor_records_skip_choices() -> None:
+    """bgi-extractor -t -f json: {type: line|choice, speaker?, text, voice?}; menu choices are not spoken."""
+    data = [{"type": "line", "speaker": "由岐", "text": "「行こう」", "voice": "yuki_000004"}, {"type": "choice", "text": "キスする"}, {"type": "line", "text": "地の文"}]
+    assert parse_bgi_json(data) == [{"speaker": "由岐", "text": "「行こう」", "voice": "yuki_000004"}, {"speaker": "", "text": "地の文", "voice": ""}]
+
+
+def test_bgi_json_with_unescaped_tabs_is_read(tmp_path: Path, make_ctx) -> None:
+    """bgi-extractor writes control characters into JSON strings as they are (strict JSON would reject the file)."""
+    from engine_helpers import detect_and_parse
+
+    game = tmp_path / "g"
+    (game / "bgi_json").mkdir(parents=True)
+    (game / "bgi_json" / "sc01.json").write_text('[\n  {"type":"line","speaker":"由岐","text":"一\t二"}\n]\n', encoding="utf-8")
+    _, _, _, res = detect_and_parse(make_ctx(game), "bgi")
+    assert not res.notes, res.notes
+    assert [(l.speaker_raw, l.text_src.split()) for l in res.lines] == [("由岐", ["一", "二"])]
+
+
 def test_catsystem2_cst_text_and_json() -> None:
     text = "0x21 さくら\n0x30 pcm sak_0001\n0x20 「こんにちは」\\n\n0x20 地の文\n"
     assert parse_cst_text(text) == [{"speaker": "さくら", "text": "「こんにちは」", "voice": "sak_0001"}, {"speaker": "", "text": "地の文", "voice": ""}]

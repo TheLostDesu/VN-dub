@@ -5,10 +5,14 @@ import { dirname } from "../util/format";
 import { JobProgress } from "./JobProgress";
 import { Button, Callout } from "./ui";
 
+const REPORT_JOBS = ["report"];
+
 /** "Собрать отчёт о проблеме": builds the zip (job) and shows where it is. */
 export function ReportProblem({ label, variant = "primary" }: { label: string; variant?: "primary" | "secondary" }) {
   const t = useT();
-  const tracker = useJobTracker();
+  // kinds: the report keeps building when the user leaves the screen; activeOnly: the button lives in several places
+  // (Settings, every error panel), so a finished report is shown only where it was started
+  const tracker = useJobTracker({ kinds: REPORT_JOBS, activeOnly: true });
   const path = typeof tracker.job?.result?.path === "string" ? (tracker.job.result.path as string) : "";
   return (
     <div className="report-problem" data-testid="report-problem">

@@ -53,6 +53,7 @@ from vndub.manifest.io import AudioIndexRecord, Character, LineRecord, LinkRecor
 from vndub.stages._opcache import OpCache
 from vndub.stages.common import StageContext, StageError
 from vndub.text import ja
+from vndub.text.lang import speech_units
 
 NAME = "link"
 VERSION = "2"
@@ -99,6 +100,10 @@ def run_asr(
             spec, _ = ctx.models.resolve(name)
         except BackendUnavailable as e:
             reasons.append(str(e))
+            continue
+        fixed = spec.options.get("language")
+        if fixed and lang and fixed != lang:  # anime-whisper is a Japanese model: useless for voices in another language
+            reasons.append(f"{spec.name}: a {fixed} model, the voices are {lang}")
             continue
         options: dict[str, Any] = {"compute_type": cfg.asr_compute} if spec.adapter == "faster_whisper" else {}
         store = OpCache(ctx, f"link_asr_{spec.name}")
@@ -405,16 +410,17 @@ def speaker_checks(
 # no_asr: cheap signals (duration vs text, voice-file prefix / index order)
 # ----------------------------------------------------------------------------
 
-def duration_check(text: str, duration_s: float, rate_min: float, rate_max: float, tolerance_s: float) -> tuple[float | None, int, bool]:
+def duration_check(text: str, duration_s: float, rate_min: float, rate_max: float, tolerance_s: float, lang: str = "ja") -> tuple[float | None, int, bool]:
     """(ratio, morae, implausible) for a clip of ``duration_s`` seconds that should say ``text``.
 
     ratio = duration / (morae / typical rate) with the typical rate = sqrt(rate_min * rate_max), so 1.0 is
     a typical speaking rate, 2.0 is twice as long as expected and 0.5 twice as short. The clip is
     implausible when it is shorter than morae / rate_max or longer than morae / rate_min (at least 1.5 s)
     plus ``tolerance_s`` (leading / trailing silence and pauses are part of the file). Texts without
-    morae (punctuation only, empty) and empty clips give ``(None, morae, False)``.
+    morae (punctuation only, empty) and empty clips give ``(None, morae, False)``. For a text in another
+    language than Japanese ``morae`` are mora equivalents (:func:`vndub.text.lang.speech_units`).
     """
-    morae = ja.count_morae(text)
+    morae = speech_units(text, lang)
     if morae < 1 or duration_s <= 0:
         return None, morae, False
     typical = (rate_min * rate_max) ** 0.5
@@ -545,10 +551,13 @@ def run(ctx: StageContext) -> dict[str, Any]:
     if not ctx.paths.audio_index.exists():
         raise StageError(f"{ctx.paths.audio_index} not found: run `vndub extract` first")
     audio = {a.id: a for a in read_jsonl(ctx.paths.audio_index, AudioIndexRecord)}
-    src_lang = ctx.cfg.project.src_lang
-    proj = ctx.project
-    if proj is not None:
-        src_lang = proj.src_lang or src_lang
+    src_lang, audio_lang = ctx.src_lang, ctx.audio_lang
+    lang_note = ""
+    if not no_asr and audio_lang != src_lang:
+        # a translated release with the original voices: what the ASR hears is not the text, cheap signals only
+        lang_note = f"the voices are {audio_lang} but the script text is {src_lang}: ASR text cannot be compared, cheap signals only"
+        ctx.log.warning(lang_note)
+        no_asr = True
 
     def wav16(aid: str) -> str:
         return str(ctx.paths.abs(audio[aid].wav16 or audio[aid].wav))
@@ -586,7 +595,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
     recover_backend, recover_reason = "", ""
     if fix:
         rtexts, recover_backend, recover_reason = run_asr(
-            ctx, [(aid, wav16(aid)) for aid in fix_audio], src_lang, names=[cfg.recover_asr, cfg.asr_fallback], on_items=units.step
+            ctx, [(aid, wav16(aid)) for aid in fix_audio], audio_lang, names=[cfg.recover_asr, cfg.asr_fallback], on_items=units.step
         )
         for l in fix:
             t = (rtexts.get(l.audio_id or "") or "").strip()
@@ -622,7 +631,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
         matcher = Matcher(lines, cfg.neighbour_window, cfg.global_topk)
         recovered_ids = set(recovered_now)
         asr_items = [(l.audio_id, wav16(l.audio_id)) for l in selected if l.line_id not in recovered_ids] + [(a.id, wav16(a.id)) for a in orphans]
-        texts, asr_backend, asr_reason = run_asr(ctx, asr_items, src_lang, on_items=units.step) if asr_items else ({}, "", "")
+        texts, asr_backend, asr_reason = run_asr(ctx, asr_items, audio_lang, on_items=units.step) if asr_items else ({}, "", "")
         asr_note = "mock ASR cannot transcribe original clips" if asr_backend.startswith("mock") else ""
         for l in selected:
             if l.line_id in recovered_ids:  # the ASR text IS the line's text: nothing to compare it with
@@ -661,7 +670,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
         for l in selected:
             reasons: list[str] = []
             text = texts_all[l.line_id]
-            ratio, morae, implausible = duration_check(text, float(audio[l.audio_id or ""].duration or 0.0), cfg.rate_min, cfg.rate_max, cfg.silence_tolerance_s)
+            ratio, morae, implausible = duration_check(text, float(audio[l.audio_id or ""].duration or 0.0), cfg.rate_min, cfg.rate_max, cfg.silence_tolerance_s, src_lang)
             signals: dict[str, Any] = {"dur_ratio": ratio, "morae": morae}
             if not text.strip():
                 signals["no_text"] = True
@@ -727,7 +736,10 @@ def run(ctx: StageContext) -> dict[str, Any]:
     else:
         asr_label = asr_backend or f"unavailable: {asr_reason}"
     summary: dict[str, Any] = {
-        "mode": cfg.mode,
+        "mode": "no_asr" if (no_asr and cfg.mode != "no_asr") else cfg.mode,
+        "src_lang": src_lang,
+        "audio_lang": audio_lang,
+        **({"note": lang_note} if lang_note else {}),
         "lines_judged": len(judged),
         "ok": counts.get("ok", 0),
         "review": counts.get("review", 0),

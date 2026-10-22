@@ -3,15 +3,17 @@
   Create backend virtual environments .venvs\<env> from envs\<env>.txt (uv, Python 3.11).
 
 .EXAMPLE
-  scripts\make_envs.ps1 -Env asr
-  scripts\make_envs.ps1 -Env asr,score -Cpu
+  scripts\make_envs.ps1 -Env main
+  scripts\make_envs.ps1 -Env main,funasr -Cpu
   scripts\make_envs.ps1 -Env all -SkipExtras
-  scripts\make_envs.ps1 -Env asr -EnvsDir "$env:LOCALAPPDATA\VNDub\envs"   # desktop app layout
+  scripts\make_envs.ps1 -Env main -EnvsDir "$env:LOCALAPPDATA\VNDub\envs"   # desktop app layout
 
 .NOTES
   Envs are created under -EnvsDir (default: $env:VNDUB_ENVS_DIR, else <repo>\.venvs). The core finds
   them through the same variable (vndub.backends.runner.envs_root); -Cpu installs CPU torch wheels,
   without it the CUDA wheels of each env file (# @cuda) are used.
+  -Python is a version (default 3.11) or the path of an interpreter; the desktop app passes the CPython it installed
+  with uv (a real folder, not uv's minor-version junction, which Windows may refuse to follow).
   Directives inside envs\<env>.txt (comments, see envs\README.md):
     # @torch torch==X torchaudio==Y     installed first from the PyTorch index
     # @cuda cu128                       CUDA tag of that index (ignored with -Cpu)
@@ -21,7 +23,7 @@
   envs\<env>+<extra>.txt are optional extras (failures are reported, not fatal, unless -Strict).
 #>
 param(
-    [string[]]$Env = @("asr"),
+    [string[]]$Env = @("main"),
     [switch]$Cpu,
     [switch]$SkipExtras,
     [switch]$Strict,
@@ -43,7 +45,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     throw "uv not found on PATH (install: pip install uv, or https://docs.astral.sh/uv/)"
 }
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Write-Warning "git not found: envs that clone repositories (funasr+cosyvoice, rvc, seedvc, hf+voxcpm, higgs) will fail"
+    Write-Warning "git not found: envs that clone repositories (funasr+cosyvoice, rvc, seedvc, main+voxcpm, main+utmosv2) will fail"
 }
 
 $Env = @($Env | ForEach-Object { $_ -split "," } | Where-Object { $_ })

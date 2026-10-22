@@ -12,11 +12,33 @@ safely), then ``<data>/configs/tools.local.yaml`` (``{tools: {key: path}}``) is 
 generated project configs are refreshed. An unreachable URL (or a manual-only entry) raises
 ``AppError("download_unreachable", {url, filename, target_dir}, action="show_manual")``: the user
 saves the file into ``target_dir`` and presses install again, the archive found there is verified
-and extracted without another download.
+and extracted without another download. An entry with ``bundled`` also ships with the packaged app
+(``<exe dir>/bin/...``, built by ``packaging/build_app.ps1``): that copy counts as installed unless
+the tools folder holds one of its own.
 
 The manifest validator (:func:`validate_manifest`) is strict: ``sha256: null`` is accepted only with
 an explicit ``verify`` of ``size`` or ``none`` (with ``unverified_reason``); :func:`manifest_warnings`
 lists every entry that is not hash-verified so nothing is unverified silently.
+
+Where things live (``<envs>`` is ``Settings.envs_dir``, else ``<data>/envs``; :func:`configure_environment`)::
+
+    <data>/tools/<name>/<version>/  downloaded tools                      (Settings: the data folder)
+    <data>/tools/pytools/           Python 3.12 venv of pip-installed tools (unrpa, siglus-ssu ...)
+    <envs>/<name>/                  backend venvs (``envs/<name>.txt``)
+    <envs>/_uv/cache/               uv's download cache         (UV_CACHE_DIR)
+    <envs>/_uv/python/              CPython builds uv installs  (UV_PYTHON_INSTALL_DIR)
+
+uv would keep its cache in ``%LOCALAPPDATA%\\uv\\cache`` and its Pythons in ``%APPDATA%\\uv\\python`` whatever
+folder the user chose, so every child process gets :func:`uv_dirs` (:func:`_child_env`). The cache sits next to the
+venvs on purpose: uv stores each wheel once and *hardlinks* it into every venv, which works only inside one volume
+(across volumes it copies), so torch is downloaded and stored once for all envs.
+
+Python itself comes from :func:`ensure_python`: ``uv python install``, then the *concrete* interpreter folder
+(``cpython-3.11.<patch>-...``) is handed to ``uv venv --python <exe>``. uv's minor-version link
+(``cpython-3.11-...``, a directory junction on Windows) is deleted after every install: Windows can refuse to follow
+it (os error 448, ``ERROR_UNTRUSTED_MOUNT_POINT``) and uv bakes the link path into the ``pyvenv.cfg`` and the
+``python.exe`` trampoline of every venv it creates while the link exists, so a venv made with the link present
+would still need it at run time.
 """
 
 from __future__ import annotations
@@ -41,9 +63,9 @@ import yaml
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from vndub_app import appdirs, downloads
+from vndub_app import appdirs, downloads, winproc
 from vndub_app.errors import AppError
-from vndub_app.jobs import JobContext
+from vndub_app.jobs import JobCancelled, JobContext
 
 log = logging.getLogger("vndub_app.installer")
 
@@ -55,6 +77,8 @@ ARCHIVES = ("zip", "tar.gz", "tar.xz", "none")
 VERIFY_MODES = ("sha256", "size", "none")
 PLATFORMS = ("win32", "linux", "darwin")
 PYTOOLS_PYTHON = "3.12"  # siglus-ssu needs >= 3.12; backend envs stay on 3.11
+ENVS_PYTHON = "3.11"  # the CPython of the backend envs (scripts/make_envs.* default; passed on as -Python / PYTHON)
+UV_DIRNAME = "_uv"  # <envs>/_uv/{cache,python}
 PYTOOLS_DIRNAME = "pytools"
 MARKER = ".installed.json"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -64,7 +88,7 @@ _PIPHASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ENTRY_KEYS = {
     "name", "version", "kind", "manual", "platforms", "engines", "required", "needs_pytools", "homepage",
     "license", "url", "filename", "archive", "size", "sha256", "verify", "unverified_reason", "provides",
-    "extra", "wrapper", "pip", "notes",
+    "bundled", "extra", "wrapper", "pip", "notes",
 }
 _EXTRA_KEYS = {"url", "filename", "archive", "size", "sha256", "verify", "unverified_reason"}
 
@@ -183,6 +207,14 @@ def validate_manifest(data: Any, *, allow_http: bool = False) -> list[str]:
                     errs.append(f"{ctx}: provides key {key!r} is not a tool in vndub.tools.TOOL_INFO")
                 if not _safe_rel(rel):
                     errs.append(f"{ctx}: provides[{key!r}] must be a relative posix path without '..'")
+        bundled = e.get("bundled")
+        if bundled is not None:
+            if not isinstance(bundled, dict) or not bundled or not isinstance(prov, dict) or set(bundled) - set(prov):
+                errs.append(f"{ctx}: bundled must map keys of provides to paths below the folder of VNDub.exe")
+            else:
+                for key, rel in bundled.items():
+                    if not _safe_rel(rel):
+                        errs.append(f"{ctx}: bundled[{key!r}] must be a relative posix path without '..'")
         if not isinstance(e.get("extra", []), list):
             errs.append(f"{ctx}: extra must be a list")
         if kind == "pip":
@@ -373,8 +405,12 @@ def _find_file(base: Path, hint: str) -> Path | None:
 
 
 def provided_paths(entry: dict[str, Any]) -> dict[str, Path]:
-    """Where this entry's executables are installed right now (only the ones that exist)."""
+    """Where this entry's executables are installed right now (only the ones that exist).
+
+    A copy in the tools folder (installed, or put there by the user) wins over the one bundled with the packaged app.
+    """
     out: dict[str, Path] = {}
+    bundled = bundled_paths(entry)
     for key, hint in entry["provides"].items():
         p: Path | None
         if entry["kind"] == "pip":
@@ -385,13 +421,15 @@ def provided_paths(entry: dict[str, Any]) -> dict[str, Path]:
             p = p if p.is_file() else None
         else:
             p = _find_file(target_dir(entry), hint)
+        if p is None:
+            p = bundled.get(key)
         if p is not None:
             out[key] = p
     return out
 
 
 def discover_installed() -> dict[str, str]:
-    """Tool paths of everything installed under ``<data>/tools`` (also files the user placed there by hand)."""
+    """Tool paths of everything installed under ``<data>/tools`` (also files the user placed there by hand) or bundled with the app."""
     found: dict[str, str] = {}
     for e in entries():
         if os.name != "nt" and "linux" not in e["platforms"]:
@@ -401,16 +439,21 @@ def discover_installed() -> dict[str, str]:
     return found
 
 
+def tool_paths() -> dict[str, str]:
+    """Tool key -> executable for the pipeline: local yaml first, then discovered files (the base ``tools.yaml`` and PATH come after)."""
+    found = discover_installed()
+    for k, v in read_local_tools().items():
+        if Path(v).exists():  # a stale path must not hide a working install
+            found[k] = v
+    return found
+
+
 def tools_object():
     """``vndub.tools.Tools`` with the installer's results: local yaml first, then discovered files, then PATH."""
     from vndub.tools import Tools
 
     base = appdirs.resource("configs", "tools.yaml")
-    overrides: dict[str, str] = dict(discover_installed())
-    for k, v in read_local_tools().items():
-        if Path(v).exists():  # a stale path must not hide a working install
-            overrides[k] = v
-    return Tools.load(base if base.exists() else None, overrides)
+    return Tools.load(base if base.exists() else None, tool_paths())
 
 
 def _platform_ok(entry: dict[str, Any]) -> bool:
@@ -557,34 +600,98 @@ def find_uv() -> Path | None:
     return home if home.is_file() else None
 
 
+def app_dir() -> Path | None:
+    """Folder of ``VNDub.exe`` in the packaged app (the installer puts ``git\\``, ``redist\\`` and ``bin\\`` next to it); ``None`` in a dev run."""
+    return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None
+
+
+def bundled_git() -> Path | None:
+    """``<exe dir>\\git\\cmd\\git.exe`` (MinGit, added by ``packaging/build_app.ps1``) in the packaged app, else ``None``."""
+    base = app_dir()
+    if base is None:
+        return None
+    git = base / "git" / "cmd" / ("git.exe" if os.name == "nt" else "git")
+    return git if git.is_file() else None
+
+
+def bundled_paths(entry: dict[str, Any]) -> dict[str, Path]:
+    """Executables of ``entry`` that ship next to ``VNDub.exe`` (manifest ``bundled``, added by ``packaging/build_app.ps1``).
+
+    Only the ones that exist; always empty in a dev run.
+    """
+    base = app_dir()
+    if base is None:
+        return {}
+    out: dict[str, Path] = {}
+    for key, rel in (entry.get("bundled") or {}).items():
+        p = base / rel
+        if p.is_file():
+            out[key] = p
+    return out
+
+
+def find_git() -> Path | None:
+    """``git`` from PATH first (the user's own Git wins), else the one bundled with the packaged app."""
+    found = shutil.which("git")
+    if found:
+        return Path(found)
+    return bundled_git()
+
+
+def bundled_vcredist() -> Path | None:
+    """``<exe dir>\\redist\\vc_redist.x64.exe`` (the Microsoft Visual C++ Redistributable the installer carries), else ``None``."""
+    base = app_dir()
+    if base is None or os.name != "nt":
+        return None
+    exe = base / "redist" / "vc_redist.x64.exe"
+    return exe if exe.is_file() else None
+
+
 def _child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     uv = find_uv()
     if uv is not None:
         env["PATH"] = str(uv.parent) + os.pathsep + env.get("PATH", "")
+    if shutil.which("git") is None:  # make_envs.ps1 and uv run a plain `git`: give them the bundled one
+        bundled = bundled_git()
+        if bundled is not None:
+            env["PATH"] = str(bundled.parent) + os.pathsep + env.get("PATH", "")
     env.setdefault("PYTHONUTF8", "1")
     env["VNDUB_ENVS_DIR"] = str(envs_dir())
+    for name, folder in uv_dirs().items():  # the app owns these two folders: never uv's per-user defaults
+        env[name] = folder
+        try:
+            Path(folder).mkdir(parents=True, exist_ok=True)
+        except OSError as e:  # uv will report the real problem itself
+            log.warning("cannot create %s=%s: %s", name, folder, e)
     env.update(extra or {})
     return env
 
 
-def _kill_tree(proc: subprocess.Popen[str]) -> None:
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        else:
-            proc.terminate()
-    except Exception:
-        pass
+def uv_dirs(envs: Path | None = None) -> dict[str, str]:
+    """uv's cache and Python folder for the app (``UV_CACHE_DIR`` / ``UV_PYTHON_INSTALL_DIR``), both below the envs folder.
+
+    Below the envs folder, not elsewhere in the data folder, so that the cache and the venvs are always on the same
+    volume: only then can uv hardlink wheels from the cache into a venv (torch is stored once for all envs).
+    ``envs`` is for callers that must not export ``VNDUB_ENVS_DIR`` (the settings answer).
+    """
+    base = (envs if envs is not None else envs_dir()) / UV_DIRNAME
+    return {"UV_CACHE_DIR": str(base / "cache"), "UV_PYTHON_INSTALL_DIR": str(base / "python")}
 
 
 def run_stream(cmd: list[str], ctx: JobContext, *, cwd: Path | None = None, env: dict[str, str] | None = None, on_line: Callable[[str], None] | None = None) -> tuple[int, list[str]]:
-    """Run ``cmd``, forward every output line to the job log, honour pause/cancel. Returns ``(exit code, last lines)``."""
+    """Run ``cmd``, forward every output line to the job log, honour pause/cancel. Returns ``(exit code, last lines)``.
+
+    The process is registered with the job (:meth:`JobContext.watch_process`), so Cancel (or the app closing) ends the
+    whole process tree at once instead of after its next line of output; the job then ends ``cancelled``
+    (:class:`JobCancelled`), not failed with the exit code of the killed child.
+    """
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     proc = subprocess.Popen(
         cmd, cwd=str(cwd) if cwd else None, env=env or _child_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", creationflags=flags, bufsize=1,
     )
+    unwatch = ctx.watch_process(proc)
     tail: list[str] = []
     try:
         assert proc.stdout is not None
@@ -600,14 +707,17 @@ def run_stream(cmd: list[str], ctx: JobContext, *, cwd: Path | None = None, env:
             ctx.checkpoint()
         rc = proc.wait()
     except BaseException:
-        _kill_tree(proc)
+        winproc.kill_tree(proc)
         raise
     finally:
+        unwatch()
         try:
             if proc.stdout:
                 proc.stdout.close()
         except Exception:
             pass
+    if ctx.cancelled:  # the cancel killed the child: its exit code says nothing about the install
+        raise JobCancelled("cancelled by user")
     return rc, tail
 
 
@@ -616,6 +726,128 @@ _NET_ERR = re.compile(r"dns error|error sending request|failed to fetch|connecti
 
 def _looks_like_network(lines: list[str]) -> bool:
     return any(_NET_ERR.search(l) for l in lines)
+
+
+# ----------------------------------------------------------------------------
+# CPython for the venvs (uv-managed, inside the envs folder)
+# ----------------------------------------------------------------------------
+
+_JUNCTION_ERR = re.compile(r"os error 448|untrusted mount point", re.I)
+# the folder of uv's minor-version link in a message: ...\cpython-3.12-windows-x86_64-none
+_LINK_IN_TEXT = re.compile(r"([A-Za-z]:[\\/][^\r\n\"'<>|]*?cpython-\d+\.\d+(?:\+\w+)?-[\w-]+)")
+_MINOR_LINK = re.compile(r"^cpython-\d+\.\d+(?:\+\w+)?-")  # cpython-3.11-windows-x86_64-none (no patch number)
+
+
+def _is_link(p: Path) -> bool:
+    """A symbolic link or, on Windows, any reparse point (uv's minor-version link is a directory junction)."""
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _remove_link(p: Path) -> bool:
+    """Remove the link itself, never the folder it points to (``rmdir`` on a junction, ``unlink`` on a symlink)."""
+    try:
+        if os.name == "nt":
+            os.rmdir(p)
+        else:
+            os.unlink(p)
+        return True
+    except OSError as e:
+        log.warning("cannot remove the link %s: %s", p, e)
+        return False
+
+
+def _drop_minor_links(root: Path) -> list[Path]:
+    """Delete uv's minor-version links (``cpython-3.11-...``) below ``root``; returns the ones removed.
+
+    uv recreates them with every ``uv python install``, so this runs after each one. Real folders are left alone.
+    """
+    removed: list[Path] = []
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return removed
+    for p in entries:
+        if _MINOR_LINK.match(p.name) and _is_link(p) and _remove_link(p):
+            removed.append(p)
+    return removed
+
+
+def _managed_exe(folder: Path) -> Path:
+    return folder / "python.exe" if os.name == "nt" else folder / "bin" / "python3"
+
+
+def concrete_python(version: str, root: Path | None = None) -> Path | None:
+    """The interpreter of the newest ``cpython-<version>.<patch>-...`` folder in uv's Python folder, else ``None``.
+
+    Only real folders count; a link (uv's ``cpython-3.11-...`` minor-version junction) is skipped, because Windows may
+    refuse to follow it. ``version`` is ``3.11`` (newest patch wins) or ``3.11.9`` (that patch).
+    """
+    root = root if root is not None else Path(uv_dirs()["UV_PYTHON_INSTALL_DIR"])
+    exact = version.count(".") >= 2
+    rx = re.compile(rf"^cpython-{re.escape(version)}-" if exact else rf"^cpython-{re.escape(version)}\.(\d+)-")
+    best: tuple[int, Path] | None = None
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return None
+    for d in entries:
+        m = rx.match(d.name)
+        if not m or _is_link(d) or not d.is_dir():
+            continue
+        exe = _managed_exe(d)
+        patch = 0 if exact else int(m.group(1))
+        if exe.is_file() and (best is None or patch > best[0]):
+            best = (patch, exe)
+    return best[1] if best else None
+
+
+def _junction_error(tail: list[str], root: Path) -> AppError | None:
+    """``python_junction_blocked`` when uv's output shows Windows refusing to follow a link folder (os error 448)."""
+    text = "\n".join(tail)
+    if not _JUNCTION_ERR.search(text):
+        return None
+    m = _LINK_IN_TEXT.search(text)
+    link = m.group(1) if m else str(root)
+    return AppError("python_junction_blocked", params={"path": link}, action="retry", details=text)
+
+
+def ensure_python(version: str, ctx: JobContext) -> Path:
+    """A real (non-link) CPython ``version`` interpreter inside the app's uv Python folder, installing it with uv if needed.
+
+    The result is meant for ``uv venv --python <exe>``: with a concrete path uv neither searches its installations
+    (where it trips over the minor-version junction, "Failed to inspect Python interpreter ... os error 448") nor
+    records the junction in the new venv. uv's minor-version links are deleted before and after the install for the
+    same reason. ``uv python install`` runs without ``--bin`` / registry entries: it must not touch ``~/.local/bin``
+    or the Windows registry of the user. An install that fails after the interpreter itself was unpacked (the exit
+    code is only about linking) still counts.
+    """
+    root = Path(uv_dirs()["UV_PYTHON_INSTALL_DIR"])
+    root.mkdir(parents=True, exist_ok=True)
+    _drop_minor_links(root)
+    exe = concrete_python(version, root)
+    if exe is not None:
+        return exe
+    uv = find_uv()
+    if uv is None:
+        raise AppError("tool_missing", params={"tool": "uv"}, action="show_manual", details="uv was not found (not bundled, not on PATH)")
+    ctx.message("installer.msg.python", version=version)
+    rc, tail = run_stream([str(uv), "python", "install", version, "--no-bin", "--no-registry"], ctx)
+    _drop_minor_links(root)
+    exe = concrete_python(version, root)
+    if exe is not None:
+        if rc != 0:
+            ctx.log(f"WARNING: uv python install exited with {rc} but Python {version} is in place: {exe}")
+        return exe
+    junction = _junction_error(tail, root)
+    if junction is not None:
+        raise junction
+    if _looks_like_network(tail):
+        raise AppError("download_unreachable", params={"url": "https://github.com/astral-sh/python-build-standalone/releases", "filename": f"Python {version}", "target_dir": str(root)}, action="show_manual", details="\n".join(tail))
+    raise AppError("tool_install_failed", params={"tool": "python"}, action="retry", details="\n".join(tail))
 
 
 # ----------------------------------------------------------------------------
@@ -678,11 +910,28 @@ def ensure_utf8_output(py: Path) -> Path | None:
     return f
 
 
+def _venv_base_is_gone(venv: Path) -> bool:
+    """True when ``pyvenv.cfg`` names an absolute ``home`` that no longer exists.
+
+    The tools venv is built on a Python in ``<envs>/_uv/python``; after the environments folder moved (Settings) and the old
+    folder was deleted, its launcher cannot start. Relative or missing ``home`` values (tests write ``home = x``) are left alone.
+    """
+    try:
+        for line in (venv / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip() == "home":
+                home = value.strip()
+                return bool(home) and os.path.isabs(home) and not Path(home).exists()
+    except OSError:
+        return False
+    return False
+
+
 def ensure_pytools(ctx: JobContext) -> Path:
     """The Python 3.12 tools environment (``<data>/tools/pytools``) used by pip-installed tools and unrpyc."""
     venv = pytools_dir()
     py = _venv_python(venv)
-    if py.is_file() and (venv / "pyvenv.cfg").is_file():
+    if py.is_file() and (venv / "pyvenv.cfg").is_file() and not _venv_base_is_gone(venv):
         ensure_utf8_output(py)
         return py
     uv = find_uv()
@@ -691,8 +940,12 @@ def ensure_pytools(ctx: JobContext) -> Path:
     if venv.exists():
         shutil.rmtree(venv, ignore_errors=True)
     ctx.message("installer.msg.pytools")
-    rc, tail = run_stream([str(uv), "venv", str(venv), "--python", PYTOOLS_PYTHON], ctx)
+    base_python = ensure_python(PYTOOLS_PYTHON, ctx)
+    rc, tail = run_stream([str(uv), "venv", str(venv), "--python", str(base_python)], ctx)
     if rc != 0 or not py.is_file():
+        junction = _junction_error(tail, Path(uv_dirs()["UV_PYTHON_INSTALL_DIR"]))
+        if junction is not None:
+            raise junction
         if _looks_like_network(tail):
             raise AppError("download_unreachable", params={"url": "https://github.com/astral-sh/python-build-standalone/releases", "filename": f"Python {PYTOOLS_PYTHON}", "target_dir": str(venv)}, action="show_manual", details="\n".join(tail))
         raise AppError("tool_install_failed", params={"tool": "pytools"}, action="retry", details="\n".join(tail))
@@ -796,10 +1049,11 @@ def install_tools(names: list[str], ctx: JobContext) -> dict[str, Any]:
         ctx.message("installer.msg.tool", tool=e["name"])
         py: Path | None = None
         try:
-            placed_by_hand = bool(e.get("manual")) and len(provided_paths(e)) == len(e["provides"])
-            if (e.get("manual") or not _platform_ok(e)) and not placed_by_hand:
+            # a manual entry is satisfied by files the user placed in its folder or by the copy bundled with the app
+            placed = bool(e.get("manual")) and len(provided_paths(e)) == len(e["provides"])
+            if (e.get("manual") or not _platform_ok(e)) and not placed:
                 raise _manual_error(e, "manual" if e.get("manual") else "platform")
-            if placed_by_hand or _is_installed(e):
+            if placed or _is_installed(e):
                 for r in row_list:
                     rows.set(r, force=True, state="done", skipped=True, done=r["total"])
             elif e["kind"] == "pip":
@@ -817,7 +1071,8 @@ def install_tools(names: list[str], ctx: JobContext) -> dict[str, Any]:
             missing = [k for k in e["provides"] if k not in paths]
             if missing:
                 raise AppError("tool_install_failed", params={"tool": e["name"], "reason": "executable_missing", "missing": missing}, action="show_manual", details=f"not found after install: {missing}")
-            update_local_tools({k: str(p) for k, p in paths.items()})
+            bundled = bundled_paths(e)  # found anew at every start: the app folder may move, and a later own copy must win
+            update_local_tools({k: str(p) for k, p in paths.items() if bundled.get(k) != p})
             installed.append(e["name"])
             if e.get("verify") != "sha256":
                 unverified.append(e["name"])
@@ -857,22 +1112,45 @@ def repo_envs_dir() -> Path:
     return appdirs.resource_root() / ".venvs"
 
 
-def configure_environment() -> Path:
-    """Decide where backend venvs live and export it as ``VNDUB_ENVS_DIR`` (idempotent; keeps an explicit setting).
+def _decide_envs_dir() -> Path:
+    """The envs folder without any outside ``VNDUB_ENVS_DIR`` in play: the setting, else the dev checkout's ``.venvs``, else ``<data>/envs``.
 
-    Packaged app: ``<data>/envs``. Dev checkout: the repo's ``.venvs`` when it already holds environments
-    (so ``uv run vndub-app`` sees what ``scripts/make_envs`` built), else ``<data>/envs``.
+    Dev checkout: the repo's ``.venvs`` is kept when it already holds environments and no folder was chosen in
+    Settings (so ``uv run vndub-app`` sees what ``scripts/make_envs`` built).
     """
-    env = os.environ.get("VNDUB_ENVS_DIR")
-    if env:
-        return Path(env)
-    chosen = appdirs.envs_dir()
-    if not getattr(sys, "frozen", False):
+    s = appdirs.load_settings()
+    if not s.envs_dir and not getattr(sys, "frozen", False):
         legacy = repo_envs_dir()
         if legacy.is_dir() and any((d / "pyvenv.cfg").exists() for d in legacy.iterdir() if d.is_dir()):
-            chosen = legacy
+            return legacy
+    return appdirs.effective_envs_dir(s)
+
+
+def resolve_envs_dir() -> Path:
+    """Where the backend venvs are right now; like :func:`envs_dir` but never exports ``VNDUB_ENVS_DIR`` (for read-only callers)."""
+    env = os.environ.get("VNDUB_ENVS_DIR")
+    return Path(env) if env else _decide_envs_dir()
+
+
+def configure_environment(force: bool = False) -> Path:
+    """Decide where backend venvs live and export it as ``VNDUB_ENVS_DIR`` for the pipeline in this process.
+
+    A ``VNDUB_ENVS_DIR`` set from outside the app (a shell, a dev's environment, tests) always wins and is never
+    overwritten. Otherwise the choice is made once and kept (idempotent); ``force=True`` decides again, which is
+    what a change of ``Settings.envs_dir`` (or of the data folder) needs. See :func:`_decide_envs_dir` for the rules.
+    """
+    env = os.environ.get("VNDUB_ENVS_DIR")
+    if env and (appdirs.external_envs_dir() is not None or not force):
+        return Path(env)
+    chosen = _decide_envs_dir()
     os.environ["VNDUB_ENVS_DIR"] = str(chosen)
+    appdirs.mark_envs_exported(str(chosen))
     return chosen
+
+
+def reset_environment_memory() -> None:
+    """Tests: forget which ``VNDUB_ENVS_DIR`` value the app exported itself (every value found afterwards counts as outside)."""
+    appdirs.mark_envs_exported(None)
 
 
 def envs_dir() -> Path:
@@ -903,9 +1181,33 @@ def env_names() -> list[str]:
     return names
 
 
+_GIT_DIRECTIVE = re.compile(r"^\s*#\s*@git\s", re.M)
+_GIT_REQUIREMENT = re.compile(r"^\s*[^#\s].*\bgit\+(?:https?|ssh|git)://", re.M)  # `pkg @ git+https://...` (uv runs git itself)
+
+
+def _text_needs_git(txt: str) -> bool:
+    return bool(_GIT_DIRECTIVE.search(txt) or _GIT_REQUIREMENT.search(txt))
+
+
 def env_needs_git(name: str) -> bool:
-    txt = _env_requirement_text(name) or ""
-    return bool(re.search(r"^\s*#\s*@git\s", txt, re.M))
+    """The env's own requirement file clones a repository (``# @git``) or installs a ``git+https`` requirement."""
+    return _text_needs_git(_env_requirement_text(name) or "")
+
+
+def envs_using_git() -> list[str]:
+    """Envs whose installation runs git, optional extras (``<env>+<extra>.txt``: voxcpm, cosyvoice, utmosv2 ...) included."""
+    d = appdirs.resource("envs")
+    out = []
+    for name in env_names():
+        files = [d / f"{name}.txt", *sorted(d.glob(f"{name}+*.txt"))]
+        for f in files:
+            try:
+                if _text_needs_git(f.read_text(encoding="utf-8", errors="replace")):
+                    out.append(name)
+                    break
+            except OSError:
+                continue
+    return out
 
 
 def _dir_size_gb(p: Path) -> float:
@@ -983,18 +1285,26 @@ def resolve_torch(choice: str) -> str:
     return doctor.choose_torch()
 
 
-def build_make_envs_command(envs: list[str], torch: str, envs_path: Path) -> tuple[list[str], dict[str, str]]:
-    """Command line + extra environment for ``scripts/make_envs.ps1`` (Windows) / ``.sh``."""
+def build_make_envs_command(envs: list[str], torch: str, envs_path: Path, python: Path | None = None) -> tuple[list[str], dict[str, str]]:
+    """Command line + extra environment for ``scripts/make_envs.ps1`` (Windows) / ``.sh``.
+
+    ``python`` is the interpreter for ``uv venv`` (``-Python`` / ``PYTHON``; see :func:`ensure_python`); without it the
+    scripts use their own default (``3.11``, found or downloaded by uv).
+    """
     scripts = appdirs.resource("scripts")
     if os.name == "nt":
         ps = shutil.which("powershell") or "powershell.exe"
         cmd = [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(scripts / "make_envs.ps1"), "-Env", ",".join(envs), "-EnvsDir", str(envs_path)]
         if torch == "cpu":
             cmd.append("-Cpu")
+        if python is not None:
+            cmd += ["-Python", str(python)]
         return cmd, {}
     extra = {"ENVS_DIR": str(envs_path)}
     if torch == "cpu":
         extra["CPU"] = "1"
+    if python is not None:
+        extra["PYTHON"] = str(python)
     return ["bash", str(scripts / "make_envs.sh"), *envs], extra
 
 
@@ -1011,19 +1321,20 @@ def install_envs(envs: list[str], torch: str, ctx: JobContext) -> dict[str, Any]
     if bad or not names:
         raise AppError("bad_request", params={"field": "envs", "value": ",".join(bad)}, details=f"unknown envs: {bad}; known: {known}", status=422)
     torch_kind = resolve_torch(torch)
-    if shutil.which("git") is None:
+    if find_git() is None:  # PATH, then the Git bundled with the packaged app: missing only in a dev run without Git
         needing = [n for n in names if env_needs_git(n)]
         if needing:
-            raise AppError("git_missing", params={"envs": needing}, action="show_manual", details=f"git not found on PATH; needed by {needing}")
+            raise AppError("git_missing", params={"envs": needing}, action="show_manual", details=f"git not found on PATH or next to VNDub.exe; needed by {needing}")
     uv = find_uv()
     if uv is None:
         raise AppError("tool_missing", params={"tool": "uv"}, action="show_manual", details="uv was not found (not bundled, not on PATH)")
     path = envs_dir()
     path.mkdir(parents=True, exist_ok=True)
+    base_python = ensure_python(ENVS_PYTHON, ctx)  # a real folder, not uv's junction: see ensure_python
     rows = _Rows(ctx)
     row_by = {n: rows.add(f"env:{n}", n, n) for n in names}
     ctx.message("installer.msg.envs", torch=torch_kind, count=len(names))
-    cmd, extra = build_make_envs_command(names, torch_kind, path)
+    cmd, extra = build_make_envs_command(names, torch_kind, path, base_python)
     current: list[str | None] = [None]
 
     def on_line(line: str) -> None:
@@ -1044,11 +1355,65 @@ def install_envs(envs: list[str], torch: str, ctx: JobContext) -> dict[str, Any]
     ctx.set_result(files=[dict(r) for r in rows.rows], envs=created, torch=torch_kind)
     _SIZE_CACHE.clear()
     if rc != 0 or len(created) != len(names):
+        junction = _junction_error(tail, Path(uv_dirs()["UV_PYTHON_INSTALL_DIR"]))
+        if junction is not None:
+            raise junction
         if _looks_like_network(tail):
             raise AppError("download_unreachable", params={"url": "https://download.pytorch.org/whl/", "filename": ", ".join(names), "target_dir": str(path)}, action="show_manual", details="\n".join(tail))
         raise AppError("env_install_failed", params={"env": current[0] or ",".join(names), "exit_code": rc}, action="retry", details="\n".join(tail))
     ctx.progress(len(names), len(names), None)
     return {"envs": created, "torch": torch_kind}
+
+
+# ----------------------------------------------------------------------------
+# Microsoft Visual C++ Redistributable (llama-server, torch and the other native code of the models need it)
+# ----------------------------------------------------------------------------
+
+VCREDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+VCREDIST_ARGS = ("/install", "/passive", "/norestart")  # the setup uses /quiet; here the user clicked, so show a progress bar
+VCREDIST_OK_CODES = (0, 1638, 3010)  # done / a newer one is already installed / done, a restart is advised
+
+
+def _run_waiting(cmd: list[str], ctx: JobContext) -> int:
+    """Start ``cmd`` (the redistributable asks for administrator rights itself: Windows shows its own prompt), wait for it.
+
+    Like :func:`run_stream`, the process belongs to the job: Cancel ends it at once and the job ends ``cancelled``.
+    """
+    proc = subprocess.Popen(cmd)
+    unwatch = ctx.watch_process(proc)
+    try:
+        while True:
+            try:
+                rc = proc.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                ctx.checkpoint()
+    except BaseException:
+        winproc.kill_tree(proc)
+        raise
+    finally:
+        unwatch()
+    if ctx.cancelled:
+        raise JobCancelled("cancelled by user")
+    return rc
+
+
+def install_vcredist(ctx: JobContext, *, run: Callable[[list[str], JobContext], int] | None = None) -> dict[str, Any]:
+    """Job body of the Doctor fix ``install_vcredist``: run the ``vc_redist.x64.exe`` the installer put next to ``VNDub.exe``."""
+    exe = bundled_vcredist()
+    if exe is None:
+        raise AppError("file_not_found", params={"path": r"redist\vc_redist.x64.exe"}, details="the bundled vc_redist.x64.exe was not found", status=404)
+    ctx.message("installer.msg.vcredist")
+    cmd = [str(exe), *VCREDIST_ARGS]
+    ctx.log(" ".join(cmd))
+    rc = (run or _run_waiting)(cmd, ctx)
+    ctx.log(f"vc_redist.x64.exe exit code {rc}")
+    if rc not in VCREDIST_OK_CODES:  # 1223 / 1602: the user declined the Windows prompt or closed the window
+        raise AppError("vcredist_failed", params={"exit_code": rc}, action="retry", details=f"vc_redist.x64.exe exited with code {rc}")
+    if rc == 3010:
+        ctx.message("installer.msg.vcredist_reboot")
+    ctx.set_result(exit_code=rc, reboot_required=rc == 3010)
+    return {"exit_code": rc, "reboot_required": rc == 3010}
 
 
 # ----------------------------------------------------------------------------

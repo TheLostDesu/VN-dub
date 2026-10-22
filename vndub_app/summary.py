@@ -173,8 +173,20 @@ def build(h: appdirs.ProjectHandle) -> dict[str, Any]:
         audio_pp = sum(1 for f in ctx.paths.analysis.glob("*.json")) if ctx.paths.analysis.exists() else 0
     text_pp = text_s.get("lines", text_s.get("written", 0)) or 0
 
+    from vndub_app.translation import source_language
+
+    src = source_language(h)
+    proj = ctx.project  # source_language may have written the detected code into project.yaml
+    languages = {
+        "src": src["effective"] or None,
+        "src_detected": bool(src["detected"]),
+        "audio": ((proj.audio_lang if proj else "") or ctx.cfg.project.audio_lang or src["effective"]) or None,
+        "tgt": (proj.tgt_lang if proj else "") or ctx.cfg.project.tgt_lang,
+    }
+
     return {
         "engine": engine,
+        "languages": languages,
         "tools_missing": tools_missing(ctx, proj),
         "voice_files": int(voice_files or 0),
         "lines_total": len(snap.lines),

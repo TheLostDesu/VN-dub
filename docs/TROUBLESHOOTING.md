@@ -21,6 +21,21 @@ enables it.
 items are recorded with the error and the stage continues. Reduce `synth.n_candidates`, keep
 VoxCPM2/Fish S2 disabled, or set `analyze.caption: false` (captioning disables itself on OOM).
 
+**`llm answer covered 0/N lines` over and over, `translate_failed` lines** — the model's JSON answer was
+unusable. Look at `work/logs/llm_answers.jsonl`: every incomplete answer is stored there with its
+`finish_reason`. `length` means the token budget ran out (a thinking model spent it on a thought block:
+Gemma 4 and Qwen 3.x get `enable_thinking: false` from the backend spec; a custom GGUF with another
+switch needs it in `chat_template_kwargs`), `stop` with an empty or off-format `content` means the model
+did not follow the format (try the fallback model). Check `src_lang` in `work/project.yaml` too: a
+script that is not Japanese used to be translated "from Japanese" (now the language is detected at parse;
+`translate.llm` logs `translating <src> -> <tgt>`).
+
+**The game's text is English (or another language), not Japanese** — nothing to do: `parse` detects the
+language of the script text (`project.src_lang: auto`) and `project.yaml` shows it (`src_lang`,
+`src_lang_detected`). Force one with `--set project.src_lang=en` or by editing `project.yaml`. When the
+voices are still Japanese (a translated release), set `project.audio_lang: ja`: the ASR check and the aligner
+are skipped (they would compare Japanese speech with English text) and link uses the cheap signals.
+
 **`work dir ... belongs to game ...`** — each game needs its own work dir:
 `--work-dir work_<game> --out-dir out_<game>`.
 

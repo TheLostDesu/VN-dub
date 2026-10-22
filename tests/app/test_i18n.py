@@ -238,7 +238,8 @@ def test_doctor_rows_have_keys(ru: dict[str, str], en: dict[str, str]) -> None:
     keys = set()
     for i in ids:
         keys |= {f"doctor.{i}.title", f"doctor.{i}.green", f"doctor.{i}.yellow", f"doctor.{i}.red"}
-    keys |= {f"doctor.fix.{a}" for a in ("download_ffmpeg", "open_data_dir", "open_driver_page", "add_defender_exclusion_help")}
+    keys |= {f"doctor.fix.{a}" for a in ("download_ffmpeg", "install_vcredist", "open_data_dir", "open_driver_page", "open_vcredist_page", "add_defender_exclusion_help")}
+    assert {"vcredist", "git"} <= set(ids), ids  # the rows for what the installer carries (Visual C++ runtime, Git)
     missing_report(keys, ru, en, "doctor rows")
 
 

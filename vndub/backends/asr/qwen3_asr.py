@@ -6,7 +6,7 @@ SPECS = [
     BackendSpec(
         name="qwen3_asr",
         role="asr",
-        env="hf",
+        env="main",
         adapter="qwen3_asr",
         license="Apache-2.0",
         commercial_ok=True,

@@ -244,6 +244,114 @@ def make_test_clip(path: str | Path, seconds: float = 2.0, sr: int = 16000, f0: 
 
 
 # ----------------------------------------------------------------------------
+# sub-batching with per-item fallback (used by every ``batch_<op>`` method)
+# ----------------------------------------------------------------------------
+
+
+def audio_seconds(item: dict[str, Any], key: str = "wav") -> float:
+    """Duration of ``item[key]`` from the file header (0.0 when unreadable); a cheap sort key for batching."""
+    try:
+        import soundfile as sf
+
+        return float(sf.info(item[key]).duration)
+    except Exception:
+        return 0.0
+
+
+def load_audios(items: list[dict[str, Any]], sr: int | None = 16000, key: str = "wav") -> tuple[list[Any], list[BaseException | None]]:
+    """Load ``item[key]`` of every item; a clip that cannot be read (or is empty) yields its exception
+    in the second list instead of failing the whole batch. Returns ``(arrays, errors)``, aligned with ``items``."""
+    ys: list[Any] = []
+    errs: list[BaseException | None] = []
+    for it in items:
+        try:
+            y, _ = load_audio(it[key], sr)
+            if len(y) == 0:
+                raise ValueError(f"empty audio: {it[key]}")
+            ys.append(y)
+            errs.append(None)
+        except Exception as e:
+            ys.append(None)
+            errs.append(e)
+    return ys, errs
+
+
+def _error_row(item: dict[str, Any], exc: BaseException, label: str) -> dict[str, Any]:
+    sys.stderr.write(f"[{label}] item {item.get('id')} failed: {exc}\n")
+    return {"id": item.get("id"), "error": f"{type(exc).__name__}: {exc}"}
+
+
+def run_in_batches(
+    items: list[dict[str, Any]],
+    batch_size: int,
+    batch_fn: Callable[[list[dict[str, Any]]], list[Any]],
+    item_fn: Callable[[dict[str, Any]], dict[str, Any] | None],
+    *,
+    label: str = "?",
+    sort_key: Callable[[dict[str, Any]], Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Run ``items`` through ``batch_fn`` in sub-batches of at most ``batch_size``; errors stay per item.
+
+    * ``batch_fn(sub_items) -> list`` returns one entry per sub-item, in order: a payload dict, or an
+      exception instance for an item that failed on its own (unreadable clip, bad text, ...).
+    * If ``batch_fn`` raises (including CUDA OOM, after ``free_cuda()``) or returns the wrong number of
+      entries, the sub-batch is redone item by item with ``item_fn`` (the plain ``op_<name>`` path), so one
+      bad clip never fails its neighbours. ``WeightsMissingError`` / ``UnavailableError`` propagate, as in
+      :meth:`ModelImpl.run`. A sub-batch of one item goes straight to ``item_fn``.
+    * ``sort_key`` (e.g. clip duration) orders the items before they are cut into sub-batches, which keeps
+      padding small; the result list is always in the original item order.
+
+    Returns one dict per item, in item order: ``{"id", **payload}`` or ``{"id", "error"}``.
+    """
+    n = len(items)
+    results: list[dict[str, Any] | None] = [None] * n
+    order = list(range(n))
+    size = max(1, int(batch_size or 1))
+    if sort_key is not None and size > 1 and n > 1:
+        try:
+            order.sort(key=lambda i: sort_key(items[i]))
+        except Exception:
+            order = list(range(n))
+    for start in range(0, n, size):
+        idx = order[start : start + size]
+        sub = [items[i] for i in idx]
+        outs: list[Any] | None = None
+        if len(sub) > 1:
+            try:
+                outs = list(batch_fn(sub))
+                if len(outs) != len(sub):
+                    raise RuntimeError(f"batch returned {len(outs)} results for {len(sub)} items")
+                outs = [RuntimeError("batch produced no result for this item") if o is None else o for o in outs]
+            except (WeightsMissingError, UnavailableError):
+                raise
+            except Exception as e:
+                if is_oom(e):
+                    free_cuda()
+                sys.stderr.write(f"[{label}] batch of {len(sub)} failed ({type(e).__name__}: {e}); retrying item by item\n{traceback.format_exc()}\n")
+                outs = None
+        if outs is None:
+            outs = []
+            for it in sub:
+                try:
+                    outs.append(item_fn(it) or {})
+                except (WeightsMissingError, UnavailableError):
+                    raise
+                except Exception as e:
+                    if is_oom(e):
+                        free_cuda()
+                    sys.stderr.write(f"[{label}] item {it.get('id')} traceback:\n{traceback.format_exc()}\n")
+                    outs.append(e)
+        for i, it, o in zip(idx, sub, outs):
+            if isinstance(o, BaseException):
+                results[i] = _error_row(it, o, label)
+            elif isinstance(o, dict) and o.get("error"):
+                results[i] = {"id": it.get("id"), **o}
+            else:
+                results[i] = {"id": it.get("id"), **(o or {})}
+    return [r if r is not None else {"id": items[i].get("id"), "error": "RuntimeError: no result"} for i, r in enumerate(results)]
+
+
+# ----------------------------------------------------------------------------
 # model implementation base
 # ----------------------------------------------------------------------------
 
@@ -253,6 +361,9 @@ class ModelImpl:
 
     ``op_<name>(self, item, **kw) -> dict`` handles one item; batch-native
     implementations may instead define ``batch_<name>(self, items, **kw) -> list``.
+    A ``batch_<name>`` should build its result with :func:`run_in_batches` (sub-batches of
+    :meth:`sub_batch_size`, per-item fallback to ``op_<name>`` when a batch fails or runs out of memory),
+    so that an error never spreads from one item to its neighbours.
     """
 
     #: op used by the default selftest and its extra kwargs
@@ -269,6 +380,13 @@ class ModelImpl:
     # lifecycle
     def load(self) -> dict[str, Any]:
         return {}
+
+    def sub_batch_size(self, default: int = 8) -> int:
+        """Items per model call inside a ``batch_<op>`` method (``options['batch_size']``, at least 1)."""
+        try:
+            return max(1, int(self.options.get("batch_size", default)))
+        except (TypeError, ValueError):
+            return default
 
     def unload(self) -> None:
         for k in list(vars(self)):

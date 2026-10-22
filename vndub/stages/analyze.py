@@ -55,11 +55,12 @@ def event_tags(raw: str | None) -> str:
     return "".join(_TAG.findall(raw or ""))
 
 
-def alignment_backends(names: list[str]) -> tuple[list[str], list[str]]:
+def alignment_backends(names: list[str], lang: str = "") -> tuple[list[str], list[str]]:
     """(names usable for forced alignment, notes for names refused because they would transcribe).
 
     Only role ``align`` backends align text that is already known; anything else (an ASR model set
-    as aligner or fallback) is refused so that analyze can never run speech recognition.
+    as aligner or fallback) is refused so that analyze can never run speech recognition. A backend
+    built for one language (``options.language``) is skipped for voices in another ``lang``.
     """
     ok: list[str] = []
     notes: list[str] = []
@@ -67,14 +68,17 @@ def alignment_backends(names: list[str]) -> tuple[list[str], list[str]]:
         if not n:
             continue
         try:
-            role = registry.get(n).role
+            spec = registry.get(n)
         except KeyError:
             ok.append(n)  # unknown names are reported by the registry when resolved
             continue
-        if role == "align":
-            ok.append(n)
+        fixed = spec.options.get("language")
+        if spec.role != "align":
+            notes.append(f"{n}: role '{spec.role}' would transcribe, analyze only aligns known text")
+        elif lang and fixed and fixed != lang:
+            notes.append(f"{n}: a {fixed} aligner, the voices are {lang}")
         else:
-            notes.append(f"{n}: role '{role}' would transcribe, analyze only aligns known text")
+            ok.append(n)
     return ok, notes
 
 
@@ -371,7 +375,7 @@ def ref_candidates(
 
 def run(ctx: StageContext) -> dict[str, Any]:
     a = ctx.cfg.analyze
-    src_lang = (ctx.project.src_lang if ctx.project else None) or ctx.cfg.project.src_lang
+    src_lang, audio_lang = ctx.src_lang, ctx.audio_lang
     all_voiced = ctx.voiced_lines(apply_only=False)
     lines = ctx.select(all_voiced)
     texts = expected_texts(ctx.lines())
@@ -409,13 +413,19 @@ def run(ctx: StageContext) -> dict[str, Any]:
     if a.events:
         parts["events"] = run_part(ctx, "events", [a.events], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "events", on_items=step,
                                    value_of=lambda l, r: {"events": list(r.get("events") or []), "raw": event_tags(r.get("raw", ""))})
-    if a.aligner:
+    if a.aligner and audio_lang != src_lang:
+        # a translated release keeps the original voices: the text says something else, nothing to align
+        parts["align"] = PartResult()
+        parts["align"].reason = f"the voices are {audio_lang} but the text is {src_lang}: nothing to align; timing from VAD speech time"
+        ctx.log.warning("aligner skipped: %s", parts["align"].reason)
+        step(len(lines), None)
+    elif a.aligner:
         # forced alignment of the KNOWN text; a backend that would transcribe is refused (VAD-only timing instead)
-        align_names, align_notes = alignment_backends([a.aligner, a.aligner_fallback])
+        align_names, align_notes = alignment_backends([a.aligner, a.aligner_fallback], audio_lang)
         for note in align_notes:
             ctx.log.warning("aligner refused: %s", note)
         parts["align"] = run_part(ctx, "align", align_names, lines,
-                                  lambda l: {"id": l.line_id, "wav": wav16(l), "text": texts.get(l.line_id, l.text_src), "lang": src_lang}, "align", on_items=step,
+                                  lambda l: {"id": l.line_id, "wav": wav16(l), "text": texts.get(l.line_id, l.text_src), "lang": audio_lang}, "align", on_items=step,
                                   value_of=lambda l, r: {"chars": list(r.get("chars") or [])})
         if align_notes and not parts["align"].backend:
             parts["align"].reason = "; ".join(align_notes) + "; timing from VAD speech time"

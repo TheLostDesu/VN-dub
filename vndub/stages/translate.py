@@ -40,7 +40,9 @@ from __future__ import annotations
 import csv
 import json
 import re
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -55,14 +57,16 @@ from vndub.stages._opcache import OpCache
 from vndub.stages.common import StageContext, StageError
 from vndub.text import ja, ru
 from vndub.text.delivery import EMOTIONS, EVENTS, LOUDNESSES, TEMPOS, validate_delivery
-from vndub.util import hash_obj
+from vndub.text.lang import LANG_NAMES, language_name
+from vndub.util import hash_obj, now_iso
 
 NAME = "translate"
 VERSION = "1"
 CONFIG_SECTIONS = ("translate", "text_emotion")
 DELIVERY_PROTOCOL = "1"  # part of the cache key of delivery batches: bump when the delivery request changes
 
-LANG_NAMES = {"ru": "Russian", "en": "English", "de": "German", "fr": "French", "es": "Spanish", "zh": "Chinese", "ko": "Korean", "it": "Italian", "pt": "Portuguese"}
+#: raw model answers that did not cover their batch are appended here (one JSON object per line) for diagnosis
+ANSWER_LOG = "llm_answers.jsonl"
 
 DEFAULT_RULES = [
     "Keep the meaning, register and emotional tone of each line.",
@@ -191,11 +195,12 @@ def _character_lines(speakers: list[str], text_all: str, gloss: dict[str, Any], 
     return names
 
 
-def delivery_system_prompt(batch: list[dict[str, Any]], speakers: list[str], gloss: dict[str, Any], chars: dict[str, Character]) -> str:
+def delivery_system_prompt(batch: list[dict[str, Any]], speakers: list[str], gloss: dict[str, Any], chars: dict[str, Character], src: str = "ja") -> str:
     """System prompt of the delivery-only request (imported translations + ``text_emotion.llm: on``)."""
+    src_name = language_name(src)
     out = [
-        "You are an assistant for the voice-acting team of a Japanese visual novel.",
-        "For each input line decide HOW it is spoken. The 'text' is the Japanese line, 'translation' its (already final) translation.",
+        f"You are an assistant for the voice-acting team of a {src_name} visual novel.",
+        f"For each input line decide HOW it is spoken. The 'text' is the {src_name} line, 'translation' its (already final) translation.",
         *delivery_rules()[1:],
         f"- 'delivery' is an object {_delivery_object_doc()}.",
         '- Answer with JSON only: {"lines": [{"id": "...", "delivery": {...}}]} containing exactly one entry for every input id.',
@@ -207,12 +212,12 @@ def delivery_system_prompt(batch: list[dict[str, Any]], speakers: list[str], glo
     return "\n".join(out)
 
 
-def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gloss: dict[str, Any], chars: dict[str, Character], short_words: int, delivery: bool = False) -> str:
+def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gloss: dict[str, Any], chars: dict[str, Character], short_words: int, delivery: bool = False, src: str = "ja") -> str:
     lang = LANG_NAMES.get(tgt, tgt)
     text_all = " ".join(b["text"] for b in batch)
     rules = list(gloss.get("style_rules") or DEFAULT_RULES)
     out = [
-        f"You are a professional game localizer translating a Japanese visual novel into {lang}.",
+        f"You are a professional game localizer translating a visual novel from {language_name(src)} into {lang}.",
         "Rules:",
         *[f"- {r}" for r in rules],
         "- The speaker's gender decides grammatical agreement (past tense, adjectives) when the speaker talks about themself.",
@@ -256,23 +261,65 @@ def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gl
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
 
 
-def _json_rows(content: str) -> list[Any] | None:
-    """The ``lines`` list of a model answer (fences / chatter around the JSON tolerated), None when unusable."""
+def _json_object(content: str) -> Any:
+    """The JSON value of a model answer (fences / chatter around it tolerated), None when unusable."""
     if not isinstance(content, str) or not content.strip():
         return None
     text = _FENCE.sub("", content.strip())
     try:
-        data = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, re.S)
-        if not m:
-            return None
+        pass
+    m = re.search(r"[\{\[].*[\}\]]", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def _salvage_rows(content: str) -> list[Any]:
+    """The complete objects of a ``lines`` array (or a bare array) that was cut off mid-way (token budget hit).
+
+    Objects are decoded one by one from the first ``[`` that follows ``"lines"``; the first object that does
+    not decode (the truncated one) ends the list. Nothing is guessed about the cut-off object.
+    """
+    if not isinstance(content, str):
+        return []
+    text = _FENCE.sub("", content.strip())
+    m = re.search(r'"lines"\s*:\s*\[', text)
+    start = m.end() if m else (text.find("[") + 1 if text.lstrip().startswith("[") else -1)
+    if start <= 0:
+        return []
+    dec = json.JSONDecoder()
+    out: list[Any] = []
+    i = start
+    while True:
+        while i < len(text) and text[i] in " \t\r\n,":
+            i += 1
+        if i >= len(text) or text[i] != "{":
+            break
         try:
-            data = json.loads(m.group(0))
+            obj, end = dec.raw_decode(text, i)
         except json.JSONDecodeError:
-            return None
+            break
+        out.append(obj)
+        i = end
+    return out
+
+
+def _json_rows(content: str) -> list[Any] | None:
+    """The ``lines`` list of a model answer (fences / chatter around the JSON tolerated), None when unusable.
+
+    A truncated answer still yields the objects that were complete (:func:`_salvage_rows`).
+    """
+    data = _json_object(content)
     rows = data.get("lines") if isinstance(data, dict) else data
-    return rows if isinstance(rows, list) else None
+    if isinstance(rows, list):
+        return rows
+    salvaged = _salvage_rows(content)
+    return salvaged or None
 
 
 def parse_delivery_response(content: str, batch_ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -320,16 +367,48 @@ def parse_response(content: str, batch_ids: list[str], tgt: str, want_delivery: 
 
 
 class LlmTranslator:
-    def __init__(self, ctx: StageContext, backend: Any, backend_name: str, tgt: str, gloss: dict[str, Any], chars: dict[str, Character]) -> None:
+    def __init__(self, ctx: StageContext, backend: Any, backend_name: str, tgt: str, gloss: dict[str, Any], chars: dict[str, Character], src: str = "ja") -> None:
         self.ctx = ctx
         self.backend = backend
         self.name = backend_name
         self.tgt = tgt
+        self.src = src
         self.gloss = gloss
         self.chars = chars
         self.t = ctx.cfg.translate
         self.calls = 0
         self.failures = 0
+        self.truncated = 0
+        self._lock = threading.Lock()  # the counters are shared by the scene threads
+
+    def _count(self, name: str) -> None:
+        with self._lock:
+            setattr(self, name, getattr(self, name) + 1)
+
+    def _last(self) -> dict[str, Any]:
+        """What the backend recorded about its latest answer (llama-server: finish_reason, reasoning chars)."""
+        last = getattr(self.backend, "last", None)
+        return last if isinstance(last, dict) else {}
+
+    def _log_answer(self, kind: str, ids: list[str], got: int, temperature: float, content: Any) -> None:
+        """Incomplete answers go to ``work/logs/llm_answers.jsonl`` so a bad model answer can be looked at."""
+        last = self._last()
+        reason = last.get("finish_reason")
+        if reason == "length":
+            self._count("truncated")
+        self.ctx.log.info(
+            "llm answer covered %d/%d lines (T=%.1f%s%s)", got, len(ids), temperature,
+            f", finish={reason}" if reason else "", f", thought {last['reasoning_chars']} chars" if last.get("reasoning_chars") else "",
+        )
+        try:
+            path = self.ctx.paths.logs / ANSWER_LOG
+            path.parent.mkdir(parents=True, exist_ok=True)
+            row = {"time": now_iso(), "kind": kind, "backend": self.name, "ids": ids, "covered": got, "temperature": temperature, **last,
+                   "content": content if isinstance(content, str) else repr(content)}
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError as e:  # the log is a diagnostic aid, never a failure
+            self.ctx.log.debug("answer log not written: %s", e)
 
     def _extra(self) -> dict[str, Any]:
         # MockTranslator needs the target language code; llama-server derives it from the prompt
@@ -352,7 +431,7 @@ class LlmTranslator:
         speakers = sorted({b["speaker_id"] for b in batch})
         visible = [{k: v for k, v in b.items() if k != "speaker_id"} for b in batch]
         delivery = any(b.get("want_delivery") for b in batch)
-        msgs = [{"role": "system", "content": system_prompt(self.tgt, batch, speakers, self.gloss, self.chars, self.t.short_variant_min_words, delivery)}]
+        msgs = [{"role": "system", "content": system_prompt(self.tgt, batch, speakers, self.gloss, self.chars, self.t.short_variant_min_words, delivery, self.src)}]
         msgs += self._context_messages(summary, context, scene_context)
         msgs.append({"role": "user", "content": "Translate these lines and answer with JSON only:\n" + json.dumps(visible, ensure_ascii=False)})
         return msgs
@@ -360,13 +439,14 @@ class LlmTranslator:
     def attempt(
         self, batch: list[dict[str, Any]], context: list[dict[str, Any]], summary: str, temperature: float, scene_context: list[dict[str, Any]] | None = None
     ) -> dict[str, dict[str, Any]]:
-        self.calls += 1
+        self._count("calls")
         want = {b["id"] for b in batch if b.get("want_delivery")}
         try:
             content = self.backend.chat(
                 self.messages(batch, context, summary, scene_context),
                 temperature=temperature,
-                max_tokens=max(512, 160 * len(batch) + 80 * len(want)),
+                # a line costs ~120 tokens of answer (translation, short variant, notes, keys); long lines more
+                max_tokens=max(1024, 220 * len(batch) + 100 * len(want)),
                 json_mode=True,
                 seed=1234,
                 **self._extra(),
@@ -376,10 +456,11 @@ class LlmTranslator:
         except Exception as e:  # adapter/http errors count as an invalid answer
             self.ctx.log.warning("llm call failed (%s): %s", self.name, e)
             return {}
-        got = parse_response(content, [b["id"] for b in batch], self.tgt, want)
+        ids = [b["id"] for b in batch]
+        got = parse_response(content, ids, self.tgt, want)
         if len(got) < len(batch):
-            self.failures += 1
-            self.ctx.log.info("llm answer covered %d/%d lines (T=%.1f)", len(got), len(batch), temperature)
+            self._count("failures")
+            self._log_answer("translate", ids, len(got), temperature, content)
         return got
 
     def translate(self, batch: list[dict[str, Any]], context: list[dict[str, Any]], summary: str, scene_context: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
@@ -406,20 +487,24 @@ class LlmTranslator:
             todo = [b for b in batch if b["id"] not in got]
             if not todo:
                 break
-            self.calls += 1
+            self._count("calls")
             speakers = sorted({b["speaker_id"] for b in todo})
             visible = [{k: v for k, v in b.items() if k != "speaker_id"} for b in todo]
-            msgs = [{"role": "system", "content": delivery_system_prompt(todo, speakers, self.gloss, self.chars)}]
+            msgs = [{"role": "system", "content": delivery_system_prompt(todo, speakers, self.gloss, self.chars, self.src)}]
             msgs += self._context_messages("", [], scene_context)
             msgs.append({"role": "user", "content": "Describe how these lines are spoken and answer with JSON only:\n" + json.dumps(visible, ensure_ascii=False)})
             try:
-                content = self.backend.chat(msgs, temperature=0.0, max_tokens=max(512, 120 * len(todo)), json_mode=True, seed=1234, **self._extra())
+                content = self.backend.chat(msgs, temperature=0.0, max_tokens=max(1024, 160 * len(todo)), json_mode=True, seed=1234, **self._extra())
             except BackendUnavailable:
                 raise
             except Exception as e:
                 self.ctx.log.warning("llm delivery call failed (%s): %s", self.name, e)
                 break
-            got.update(parse_delivery_response(content, [b["id"] for b in todo]))
+            ids = [b["id"] for b in todo]
+            part = parse_delivery_response(content, ids)
+            if len(part) < len(todo):
+                self._log_answer("delivery", ids, len(part), 0.0, content)
+            got.update(part)
         return got
 
     def summarize(self, scene: str, rows: list[dict[str, Any]]) -> str:
@@ -429,15 +514,19 @@ class LlmTranslator:
             {"role": "system", "content": "Summarize a visual novel scene in two short English sentences. Answer with JSON only: {\"summary\": \"...\"}."},
             {"role": "user", "content": "\n".join(f"{r['speaker']}: {r['text']}" for r in rows[:80])},
         ]
+        content: Any = None
         try:
-            data = json.loads(_FENCE.sub("", self.backend.chat(msgs, temperature=0.0, max_tokens=200, json_mode=True, seed=1234, **self._extra())))
+            content = self.backend.chat(msgs, temperature=0.0, max_tokens=400, json_mode=True, seed=1234, **self._extra())
+            data = _json_object(content)
             s = data.get("summary") if isinstance(data, dict) else None
             if isinstance(s, str) and s.strip():
                 return s.strip()
+            self.ctx.log.info("scene summary unusable for %s", scene)
         except BackendUnavailable:
             raise
         except Exception as e:
             self.ctx.log.info("scene summary failed for %s: %s", scene, e)
+        self._log_answer("summary", [scene], 0, 0.0, content)
         return derived_summary(scene, rows)
 
 
@@ -453,6 +542,12 @@ def derived_summary(scene: str, rows: list[dict[str, Any]]) -> str:
 
 _SRC_KEYS = ("original", "source", "src", "ja", "text_src", "japanese")
 _ID_KEYS = ("line_id", "id")
+
+
+def _src_keys(src: str = "ja") -> tuple[str, ...]:
+    """Column / field names that hold the source text (the language code and name of the source added)."""
+    extra = tuple(k for k in (src, language_name(src).lower()) if k and k not in _SRC_KEYS)
+    return _SRC_KEYS + extra
 
 
 def _tgt_keys(tgt: str) -> tuple[str, ...]:
@@ -472,7 +567,7 @@ def _map_by_source(entries: list[tuple[str, str]], lines: list[LineRecord]) -> d
     return out
 
 
-def _import_json_file(p: Path, lines: list[LineRecord], tgt: str, log: Any) -> dict[str, str]:
+def _import_json_file(p: Path, lines: list[LineRecord], tgt: str, log: Any, src: str = "ja") -> dict[str, str]:
     data = json.loads(p.read_text(encoding="utf-8-sig"))
     if isinstance(data, dict):
         if all(isinstance(v, str) for v in data.values()):
@@ -482,6 +577,7 @@ def _import_json_file(p: Path, lines: list[LineRecord], tgt: str, log: Any) -> d
         return {}
     rows = [r for r in data if isinstance(r, dict)]
     tkeys = _tgt_keys(tgt)
+    skeys = _src_keys(src)
 
     def tgt_of(r: dict[str, Any]) -> str | None:
         for k in tkeys:
@@ -497,11 +593,11 @@ def _import_json_file(p: Path, lines: list[LineRecord], tgt: str, log: Any) -> d
             if rid and t is not None:
                 out[rid] = t
         return out
-    if rows and any(k in rows[0] for k in _SRC_KEYS):
+    if rows and any(k in rows[0] for k in skeys):
         pairs = []
         for r in rows:
-            s = next((r[k] for k in _SRC_KEYS if isinstance(r.get(k), str)), None)
-            t = tgt_of({k: v for k, v in r.items() if k not in _SRC_KEYS})
+            s = next((r[k] for k in skeys if isinstance(r.get(k), str)), None)
+            t = tgt_of({k: v for k, v in r.items() if k not in skeys})
             if s is not None and t is not None:
                 pairs.append((s, t))
         return _map_by_source(pairs, lines)
@@ -514,12 +610,13 @@ def _import_json_file(p: Path, lines: list[LineRecord], tgt: str, log: Any) -> d
     return {l.line_id: m for l, m in zip(cands, msgs)}
 
 
-def _import_xlsx(p: Path, lines: list[LineRecord], tgt: str) -> dict[str, str]:
+def _import_xlsx(p: Path, lines: list[LineRecord], tgt: str, src: str = "ja") -> dict[str, str]:
     import openpyxl
 
     wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
     out: dict[str, str] = {}
     pairs: list[tuple[str, str]] = []
+    skeys = _src_keys(src)
     for ws in wb.worksheets:
         rows = list(ws.iter_rows(values_only=True))
         if not rows:
@@ -530,7 +627,7 @@ def _import_xlsx(p: Path, lines: list[LineRecord], tgt: str) -> dict[str, str]:
             return next((i for i, h in enumerate(header) if pred(h)), None)
 
         ci = col(lambda h: h in _ID_KEYS)
-        cs = col(lambda h: any(k in h for k in _SRC_KEYS))
+        cs = col(lambda h: any(k in h for k in skeys))
         ct = col(lambda h: any(k in h for k in ("translation", "translated", "target", "text_tgt", "russian")) or h == tgt)
         if ct is None:
             continue
@@ -546,7 +643,7 @@ def _import_xlsx(p: Path, lines: list[LineRecord], tgt: str) -> dict[str, str]:
     return out
 
 
-def load_import(path: Path, lines: list[LineRecord], tgt: str, log: Any) -> dict[str, str]:
+def load_import(path: Path, lines: list[LineRecord], tgt: str, log: Any, src: str = "ja") -> dict[str, str]:
     if not path.exists():
         raise StageError(f"translate.import path not found: {path}")
     files = sorted(path.iterdir()) if path.is_dir() else [path]
@@ -560,7 +657,7 @@ def load_import(path: Path, lines: list[LineRecord], tgt: str, log: Any) -> dict
                 if rid and t is not None:
                     out[rid] = t
         elif suf == ".json":
-            out.update(_import_json_file(p, lines, tgt, log))
+            out.update(_import_json_file(p, lines, tgt, log, src))
         elif suf in (".csv", ".tsv"):
             delim = "\t" if suf == ".tsv" else ","
             with open(p, encoding="utf-8-sig", newline="") as f:
@@ -573,7 +670,7 @@ def load_import(path: Path, lines: list[LineRecord], tgt: str, log: Any) -> dict
                 if len(r) >= 2 and r[0].strip():
                     out[r[0].strip()] = r[1]
         elif suf == ".xlsx":
-            out.update(_import_xlsx(p, lines, tgt))
+            out.update(_import_xlsx(p, lines, tgt, src))
     return out
 
 
@@ -689,14 +786,21 @@ def _acquire_llm(ctx: StageContext) -> tuple[Any, str]:
     primary = llm.backend
     if ctx.extra.get("real") and primary.startswith("mock"):
         primary = llm.real_backend
-    options: dict[str, Any] = {"ctx": llm.ctx, "n_gpu_layers": llm.n_gpu_layers, "temperature": llm.temperature, "port": llm.port}
+    options: dict[str, Any] = {"ctx": llm.ctx, "n_gpu_layers": llm.n_gpu_layers, "temperature": llm.temperature, "port": llm.port, "parallel": max(1, int(llm.parallel))}
+    if getattr(llm, "extra_args", None):
+        options["extra_args"] = [str(a) for a in llm.extra_args]
     if ctx.cfg.translate.mock_dictionary:
         options["dictionary"] = str(ctx.cfg.resolve(ctx.cfg.translate.mock_dictionary))
-    reasons = []
+    reasons: list[str] = []
     for name in [primary, *llm.fallbacks]:
         try:
             spec, _ = ctx.models.resolve(name)
-            return ctx.models.acquire(name, options), spec.name
+            reason = "; ".join(reasons)
+            if name != primary:
+                # loud, and recorded as a substitution (report, gpu_events): before, the default model could be
+                # skipped on every run (VRAM budget) without a trace
+                ctx.log.warning("translation LLM %s is not usable (%s): using %s", primary, reason, spec.name)
+            return ctx.models.acquire(name, options, substituted_for=primary if name != primary else None, reason=reason), spec.name
         except BackendUnavailable as e:
             reasons.append(str(e))
     raise StageError("no translation backend usable: " + "; ".join(reasons))
@@ -707,28 +811,31 @@ def run(ctx: StageContext) -> dict[str, Any]:
     if ctx.extra.get("seed_glossary"):
         return seed_glossary(ctx)
     tgt = (ctx.project.tgt_lang if ctx.project else None) or ctx.cfg.project.tgt_lang
+    src = ctx.src_lang
     lines = lines_to_translate(ctx)
     delivery_ids = delivery_target_ids(ctx, lines)
     chars = ctx.characters()
     gloss = load_glossary(glossary_path(ctx))
-    lexicon = ja.load_interjections(ctx.cfg.resolve(t.interjections)) if tgt == "ru" else {}
+    # the interjection lexicon maps Japanese interjections to Russian ones; other pairs go through the model
+    lexicon = ja.load_interjections(ctx.cfg.resolve(t.interjections)) if (src == "ja" and tgt == "ru") else {}
     max_morae = ctx.cfg.synth.interjection_max_syllables
+    ctx.log.info("translating %s -> %s (%d lines)", src, tgt, len(lines))
 
     entries: dict[str, dict[str, Any]] = {}
     flags: dict[str, list[str]] = {l.line_id: [] for l in lines}
     backend_name = ""
 
-    # 1. interjections
+    # 1. interjections (kana-only short lines are Japanese by definition)
     for l in lines:
-        if ja.is_interjection(l.text_src, lexicon, max_morae):
+        if src == "ja" and ja.is_interjection(l.text_src, lexicon, max_morae):
             flags[l.line_id].append("interjection")
         mapped = ja.match_interjection(l.text_src, lexicon, max_morae) if lexicon else None
         if mapped:
             entries[l.line_id] = {"text_tgt": mapped, "text_tgt_short": mapped, "notes": "", "source": "interjection"}
 
-    # 2. import or LLM
+    # 2. import or LLM (or nothing: the text already is in the target language)
     if t.import_path:
-        imported = load_import(ctx.cfg.resolve(t.import_path), ctx.lines(), tgt, ctx.log)
+        imported = load_import(ctx.cfg.resolve(t.import_path), ctx.lines(), tgt, ctx.log, src)
         for l in lines:
             if l.line_id in imported and str(imported[l.line_id]).strip():
                 txt = str(imported[l.line_id]).strip()
@@ -739,13 +846,20 @@ def run(ctx: StageContext) -> dict[str, Any]:
             targets = [l for l in lines if l.line_id in delivery_ids and (entries.get(l.line_id) or {}).get("text_tgt")]
             if targets:
                 try:
-                    translate_deliveries(ctx, targets, entries, tgt, gloss, chars)
+                    translate_deliveries(ctx, targets, entries, tgt, gloss, chars, src)
                 except (BackendUnavailable, StageError) as e:
                     ctx.log.warning("llm delivery skipped: %s", e)
+    elif src == tgt:
+        ctx.log.warning("the script text already is %s (the target language): lines are kept as they are, no model is started", language_name(tgt))
+        for l in lines:
+            if l.line_id not in entries:
+                txt = " ".join((l.text_src or "").split())
+                entries[l.line_id] = {"text_tgt": txt, "text_tgt_short": txt, "notes": "", "source": "same_lang"}
+        backend_name = "same_lang"
     else:
         todo = [l for l in lines if l.line_id not in entries]
         if todo:
-            backend_name = translate_llm(ctx, todo, entries, flags, tgt, gloss, chars, delivery_ids & {l.line_id for l in todo})
+            backend_name = translate_llm(ctx, todo, entries, flags, tgt, gloss, chars, delivery_ids & {l.line_id for l in todo}, src)
 
     # 3. records + post-processing
     plus = needs_plus(ctx) and tgt == "ru"
@@ -792,6 +906,8 @@ def run(ctx: StageContext) -> dict[str, Any]:
     src_counts = Counter(r.source.split(":")[0] for r in recs)
     return {
         "lines": len(recs),
+        "src_lang": src,
+        "tgt_lang": tgt,
         "sources": dict(src_counts),
         "backend": backend_name or "-",
         "interjections": sum(1 for r in recs if "interjection" in r.flags),
@@ -855,6 +971,7 @@ def translate_llm(
     gloss: dict[str, Any],
     chars: dict[str, Character],
     delivery_ids: set[str] | None = None,
+    src: str = "ja",
 ) -> str:
     """Translate ``todo`` per scene. Lines in ``delivery_ids`` (unvoiced speaker lines) go in their own batches after
     the scene's regular ones and also return a ``delivery`` object (see the module docstring)."""
@@ -884,13 +1001,15 @@ def translate_llm(
 
     translator: LlmTranslator | None = None
     backend_name = ""
+    tr_lock = threading.Lock()
 
     def get_translator() -> LlmTranslator:
         nonlocal translator, backend_name
-        if translator is None:
-            backend, backend_name = _acquire_llm(ctx)
-            translator = LlmTranslator(ctx, backend, backend_name, tgt, gloss, chars)
-        return translator
+        with tr_lock:  # the model is loaded once, whichever scene thread misses the cache first
+            if translator is None:
+                backend, backend_name = _acquire_llm(ctx)
+                translator = LlmTranslator(ctx, backend, backend_name, tgt, gloss, chars, src)
+            return translator
 
     def context_before(scene: str, line_id: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -904,59 +1023,77 @@ def translate_llm(
 
     llm = t.llm
     key_backend = _llm_key_backend(ctx)
+    lock = threading.Lock()  # ``entries`` is shared by the scene threads when llm.parallel > 1
 
-    for scene, scene_lines in scenes.items():
+    def do_scene(scene: str, scene_lines: list[LineRecord]) -> None:
         rows = [row(l) for l in scene_lines if l.line_id not in delivery_ids]
         t_rows = [row(l, True) for l in scene_lines if l.line_id in delivery_ids]
         summary_rows = rows or t_rows
         summary_key = store.key("summary", key_backend, scene, [r["text"] for r in summary_rows])
         summary = store.get(f"summary:{scene}", summary_key)
         history: list[dict[str, Any]] = []
+
+        def ensure_summary(tr: LlmTranslator) -> str:
+            nonlocal summary
+            if summary is None:
+                summary = tr.summarize(scene, summary_rows)
+                store.put(f"summary:{scene}", summary_key, summary)
+            return summary
+
         for i in range(0, len(rows), max(1, t.batch_lines)):
             batch = rows[i : i + t.batch_lines]
             context = history[-t.context_window_lines :] if t.context_window_lines else []
-            bkey = store.key(key_backend, tgt, gloss_hash, batch, context, llm.temperature)
+            bkey = store.key(key_backend, src, tgt, gloss_hash, batch, context, llm.temperature)
             item_id = f"batch:{scene}:{batch[0]['id']}:{len(batch)}"
             got = store.get(item_id, bkey)
             if got is None:
                 tr = get_translator()
-                if summary is None:
-                    summary = tr.summarize(scene, summary_rows)
-                    store.put(f"summary:{scene}", summary_key, summary)
-                got = tr.translate(batch, context, summary)
+                got = tr.translate(batch, context, ensure_summary(tr))
                 if len(got) == len(batch):
                     store.put(item_id, bkey, got)
                 store.save()
-            for b in batch:
-                e = got.get(b["id"])
-                if e is None:
-                    continue
-                entries[b["id"]] = {**e, "source": f"llm:{backend_name or key_backend}"}
-                history.append({"speaker": b["speaker"], "text": b["text"], tgt: e["text_tgt"]})
+            with lock:
+                for b in batch:
+                    e = got.get(b["id"])
+                    if e is None:
+                        continue
+                    entries[b["id"]] = {**e, "source": f"llm:{backend_name or key_backend}"}
+                    history.append({"speaker": b["speaker"], "text": b["text"], tgt: e["text_tgt"]})
         # delivery stream: lines nobody voices, translated with the surrounding script as context
         for i in range(0, len(t_rows), max(1, t.batch_lines)):
             batch = t_rows[i : i + t.batch_lines]
-            context = context_before(scene, batch[0]["id"])
+            with lock:
+                context = context_before(scene, batch[0]["id"])
             sc = _delivery_scene_context(scene_all.get(scene, []), [b["id"] for b in batch], ctx.cfg.text_emotion.llm_context_lines, chars, gloss)
-            bkey = store.key(DELIVERY_PROTOCOL, key_backend, tgt, gloss_hash, batch, context, sc, llm.temperature)
+            bkey = store.key(DELIVERY_PROTOCOL, key_backend, src, tgt, gloss_hash, batch, context, sc, llm.temperature)
             item_id = f"batch:{scene}:{batch[0]['id']}:{len(batch)}:delivery"
             got = store.get(item_id, bkey)
             if got is None:
                 tr = get_translator()
-                if summary is None:
-                    summary = tr.summarize(scene, summary_rows)
-                    store.put(f"summary:{scene}", summary_key, summary)
-                got = tr.translate(batch, context, summary, sc)
+                got = tr.translate(batch, context, ensure_summary(tr), sc)
                 if len(got) == len(batch):
                     store.put(item_id, bkey, got)
                 store.save()
-            for b in batch:
-                e = got.get(b["id"])
-                if e is not None:
-                    entries[b["id"]] = {**e, "source": f"llm:{backend_name or key_backend}"}
+            with lock:
+                for b in batch:
+                    e = got.get(b["id"])
+                    if e is not None:
+                        entries[b["id"]] = {**e, "source": f"llm:{backend_name or key_backend}"}
+
+    workers = max(1, int(llm.parallel))
+    if workers > 1 and len(scenes) > 1:
+        # scenes are independent (the rolling context never crosses a scene): each worker drives one llama-server
+        # slot, so the server decodes several answers in one batch
+        ctx.log.info("translating %d scenes on %d llama-server slots", len(scenes), workers)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="translate") as pool:
+            for fut in [pool.submit(do_scene, scene, scene_lines) for scene, scene_lines in scenes.items()]:
+                fut.result()  # the first failure (backend unavailable ...) is raised here, after the others finished
+    else:
+        for scene, scene_lines in scenes.items():
+            do_scene(scene, scene_lines)
     store.save()
     if translator is not None:
-        ctx.log.info("llm calls: %d, incomplete answers: %d", translator.calls, translator.failures)
+        ctx.log.info("llm calls: %d, incomplete answers: %d, cut off by the token budget: %d", translator.calls, translator.failures, translator.truncated)
     return backend_name or key_backend
 
 
@@ -967,6 +1104,7 @@ def translate_deliveries(
     tgt: str,
     gloss: dict[str, Any],
     chars: dict[str, Character],
+    src: str = "ja",
 ) -> None:
     """Delivery-only LLM pass for lines whose translation is already known (``text_emotion.llm: on`` with an import).
 
@@ -994,13 +1132,13 @@ def translate_deliveries(
         for i in range(0, len(rows), max(1, t.batch_lines)):
             batch = rows[i : i + t.batch_lines]
             sc = _delivery_scene_context(scene_all.get(scene, []), [b["id"] for b in batch], ctx.cfg.text_emotion.llm_context_lines, chars, gloss)
-            bkey = store.key(DELIVERY_PROTOCOL, "delivery_only", key_backend, tgt, gloss_hash, batch, sc)
+            bkey = store.key(DELIVERY_PROTOCOL, "delivery_only", key_backend, src, tgt, gloss_hash, batch, sc)
             item_id = f"batch:{scene}:{batch[0]['id']}:{len(batch)}"
             got = store.get(item_id, bkey)
             if got is None:
                 if translator is None:
                     backend, name = _acquire_llm(ctx)
-                    translator = LlmTranslator(ctx, backend, name, tgt, gloss, chars)
+                    translator = LlmTranslator(ctx, backend, name, tgt, gloss, chars, src)
                 got = translator.deliver(batch, sc)
                 store.put(item_id, bkey, got)
                 store.save()
@@ -1056,7 +1194,7 @@ def preview_import(ctx: StageContext, path: str, n: int = 5) -> dict[str, Any]:
     all_lines = ctx.lines()
     cand = lines_to_translate(ctx, apply_select=False)
     try:
-        imported = load_import(p, all_lines, tgt, ctx.log)
+        imported = load_import(p, all_lines, tgt, ctx.log, ctx.src_lang)
         fmt = detect_import_format(p)
     except StageError:
         raise

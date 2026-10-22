@@ -11,6 +11,22 @@ import { useI18n } from "../i18n";
 import { useJobTracker } from "../state/progress";
 import { fmtGb, fmtMb } from "../util/format";
 
+/**
+ * Choices the user made on this screen. /models and /tools are two routes, so switching the tab unmounts the whole tab
+ * component; module-level memory keeps the choices for the rest of the UI session (a page reload resets them).
+ */
+const choices: {
+  /** ticked models; `null` = the screen was never initialised (the first load then pre-selects what is missing) */
+  selected: Set<string> | null;
+  torch: TorchChoice;
+} = { selected: null, torch: "auto" };
+
+type TorchChoice = "auto" | "cuda" | "cpu";
+const MODEL_JOBS = ["models_download"];
+const CHECK_JOBS = ["models_check"];
+const ENV_JOBS = ["envs_install"];
+const TOOL_JOBS = ["tools_install"];
+
 export default function ModelsScreen({ tab }: { tab: "models" | "tools" }) {
   const { t } = useI18n();
   const nav = useNavigate();
@@ -47,8 +63,8 @@ function ModelsTab() {
   const nav = useNavigate();
   const [report, setReport] = useState<ModelsReport | null>(null);
   const [error, setError] = useState<ErrorInfo | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [initialised, setInitialised] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set(choices.selected ?? []));
+  const initialised = useRef(choices.selected !== null);
   const [flash, setFlash] = useState<string | null>(null);
   const flashTimer = useRef<number | null>(null);
 
@@ -66,18 +82,24 @@ function ModelsTab() {
 
   useEffect(() => {
     void load().then((r) => {
-      if (r && !initialised) {
-        // pre-select what the recommended set still lacks
+      if (r && !initialised.current) {
+        // pre-select what the recommended set still lacks, but only when nothing was chosen on an earlier visit
+        initialised.current = true;
         setSelected(new Set(r.rows.filter((m) => !m.present && r.presets.recommended.includes(m.name)).map((m) => m.name)));
-        setInitialised(true);
       }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const download = useJobTracker({ onFinal: () => void load() });
-  const check = useJobTracker({ onFinal: () => void load() });
-  const envJob = useJobTracker({ onFinal: () => void load() });
+  // remember the choice for the next visit of the tab
+  useEffect(() => {
+    if (initialised.current) choices.selected = selected;
+  }, [selected]);
+
+  // the jobs keep running on the server when the tab is left: each tracker picks its job up again on return
+  const download = useJobTracker({ onFinal: () => void load(), kinds: MODEL_JOBS });
+  const check = useJobTracker({ onFinal: () => void load(), kinds: CHECK_JOBS });
+  const envJob = useJobTracker({ onFinal: () => void load(), kinds: ENV_JOBS });
 
   const rows = report?.rows ?? [];
   // selected weights whose backend environment is not installed yet: they must wait for the environment
@@ -287,7 +309,11 @@ function ToolsTab() {
   const [tools, setTools] = useState<ToolRow[] | null>(null);
   const [envs, setEnvs] = useState<EnvRow[] | null>(null);
   const [error, setError] = useState<ErrorInfo | null>(null);
-  const [torch, setTorch] = useState<"auto" | "cuda" | "cpu">("auto");
+  const [torch, setTorchState] = useState<TorchChoice>(choices.torch);
+  const setTorch = (v: TorchChoice) => {
+    choices.torch = v;
+    setTorchState(v);
+  };
 
   const load = useCallback(async () => {
     try {
@@ -304,8 +330,8 @@ function ToolsTab() {
     void load();
   }, [load]);
 
-  const toolJob = useJobTracker({ onFinal: () => void load() });
-  const envJob = useJobTracker({ onFinal: () => void load() });
+  const toolJob = useJobTracker({ onFinal: () => void load(), kinds: TOOL_JOBS });
+  const envJob = useJobTracker({ onFinal: () => void load(), kinds: ENV_JOBS });
 
   if (error && !tools) return <ErrorPanel error={error} onRetry={() => void load()} />;
   if (!tools || !envs) return <Spinner label={t("app.loading")} />;
@@ -392,9 +418,9 @@ function ToolsTab() {
           onChange={setTorch}
           testid="envs-torch"
           options={[
-            { value: "auto", label: t("envs.torch.auto"), hint: t("envs.torch.auto_hint") },
-            { value: "cuda", label: t("envs.torch.cuda") },
-            { value: "cpu", label: t("envs.torch.cpu"), hint: t("envs.torch.cpu_hint") },
+            { value: "auto", label: t("envs.torch.auto"), hint: t("envs.torch.auto_hint"), testid: "envs-torch-auto" },
+            { value: "cuda", label: t("envs.torch.cuda"), testid: "envs-torch-cuda" },
+            { value: "cpu", label: t("envs.torch.cpu"), hint: t("envs.torch.cpu_hint"), testid: "envs-torch-cpu" },
           ]}
         />
         <div className="row-actions">
