@@ -20,12 +20,17 @@ to a smaller model instead of a slow one. A non-negative
 offload and is passed through unchanged.
 
 Nothing ever leaves localhost.
+
+Logs: ``<log_dir>/llama_server.log`` is the server's own output; every start is announced by a ``=== YYYY-MM-DD
+HH:MM:SS <command line>`` line and every stop by ``=== stopped HH:MM:SS (exit code N)``. The app log gets one line per
+start (pid, port, model, layers on the GPU) and per stop, through the ``vndub.backends.llm.llamacpp`` logger.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import re
 import socket
 import subprocess
@@ -39,6 +44,8 @@ from typing import Any
 
 from vndub.backends.base import BackendSpec, BackendUnavailable, LocalBackend, WeightSpec, WeightsMissing
 from vndub.backends.weights import local_dir
+
+logger = logging.getLogger("vndub.backends.llm.llamacpp")
 
 _COMMON = dict(role="llm", env=None, adapter="llamacpp", heavy=True, local_impl="vndub.backends.llm.llamacpp:LlamaCppBackend")
 
@@ -226,6 +233,7 @@ class LlamaCppBackend(LocalBackend):
         self.gguf: Path | None = None
         self._tls = threading.local()  # per-thread record of the latest answer (slots are driven from several threads)
         self.load_info: dict[str, Any] = {}  # args, gpu_layers ... of the running server
+        self._t_spawn: float | None = None  # monotonic time the server process was started
 
     @property
     def last(self) -> dict[str, Any]:
@@ -263,7 +271,7 @@ class LlamaCppBackend(LocalBackend):
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(log_path, "ab") as f:  # the command line first, so the log says what was asked for
-                f.write(("\n=== " + " ".join(args) + "\n").encode("utf-8", "replace"))
+                f.write((f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} " + " ".join(args) + "\n").encode("utf-8", "replace"))
                 log_start = f.tell()
         log = open(log_path, "ab") if log_path is not None else subprocess.DEVNULL
         try:
@@ -271,9 +279,16 @@ class LlamaCppBackend(LocalBackend):
         finally:
             if log is not subprocess.DEVNULL:
                 log.close()  # the child holds its own handle
+        self._t_spawn = time.monotonic()
+        logger.info(
+            "llama-server started pid %s port %s gguf %s ctx %s parallel %s (%s)",
+            self.proc.pid, self.port, self.gguf, int(self.options.get("ctx", 16384)), max(1, int(self.options.get("parallel", 1) or 1)),
+            "gpu" if self._want_gpu() else "cpu",
+        )
         deadline = time.monotonic() + float(self.options.get("timeout_load_s", 900))
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
+                logger.warning("llama-server pid %s exited with code %s before it was ready", self.proc.pid, self.proc.returncode)
                 raise BackendUnavailable(self.spec.name, f"llama-server exited with code {self.proc.returncode}", "see work/logs/llama_server.log")
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=2) as r:
@@ -282,6 +297,7 @@ class LlamaCppBackend(LocalBackend):
             except (urllib.error.URLError, ConnectionError, OSError):
                 pass
             time.sleep(1.0)
+        logger.warning("llama-server pid %s did not become healthy in %ss", getattr(self.proc, "pid", "?"), self.options.get("timeout_load_s", 900))
         self.unload()
         raise BackendUnavailable(self.spec.name, "llama-server did not become healthy in time")
 
@@ -294,6 +310,7 @@ class LlamaCppBackend(LocalBackend):
             requested = -1
         problem = offload_problem(requested, self._want_gpu(), offload)
         if problem:
+            logger.warning("llama-server pid %s refused: %s", getattr(self.proc, "pid", "?"), problem)
             self.unload()
             raise BackendUnavailable(
                 self.spec.name,
@@ -302,6 +319,11 @@ class LlamaCppBackend(LocalBackend):
                 "translate.llm.n_gpu_layers: <number> allows a partial offload on purpose",
             )
         self.loaded = True
+        took = f" in {time.monotonic() - self._t_spawn:.1f}s" if self._t_spawn is not None else ""
+        logger.info(
+            "llama-server ready pid %s port %s gpu layers %s%s",
+            getattr(self.proc, "pid", "?"), self.port, f"{offload[0]}/{offload[1]}" if offload else "unknown", took,
+        )
         self.load_info = {
             "gguf": str(self.gguf),
             "args": args[1:],
@@ -314,6 +336,7 @@ class LlamaCppBackend(LocalBackend):
         """Kill the server at once (a job was cancelled): a request in flight fails instead of running to its end."""
         proc = self.proc
         if proc is not None and proc.poll() is None:
+            logger.warning("llama-server pid %s killed (job cancelled)", getattr(proc, "pid", "?"))
             try:
                 proc.kill()
             except OSError:
@@ -321,12 +344,27 @@ class LlamaCppBackend(LocalBackend):
 
     def unload(self) -> None:
         if self.proc is not None:
-            self.proc.terminate()
+            proc, pid = self.proc, getattr(self.proc, "pid", "?")
+            proc.terminate()
+            code: int | None
             try:
-                self.proc.wait(timeout=20)
+                code = proc.wait(timeout=20)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                logger.warning("llama-server pid %s did not stop in 20s: killing it", pid)
+                proc.kill()
+                try:
+                    code = proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    code = None
             self.proc = None
+            logger.info("llama-server stopped pid %s exit code %s", pid, code)
+            log_dir = self.context.get("log_dir")
+            if log_dir:  # the server's log ends with the exit, so a log read later says the process is gone
+                try:
+                    with open(Path(log_dir) / "llama_server.log", "ab") as f:
+                        f.write(f"\n=== stopped {time.strftime('%H:%M:%S')} (exit code {code})\n".encode("utf-8"))
+                except OSError:
+                    pass
         self.loaded = False
         self.load_info = {}
 

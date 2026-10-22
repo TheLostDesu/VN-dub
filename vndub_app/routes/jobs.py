@@ -21,6 +21,12 @@ def get_job(job_id: str) -> dict[str, Any]:
     return jobs.runner().get(job_id).info(with_log=True)
 
 
+@router.get("/jobs/{job_id}/log")
+def get_job_log(job_id: str) -> dict[str, Any]:
+    """The whole log of a job: ``{path, lines}`` from its log file (newest 5 MB), else the in-memory tail (``path`` null)."""
+    return jobs.runner().read_log(job_id)
+
+
 @router.post("/jobs/{job_id}/pause")
 def pause(job_id: str) -> dict[str, Any]:
     return jobs.runner().pause(job_id).info()

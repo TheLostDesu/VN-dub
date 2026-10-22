@@ -26,6 +26,19 @@
   --wave-progress: #245fa8;
   --wave-cursor: #1a487f;
   --radius: 10px;
+  /* one spacing scale for paddings and gaps; control heights shared by buttons, inputs and selects */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --card-pad-y: var(--space-4);
+  --card-pad-x: var(--space-5);
+  --stack-gap: var(--space-4); /* between cards and other top-level blocks of a screen */
+  --control-h: 2.5rem;
+  --control-h-sm: 2rem;
+  --control-h-cell: 2.25rem; /* inputs and selects inside table cells */
   --shadow: 0 1px 2px rgba(20, 30, 50, 0.06), 0 3px 10px rgba(20, 30, 50, 0.05);
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
@@ -204,6 +217,7 @@ p.hint.src-lang-hint {
   align-items: center;
   gap: 1rem;
   min-width: 0;
+  flex: 0 1 auto;
 }
 .brand {
   display: inline-flex;
@@ -216,6 +230,7 @@ p.hint.src-lang-hint {
 }
 .project-name {
   color: var(--text-muted);
+  min-width: 0;
   max-width: 28rem;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -227,6 +242,7 @@ p.hint.src-lang-hint {
   display: flex;
   gap: 0.25rem;
   flex-wrap: wrap;
+  margin-left: auto;
 }
 .topbar-nav a {
   padding: 0.4rem 0.8rem;
@@ -241,6 +257,75 @@ p.hint.src-lang-hint {
 .topbar-nav a.active {
   background: var(--accent-soft);
   color: var(--accent-strong);
+}
+/* the running job, in the top bar: a compact chip that opens the page showing it */
+.topbar-job {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 0 1 22rem;
+  min-width: 7rem;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0.3rem 0.8rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--info-bg);
+  color: var(--info);
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.3;
+  text-align: left;
+}
+button.topbar-job {
+  cursor: pointer;
+}
+button.topbar-job:hover {
+  border-color: var(--info);
+}
+.topbar-job .spinner {
+  flex: none;
+}
+.topbar-job-title,
+.topbar-job-stage {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topbar-job-title {
+  flex: 0 1 auto;
+  font-weight: 700;
+}
+.topbar-job-stage {
+  flex: 1 1 0;
+  opacity: 0.85;
+}
+.topbar-job-pct {
+  flex: none;
+  margin-left: auto;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.topbar-job-fill {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--info);
+  opacity: 0.7;
+  transition: width 0.25s ease;
+}
+
+@media (min-width: 1100px) {
+  .topbar {
+    flex-wrap: nowrap;
+  }
+  .topbar-nav {
+    flex-wrap: nowrap;
+    flex: none;
+  }
 }
 
 .stepper {
@@ -313,11 +398,15 @@ p.hint.src-lang-hint {
   outline: none;
 }
 .page-title {
-  margin-bottom: 1rem;
+  margin-bottom: var(--space-5);
+}
+.page-title h1 {
+  margin-bottom: var(--space-2);
 }
 .page-title .intro {
   color: var(--text-muted);
   max-width: 62rem;
+  margin: 0;
 }
 .loading {
   color: var(--text-muted);
@@ -350,17 +439,20 @@ p.hint.src-lang-hint {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 1rem;
-  margin-top: 1.5rem;
-  padding-top: 1rem;
+  gap: var(--space-4);
+  margin-top: var(--space-6);
+  padding-top: var(--space-4);
   border-top: 1px solid var(--border);
 }
 .step-footer-right {
   display: flex;
   align-items: center;
-  gap: 1rem;
+  gap: var(--space-4);
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+.step-footer .btn {
+  min-height: var(--control-h);
 }
 
 /* ---- primitives -------------------------------------------------------------------------- */
@@ -369,12 +461,38 @@ p.hint.src-lang-hint {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 1rem 1.25rem;
-  margin-bottom: 1rem;
+  padding: var(--card-pad-y) var(--card-pad-x);
+  margin-bottom: var(--stack-gap);
   box-shadow: var(--shadow);
 }
-.card > h2:first-child {
+/* the padding of the card is the only space around its content: nothing inside adds more at the edges */
+.card > :first-child {
   margin-top: 0;
+}
+.card > :last-child {
+  margin-bottom: 0;
+}
+/* title to body: the same gap in every card */
+.card > h2 {
+  margin-bottom: var(--space-3);
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.card-head h2 {
+  margin: 0;
+}
+/* top-level callouts and error panels stack like cards */
+.main > .callout,
+.screen > .callout,
+.main > .error-panel,
+.screen > .error-panel {
+  margin: 0 0 var(--stack-gap);
 }
 
 .btn {
@@ -382,7 +500,7 @@ p.hint.src-lang-hint {
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
-  min-height: 2.5rem;
+  min-height: var(--control-h);
   padding: 0.45rem 1rem;
   font: inherit;
   font-weight: 600;
@@ -418,7 +536,7 @@ p.hint.src-lang-hint {
   color: var(--accent);
 }
 .btn-small {
-  min-height: 2rem;
+  min-height: var(--control-h-sm);
   padding: 0.2rem 0.7rem;
   font-size: 0.9rem;
 }
@@ -559,8 +677,8 @@ p.hint.src-lang-hint {
 
 .callout {
   border-radius: var(--radius);
-  padding: 0.75rem 1rem;
-  margin: 0.75rem 0;
+  padding: var(--space-3) var(--space-4);
+  margin: var(--space-3) 0;
   border: 1px solid transparent;
 }
 .callout > :last-child {
@@ -596,7 +714,7 @@ p.hint.src-lang-hint {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  margin-bottom: 1rem;
+  margin-bottom: var(--stack-gap);
 }
 .collapsible .collapsible {
   box-shadow: none;
@@ -638,7 +756,10 @@ p.hint.src-lang-hint {
   transform: rotate(45deg);
 }
 .collapsible-body {
-  padding: 0 1rem 1rem;
+  padding: 0 var(--space-4) var(--space-4);
+}
+.collapsible-body > :last-child {
+  margin-bottom: 0;
 }
 .collapsible-body[hidden] {
   display: none;
@@ -774,8 +895,9 @@ textarea {
 .data-table input[type="text"],
 .data-table input[type="number"],
 .data-table select {
-  min-height: 2.1rem;
-  padding: 0.25rem 0.5rem;
+  height: var(--control-h-cell);
+  min-height: 0;
+  padding: 0 0.5rem;
 }
 input[type="checkbox"],
 input[type="radio"] {
@@ -820,19 +942,23 @@ fieldset.radio-group.is-inline legend {
 .row-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.6rem;
+  gap: var(--space-2) 0.6rem;
   align-items: center;
-  margin: 0.75rem 0;
+  margin: var(--space-3) 0;
 }
+/* a label above a field with its buttons next to it: the controls share one baseline and one height */
 .path-row {
   display: flex;
-  gap: 0.75rem;
+  gap: var(--space-3);
   align-items: flex-end;
   flex-wrap: wrap;
-  margin-top: 0.5rem;
+  margin: var(--space-2) 0 var(--space-3);
+}
+.path-row .field {
+  margin-bottom: 0;
 }
 .path-row .btn {
-  margin-bottom: 0.75rem;
+  min-height: var(--control-h);
 }
 .inline-field {
   display: inline-flex;
@@ -900,6 +1026,37 @@ fieldset.radio-group.is-inline legend {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.95rem;
+}
+/* fixed column widths (set by <colgroup>): the table always fits its card, long text wraps inside its cell */
+.data-table.is-fixed {
+  table-layout: fixed;
+}
+.data-table.is-fixed th,
+.data-table.is-fixed td {
+  overflow-wrap: anywhere;
+}
+/* tables made of inputs: headers and fields start at the same x, the cell content sits in the middle of the row */
+.data-table.is-form tbody th,
+.data-table.is-form tbody td {
+  vertical-align: middle;
+}
+.col-select {
+  width: 2.75rem;
+}
+.col-num {
+  width: 6rem;
+}
+/* chips in a fixed column wrap instead of spilling into the next one */
+.data-table.is-fixed .chip {
+  white-space: normal;
+  min-width: 0;
+  max-width: 100%;
+}
+.data-table.is-fixed .license-badges {
+  display: flex;
+}
+.col-state {
+  width: 9.5rem;
 }
 .data-table th,
 .data-table td {
@@ -1038,8 +1195,20 @@ fieldset.radio-group.is-inline legend {
   fill: var(--text);
 }
 
+/* a job panel is a column of blocks with one gap between them (no margins of its own inside) */
 .job-progress {
-  margin: 0.75rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+}
+.job-progress > * {
+  margin: 0;
+}
+.job-progress > .job-controls,
+.job-progress > .stage-list,
+.job-progress > .collapsible {
+  margin-top: var(--space-1);
 }
 .job-head {
   display: flex;
@@ -1050,28 +1219,28 @@ fieldset.radio-group.is-inline legend {
 .job-title {
   margin: 0;
 }
-.job-stage {
-  margin: 0.25rem 0;
-}
 .job-numbers {
   display: flex;
   gap: 1.25rem;
   flex-wrap: wrap;
-  margin: 0.4rem 0;
   color: var(--text-muted);
+}
+.job-numbers:empty {
+  display: none;
 }
 .job-item {
   color: var(--text-muted);
   font-size: 0.9rem;
   word-break: break-all;
 }
-.job-overall {
-  margin: 0.35rem 0;
-}
 .job-controls {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 0.6rem;
-  margin: 0.6rem 0;
+}
+.job-controls .btn {
+  min-height: var(--control-h);
 }
 .stage-list {
   list-style: none;
@@ -1079,7 +1248,6 @@ fieldset.radio-group.is-inline legend {
   flex-wrap: wrap;
   gap: 0.4rem 1.2rem;
   padding: 0;
-  margin: 0.6rem 0;
 }
 .stage-list li {
   display: inline-flex;
@@ -1111,6 +1279,16 @@ fieldset.radio-group.is-inline legend {
 .job-progress.is-compact .job-title {
   font-size: 0.95rem;
 }
+.log-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+.log-head .hint {
+  margin-right: auto;
+}
 .log-viewer {
   font-family: var(--mono);
   font-size: 0.8rem;
@@ -1123,6 +1301,11 @@ fieldset.radio-group.is-inline legend {
   white-space: pre-wrap;
   word-break: break-word;
   margin: 0;
+}
+.log-ts {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  user-select: text;
 }
 .files-progress {
   list-style: none;
@@ -1167,8 +1350,21 @@ fieldset.radio-group.is-inline legend {
 .wave-player.is-playing {
   border-color: var(--accent);
 }
-.wave-player.is-empty {
-  padding: 0.5rem 0.75rem;
+.wave-player.is-empty .wave-row {
+  min-height: 2.25rem; /* as tall as a real player: the row of a missing recording lines up with its neighbour */
+}
+.wave-player.is-empty .hint {
+  display: block;
+}
+.wave-player.is-compact .wave-surface {
+  min-width: 3rem;
+}
+.wave-player.is-compact .wave-time {
+  min-width: 4.4rem;
+  font-size: 0.78rem;
+}
+.wave-player.is-compact .wave-volume {
+  width: 3.5rem;
 }
 .wave-label {
   font-size: 0.85rem;
@@ -1216,9 +1412,15 @@ fieldset.radio-group.is-inline legend {
 }
 .ab-player {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.6rem;
   align-items: start;
+}
+.ab-col {
+  min-width: 0;
+}
+.ab-col > .wave-player {
+  margin: 0;
 }
 .ab-player > .btn {
   grid-column: 1 / -1;
@@ -1330,8 +1532,9 @@ fieldset.radio-group.is-inline legend {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
-  gap: 1rem;
+  gap: var(--space-4);
   flex-wrap: wrap;
+  margin-bottom: var(--space-3);
 }
 .game-head h2 {
   margin-bottom: 0.15rem;
@@ -1340,6 +1543,12 @@ fieldset.radio-group.is-inline legend {
   word-break: break-all;
   font-size: 0.9rem;
   margin: 0;
+}
+.recent {
+  margin-top: var(--space-3);
+}
+.recent p.hint {
+  margin-bottom: var(--space-1);
 }
 .recent ul {
   list-style: none;
@@ -1453,7 +1662,31 @@ fieldset.radio-group.is-inline legend {
   padding: 0.25rem 0;
 }
 .glossary h3 {
-  margin-top: 1rem;
+  margin-top: var(--space-4);
+}
+.glossary > h3:first-child {
+  margin-top: 0;
+}
+.glossary .col-gl-src {
+  width: 28%;
+}
+.glossary .col-gl-tgt {
+  width: 44%;
+}
+.glossary .col-gl-gender {
+  width: 28%;
+}
+.glossary .col-gl-term {
+  width: 28%;
+}
+.glossary .col-gl-note {
+  width: 32%;
+}
+.glossary .col-gl-remove {
+  width: 7.5rem;
+}
+.glossary .table-wrap + .btn {
+  margin-top: var(--space-3);
 }
 .cues-table {
   max-height: 24rem;
@@ -1663,10 +1896,15 @@ fieldset.radio-group.is-inline legend {
 }
 .preview-item {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
-  gap: 1rem;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  gap: var(--space-4);
+  align-items: start;
   border-bottom: 1px solid var(--border);
-  padding-bottom: 0.75rem;
+  padding-bottom: var(--space-3);
+}
+.preview-item:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
 }
 .preview-name {
   display: flex;
@@ -1703,6 +1941,14 @@ fieldset.radio-group.is-inline legend {
 .review-list-pane {
   position: sticky;
   top: 4.5rem;
+}
+/* the counter above the list has a fixed height, so the detail pane starts level with the list itself */
+.review-list-pane > p.hint {
+  height: 1.5rem;
+  margin: 0 0 var(--space-2);
+}
+.review-layout > .review-detail-pane {
+  margin-top: 2rem;
 }
 .virtual-list {
   height: calc(100vh - 14rem);
@@ -1893,6 +2139,55 @@ fieldset.radio-group.is-inline legend {
 .model-name {
   font-weight: 700;
 }
+/* the models table: fixed columns that always fit the card; the description is clamped, the full text is in its title */
+.models-table {
+  min-width: 52rem;
+}
+.models-table thead th,
+.models-table thead th.num {
+  white-space: normal;
+}
+.models-table .col-vram {
+  width: 7rem;
+}
+.models-table .col-size {
+  width: 5.5rem;
+}
+.models-table .col-name {
+  width: auto;
+}
+.models-table .col-license {
+  width: 14rem;
+}
+.models-table .col-check {
+  width: 8.5rem;
+}
+.model-purpose {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+  margin-top: 0.1rem;
+}
+.model-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
+.tools-table {
+  min-width: 40rem;
+}
+.tools-table .col-for {
+  width: 14rem;
+}
+.settings-path h3 {
+  margin-bottom: var(--space-1);
+}
+.card > .hint + .settings-path {
+  margin-top: var(--space-3);
+}
 .env-list {
   list-style: none;
   padding: 0;
@@ -1960,6 +2255,9 @@ fieldset.radio-group.is-inline legend {
   .review-list-pane {
     position: static;
   }
+  .review-layout > .review-detail-pane {
+    margin-top: 0;
+  }
   .virtual-list {
     height: 22rem;
   }
@@ -2005,8 +2303,8 @@ fieldset.radio-group.is-inline legend {
 .engine-steps {
   background: var(--accent-soft);
   border-radius: var(--radius);
-  padding: 0.75rem 1rem;
-  margin-bottom: 1rem;
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
 }
 .engine-steps h3 {
   margin-bottom: 0.25rem;

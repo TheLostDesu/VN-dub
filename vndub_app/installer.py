@@ -39,6 +39,10 @@ Python itself comes from :func:`ensure_python`: ``uv python install``, then the 
 it (os error 448, ``ERROR_UNTRUSTED_MOUNT_POINT``) and uv bakes the link path into the ``pyvenv.cfg`` and the
 ``python.exe`` trampoline of every venv it creates while the link exists, so a venv made with the link present
 would still need it at run time.
+
+Processes that run from these folders (:func:`process_roots`) are tracked by image path (``winproc``): an interpreter that is
+still running from an environment keeps its files locked, so :func:`install_envs` and :func:`ensure_pytools` terminate every
+process of an environment before they reinstall it (:func:`free_folders`; one job-log line per process).
 """
 
 from __future__ import annotations
@@ -342,6 +346,36 @@ def target_dir(entry: dict[str, Any]) -> Path:
 
 def pytools_dir() -> Path:
     return appdirs.tools_dir() / PYTOOLS_DIRNAME
+
+
+def process_roots() -> list[Path]:
+    """The folders whose processes belong to the app (``winproc`` ledger roots); the first one is the environments folder.
+
+    ``[<envs> (with _uv: uv's Pythons are the real interpreters behind every env launcher), <data>/tools (llama-server, the
+    pytools venv, downloaded tools)]``, plus ``<exe dir>/bin`` and ``<exe dir>/git`` in the packaged app (uv, MinGit).
+    """
+    roots = [envs_dir(), appdirs.tools_dir()]
+    base = app_dir()
+    if base is not None:
+        roots += [base / "bin", base / "git"]
+    return roots
+
+
+def free_folders(folders: list[Path], ctx: JobContext, why: str) -> int:
+    """Terminate every process that runs from ``folders`` (and what those started) before the folders are rebuilt; returns the count.
+
+    uv cannot replace a virtual environment while one of its interpreters runs: the launcher and the DLLs / extension modules
+    of the real interpreter stay locked ("file in use"). Each terminated process gets a line in the job log.
+    """
+    existing = [f for f in folders if f.is_dir()]
+    if not existing:
+        return 0
+    killed = winproc.kill_all_under(existing, with_descendants=True, reason=why)
+    for info in killed:
+        ctx.log(f"terminated pid {info.pid} ({info.exe}): {why}")
+    if killed:
+        log.info("%s: terminated %d process(es): %s", why, len(killed), winproc.describe(killed))
+    return len(killed)
 
 
 def _venv_python(venv: Path) -> Path:
@@ -938,6 +972,7 @@ def ensure_pytools(ctx: JobContext) -> Path:
     if uv is None:
         raise AppError("tool_missing", params={"tool": "uv"}, action="show_manual", details="uv was not found (not bundled, not on PATH)")
     if venv.exists():
+        free_folders([venv], ctx, "the tools environment is being rebuilt")
         shutil.rmtree(venv, ignore_errors=True)
     ctx.message("installer.msg.pytools")
     base_python = ensure_python(PYTOOLS_PYTHON, ctx)
@@ -1331,6 +1366,7 @@ def install_envs(envs: list[str], torch: str, ctx: JobContext) -> dict[str, Any]
     path = envs_dir()
     path.mkdir(parents=True, exist_ok=True)
     base_python = ensure_python(ENVS_PYTHON, ctx)  # a real folder, not uv's junction: see ensure_python
+    free_folders([path / n for n in names], ctx, "the environment is being reinstalled")
     rows = _Rows(ctx)
     row_by = {n: rows.add(f"env:{n}", n, n) for n in names}
     ctx.message("installer.msg.envs", torch=torch_kind, count=len(names))

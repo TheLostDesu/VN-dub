@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -157,10 +159,12 @@ def test_events_and_result() -> None:
     r.wait(job.id, 10)
     assert job.state == "done" and job.result == {"a": 1, "b": 2} and job.project == "p"
     types = [e["type"] for e in events]
-    assert "job" in types and {"type": "log", "job_id": job.id, "line": "hello"} in events
+    logs = [e for e in events if e["type"] == "log"]
+    assert "job" in types and len(logs) == 1 and logs[0]["job_id"] == job.id and set(logs[0]) == {"type", "job_id", "line"}
+    assert re.fullmatch(r"\d\d:\d\d:\d\d hello", logs[0]["line"])  # every line carries the local time
     assert events[-1]["job"]["state"] == "done"
     assert job.message_key == "jobs.msg.report_zip" and job.message_params == {"n": 1}
-    assert r.get(job.id).info(with_log=True)["log_tail"] == ["hello"]
+    assert r.get(job.id).info(with_log=True)["log_tail"] == [logs[0]["line"]]  # the tail is prefixed the same way
     r.shutdown()
 
 
@@ -520,3 +524,294 @@ def test_cancel_runs_hooks_and_a_failure_after_it_is_a_cancel(tmp_path):
     assert hooked.is_set()
     assert rec.state == "cancelled" and rec.error is None
     assert rec.cancel_requested
+
+
+# ----------------------------------------------------------------------------
+# logging: time prefix, per-job log files, events in app.log
+# ----------------------------------------------------------------------------
+
+TIME = r"\d\d:\d\d:\d\d "
+
+
+def _texts(lines: list[str]) -> list[str]:
+    """Job log lines without their ``HH:MM:SS `` prefix."""
+    assert all(re.match(TIME, l) for l in lines), lines
+    return [l[9:] for l in lines]
+
+
+def test_every_log_line_starts_with_the_local_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(jobs, "_stamp", lambda: "12:34:56")
+    r = JobRunner(None, None)
+    events: list[dict] = []
+    r.subscribe(events.append)
+
+    def fn(ctx: jobs.JobContext) -> None:
+        ctx.log("INFO vndub.link: a forwarded pipeline record")
+        ctx.log("plain")
+        raise RuntimeError("boom")
+
+    job = r.submit("stage", fn)
+    r.wait(job.id, 10)
+    assert job.log_tail == [
+        "12:34:56 INFO vndub.link: a forwarded pipeline record",
+        "12:34:56 plain",
+        "12:34:56 ERROR: RuntimeError: boom",  # the failure line goes through the same path
+    ]
+    streamed = [e for e in events if e["type"] == "log"]
+    assert [e["line"] for e in streamed] == job.log_tail and all(set(e) == {"type", "job_id", "line"} and e["job_id"] == job.id for e in streamed)
+    assert r.get(job.id).info(with_log=True)["log_tail"] == job.log_tail
+    r.shutdown()
+
+
+def test_the_real_clock_is_used_by_default() -> None:
+    before = time.strftime("%H:%M:%S")
+    got = jobs._stamp()  # noqa: SLF001
+    after = time.strftime("%H:%M:%S")
+    assert re.fullmatch(r"\d\d:\d\d:\d\d", got) and got[:2] in {before[:2], after[:2]}
+
+
+def test_job_log_file_has_header_lines_events_and_footer(tmp_path: Path) -> None:
+    logs = tmp_path / "logs" / "jobs"
+    r = JobRunner(None, None, log_dir=logs)
+
+    def fn(ctx: jobs.JobContext) -> None:
+        ctx.set_stages(["synth", "score"])
+        ctx.begin_stage("synth")
+        ctx.log("first")
+        ctx.progress(2, 2)
+        ctx.begin_stage("score")
+        ctx.log("second")
+
+    job = r.submit("stage", fn, params={"name": "synth", "hf_token": "secret-value", "only": ["a"]}, project="demo")
+    r.wait(job.id, 10)
+    assert job.state == "done"
+    files = list(logs.glob("*.log"))
+    assert [str(f) for f in files] == [job.log_path]
+    assert re.fullmatch(r"\d{8}-\d{6}-stage-" + job.id + r"\.log", files[0].name)
+    raw = files[0].read_text(encoding="utf-8")
+    assert "secret-value" not in raw
+    lines = raw.splitlines()
+    body = _texts(lines)
+    assert body[0].startswith(f"=== job {job.id} kind=stage project=demo created={job.created} params=")
+    assert json.loads(body[0].split(" params=", 1)[1]) == {"name": "synth", "hf_token": "***", "only": ["a"]}
+    assert body[1:3] == ["--- stage synth begin (1/2)", "first"]
+    assert re.fullmatch(r"--- stage synth done in \d+\.\ds \(2/2\)", body[3])
+    assert body[4:6] == ["--- stage score begin (2/2)", "second"]
+    assert re.fullmatch(r"--- stage score done in \d+\.\ds \(0/0\)", body[6])
+    assert re.fullmatch(r"=== done after \d+\.\ds", body[7]) and len(body) == 8
+    # the UI log shows what the job printed, not the events: the file is the fuller record
+    assert _texts(job.log_tail) == ["first", "second"]
+    r.shutdown()
+
+
+def test_job_log_footer_names_the_state_and_the_error_code(tmp_path: Path) -> None:
+    logs = tmp_path / "jobs"
+    r = JobRunner(None, None, log_dir=logs)
+
+    def boom(ctx: jobs.JobContext) -> None:
+        ctx.set_stages(["synth"])
+        ctx.begin_stage("synth")
+        raise AppError("tool_missing", params={"tool": "ffmpeg"}, details="ffmpeg is gone\nsecond line")
+
+    started = threading.Event()
+
+    def long(ctx: jobs.JobContext) -> None:
+        started.set()
+        while True:
+            ctx.progress(1, 10)
+            time.sleep(0.01)
+
+    bad = r.submit("stage", boom)
+    r.wait(bad.id, 10)
+    body = _texts(Path(bad.log_path).read_text(encoding="utf-8").splitlines())
+    assert re.fullmatch(r"--- stage synth failed in \d+\.\ds \(0/0\)", body[-3]) and body[-2] == "ERROR: ffmpeg is gone"
+    assert re.fullmatch(r"=== failed after \d+\.\ds error=tool_missing", body[-1])
+
+    ok = r.submit("stage", long)
+    started.wait(5)
+    r.cancel(ok.id)
+    r.wait(ok.id, 10)
+    body = _texts(Path(ok.log_path).read_text(encoding="utf-8").splitlines())
+    assert "=== cancel requested" in body and re.fullmatch(r"=== cancelled after \d+\.\ds", body[-1])
+    r.shutdown()
+
+
+def test_job_log_file_is_written_while_the_job_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(jobs, "JOB_LOG_FLUSH_S", 0.05)
+    r = JobRunner(None, None, log_dir=tmp_path / "jobs")
+    gate, logged = threading.Event(), threading.Event()
+
+    def fn(ctx: jobs.JobContext) -> None:
+        ctx.log("early line")
+        logged.set()
+        gate.wait(10)
+
+    job = r.submit("report", fn, gpu=False)
+    try:
+        assert logged.wait(5)
+        # buffered, not written per line: the flusher thread puts it on disk within a moment, the job still running
+        wait_until(lambda: "early line" in Path(job.log_path).read_text(encoding="utf-8"), timeout=5)
+        assert job.state == "running"
+    finally:
+        gate.set()
+        r.wait(job.id, 10)
+        r.shutdown()
+
+
+def test_many_lines_are_buffered_not_written_one_by_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    flushes: list[int] = []
+    real = jobs._JobLogFile.flush  # noqa: SLF001
+    monkeypatch.setattr(jobs._JobLogFile, "flush", lambda self: (flushes.append(1), real(self))[1])  # noqa: SLF001
+    r = JobRunner(None, None, log_dir=tmp_path / "jobs")
+
+    def fn(ctx: jobs.JobContext) -> None:
+        for i in range(5000):  # what `uv pip install` prints
+            ctx.log(f"line {i}")
+
+    t0 = time.monotonic()
+    job = r.submit("report", fn, gpu=False)
+    r.wait(job.id, 30)
+    assert job.state == "done" and time.monotonic() - t0 < 10
+    assert len(flushes) < 50  # nowhere near one flush per line
+    body = _texts(Path(job.log_path).read_text(encoding="utf-8").splitlines())
+    assert body[1] == "line 0" and body[5000] == "line 4999" and len(body) == 5002  # header + 5000 lines + footer
+    r.shutdown()
+
+
+def test_old_job_logs_are_pruned_to_the_newest_thirty(tmp_path: Path) -> None:
+    logs = tmp_path / "jobs"
+    logs.mkdir()
+    for i in range(35):
+        (logs / f"20200101-0000{i:02d}-stage-old{i:02d}.log").write_text("x", encoding="utf-8")
+    r = JobRunner(None, None, log_dir=logs)
+    ids = []
+    for _ in range(3):
+        job = r.submit("stage", lambda ctx: None)
+        r.wait(job.id, 10)
+        ids.append(job.id)
+    names = sorted(p.name for p in logs.glob("*.log"))
+    assert len(names) == 30
+    assert not any("old0" in n and int(n.split("old")[1][:2]) < 8 for n in names)  # the 8 oldest of the 38 are gone
+    assert any("old34" in n for n in names) and all(any(i in n for n in names) for i in ids)
+    r.shutdown()
+
+
+def test_a_broken_log_folder_never_breaks_the_job(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    blocker = tmp_path / "jobs"
+    blocker.write_text("a file where the folder should be", encoding="utf-8")
+    r = JobRunner(None, None, log_dir=blocker / "sub")
+    caplog.set_level("WARNING", logger="vndub_app.jobs")
+
+    def fn(ctx: jobs.JobContext) -> dict:
+        for i in range(3):
+            ctx.log(f"line {i}")
+        return {"ok": 1}
+
+    job = r.submit("report", fn, gpu=False)
+    r.wait(job.id, 10)
+    assert job.state == "done" and job.result == {"ok": 1} and job.log_path is None
+    assert _texts(job.log_tail) == ["line 0", "line 1", "line 2"]
+    assert len([rec for rec in caplog.records if "cannot write its log file" in rec.getMessage()]) == 1
+    assert r.read_log(job.id) == {"path": None, "lines": job.log_tail}
+    r.shutdown()
+
+
+def test_a_write_error_in_the_middle_warns_once_and_stops_writing(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("WARNING", logger="vndub_app.jobs")
+    f = jobs._JobLogFile(tmp_path / "a.log", "j1")  # noqa: SLF001
+    assert f.open()
+
+    class Full:
+        def write(self, _: str) -> None:
+            raise OSError("disk full")
+
+        def close(self) -> None:
+            pass
+
+    f._f.close()  # type: ignore[union-attr]  # noqa: SLF001
+    f._f = Full()  # type: ignore[assignment]  # noqa: SLF001
+    for _ in range(3):
+        f.write("a")
+    f.flush()
+    f.close()
+    assert len([r for r in caplog.records if "disk full" in r.getMessage()]) == 1
+
+
+def test_read_log_returns_the_file_the_newest_part_of_a_big_one_or_the_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    r = JobRunner(None, None, log_dir=tmp_path / "jobs")
+
+    def fn(ctx: jobs.JobContext) -> None:
+        for i in range(60):
+            ctx.log(f"line {i:03d}")
+
+    job = r.submit("report", fn, gpu=False)
+    r.wait(job.id, 10)
+    full = r.read_log(job.id)
+    assert full["path"] == job.log_path and len(full["lines"]) == 62
+    assert _texts(full["lines"])[1:-1] == _texts(job.log_tail)
+    monkeypatch.setattr(jobs, "JOB_LOG_READ_MAX", 300)  # the cap: the newest lines win, the cut line is dropped
+    cut = r.read_log(job.id)["lines"]
+    assert 3 <= len(cut) < 62 and cut[-1] == full["lines"][-1] and all(re.match(TIME, l) for l in cut)
+    assert cut == full["lines"][-len(cut):]
+    Path(job.log_path).unlink()  # pruned or removed: what the record still has
+    gone = r.read_log(job.id)
+    assert gone == {"path": None, "lines": job.log_tail}
+    with pytest.raises(AppError):
+        r.read_log("nope")
+    r.shutdown()
+
+
+def test_job_events_go_to_the_app_log(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO", logger="vndub_app.jobs")
+    r = JobRunner(None, None)
+    gate = threading.Event()
+
+    def ok(ctx: jobs.JobContext) -> None:
+        ctx.set_stages(["a", "b"])
+        ctx.begin_stage("a")
+        ctx.progress(3, 3)
+        ctx.begin_stage("b")
+
+    def paused(ctx: jobs.JobContext) -> None:
+        gate.wait(10)
+        ctx.checkpoint()
+        raise AppError("tool_missing", details="ffmpeg is gone", action="open_tools")
+
+    j1 = r.submit("stage", ok, project="demo", params={"name": "a", "only": None})
+    r.wait(j1.id, 10)
+    j2 = r.submit("stage", paused)
+    wait_until(lambda: j2.state == "running")
+    r.pause(j2.id)
+    gate.set()
+    wait_until(lambda: j2.state == "paused")
+    r.resume(j2.id)
+    r.wait(j2.id, 10)
+    gate2 = threading.Event()
+    block = r.submit("stage", lambda ctx: gate2.wait(10) and None)
+    wait_until(lambda: block.state == "running")
+    j3 = r.submit("stage", lambda ctx: None)  # queued behind the blocker: cancelled before it ever starts
+    r.cancel(j3.id)
+    r.wait(j3.id, 10)
+    gate2.set()
+    r.wait(block.id, 10)
+    msgs = [rec.getMessage() for rec in caplog.records if rec.name == "vndub_app.jobs"]
+    assert f"job {j1.id} submitted: kind=stage project=demo gpu=True params=['name', 'only']" in msgs
+    assert any(re.fullmatch(rf"job {j1.id} started: kind=stage \(waited \d+\.\ds in the queue\)", m) for m in msgs)
+    assert f"job {j1.id} stage a begin (1/2)" in msgs and f"job {j1.id} stage b begin (2/2)" in msgs
+    assert any(re.fullmatch(rf"job {j1.id} stage a done in \d+\.\ds \(3/3\)", m) for m in msgs)
+    assert any(re.fullmatch(rf"job {j1.id} stage b done in \d+\.\ds \(0/0\)", m) for m in msgs)  # the last stage ends with the job
+    assert any(re.fullmatch(rf"job {j1.id} done: kind=stage duration=\d+\.\ds", m) for m in msgs)
+    assert f"job {j2.id}: pause requested (running)" in msgs and f"job {j2.id}: resume requested" in msgs
+    assert any(re.fullmatch(rf"job {j2.id} failed: kind=stage duration=\d+\.\ds error=tool_missing \(ffmpeg is gone\)", m) for m in msgs)
+    assert f"job {j3.id}: cancel requested (queued)" in msgs
+    assert f"job {j3.id} cancelled: kind=stage duration=0.0s" in msgs
+    r.shutdown()
+
+
+def test_job_records_from_before_log_path_still_load(tmp_path: Path) -> None:
+    state = tmp_path / "jobs.json"
+    old = jobs.JobRecord(id="old1", kind="report", title_key="jobs.report", state="done", created="2026-01-01T00:00:00+00:00").info(with_log=True)
+    del old["log_path"]  # a jobs.json written before the field existed
+    state.write_text(json.dumps([old]), encoding="utf-8")
+    rec = JobRunner(state, None).get("old1")
+    assert rec.log_path is None and rec.info()["log_path"] is None

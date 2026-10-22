@@ -5,7 +5,8 @@ Layout of the data folder (DEFAULT ``%LOCALAPPDATA%\\VNDub``, ``~/.local/share/v
     <data>/settings.json            app settings (UI language, GPU budget, license policy ...)
     <data>/jobs.json                job records (resume after restart)
     <data>/throughput_v2.json       measured seconds per voiced line per stage (ETA)
-    <data>/logs/app.log             rotating app log
+    <data>/logs/app.log             rotating app log (INFO; DEBUG with Settings.debug_log)
+    <data>/logs/jobs/               one log file per job (<YYYYMMDD-HHMMSS>-<kind>-<id>.log), the newest 30
     <data>/configs/tools.local.yaml external tool paths written by the installer
     <data>/tools/                   external tools (ffmpeg, vgmstream ...)
     <data>/envs/                    backend virtual environments (VNDUB_ENVS_DIR; Settings.envs_dir moves it)
@@ -179,6 +180,7 @@ class Settings(BaseModel):
     last_project: str | None = None
     shutdown_when_done: bool = False
     translation_llm: str = ""                   # "" = the profile's default (gemma4_12b); else a registry llm backend name
+    debug_log: bool = False                     # DEBUG lines in logs/app.log (WebSocket clients, every HTTP request); INFO otherwise
 
 
 def settings_file() -> Path:

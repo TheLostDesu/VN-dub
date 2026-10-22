@@ -16,6 +16,7 @@ import type {
   ImportPreview,
   InstallPlan,
   JobInfo,
+  JobLog,
   ModelsReport,
   PreviewItem,
   ProjectInfo,
@@ -71,6 +72,7 @@ export const api = {
 
   // ---- jobs ---------------------------------------------------------------------------------
   job: (id: string) => http.get<JobInfo & { log_tail?: string[] }>(`/api/jobs/${encodeURIComponent(id)}`),
+  jobLog: (id: string) => http.get<JobLog>(`/api/jobs/${encodeURIComponent(id)}/log`),
   jobs: (active?: boolean) => http.get<JobInfo[]>("/api/jobs", { active: active ? 1 : undefined }),
   pauseJob: (id: string) => http.post<JobInfo>(`/api/jobs/${encodeURIComponent(id)}/pause`),
   resumeJob: (id: string) => http.post<JobInfo>(`/api/jobs/${encodeURIComponent(id)}/resume`),
@@ -144,7 +146,7 @@ export const api = {
 
   // ---- doctor / tools / models / install --------------------------------------------------------
   doctor: () => http.get<DoctorReport>("/api/doctor"),
-  doctorFix: (action: string) => http.post<JobInfo | DefenderHelp | { ok: boolean; path?: string; url?: string }>(`/api/doctor/fix/${encodeURIComponent(action)}`),
+  doctorFix: (action: string) => http.post<JobInfo | DefenderHelp | { ok: boolean; path?: string; url?: string; killed?: number }>(`/api/doctor/fix/${encodeURIComponent(action)}`),
   tools: () => http.get<ToolRow[]>("/api/tools"),
   installTools: (names: string[]) => http.post<JobInfo>("/api/tools/install", { names }),
   envs: () => http.get<EnvRow[]>("/api/envs"),

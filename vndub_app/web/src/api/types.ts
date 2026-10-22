@@ -40,6 +40,8 @@ export interface Settings {
   shutdown_when_done: boolean;
   /** "" = the default translation model; else a registry `llm` backend name (built in or added by link) */
   translation_llm?: string;
+  /** write DEBUG lines to <data>/logs (absent until the backend knows the setting: read it as `?? false`) */
+  debug_log?: boolean;
   data_dir?: string;
   [extra: string]: unknown;
 }
@@ -75,6 +77,12 @@ export interface JobInfo {
   error: ErrorInfo | null;
   result: Record<string, unknown>;
   log_tail?: string[];
+}
+
+/** GET /api/jobs/{id}/log: the whole per-job log file (or the tail the server keeps when the file is gone). */
+export interface JobLog {
+  path: string | null;
+  lines: string[];
 }
 
 export const ACTIVE_STATES: JobState[] = ["queued", "running", "paused"];

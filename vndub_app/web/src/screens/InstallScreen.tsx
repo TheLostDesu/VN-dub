@@ -67,7 +67,7 @@ export default function InstallScreen() {
       {plan ? (
         <>
           <Card testid="install-plan">
-            <div className="game-head">
+            <div className="card-head">
               <h2>{t("install.what.title")}</h2>
               <Chip tone="info" testid="install-engine">
                 {t("game.engine")}: {tOr(`engines.${plan.engine}`, plan.engine)}

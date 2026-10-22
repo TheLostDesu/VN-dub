@@ -10,6 +10,38 @@ import { furthestStep, pathForJobKind, STEP_NUMBER, stepForJobKind, stepPath, us
 import { ErrorPanel } from "./ErrorPanel";
 import { Button, Dialog, ProgressBar } from "./ui";
 
+/** The running job as a chip in the top bar: title, stage, percentage; a click opens the page that shows the job. */
+function TopBarJob() {
+  const { t, tOr, has } = useI18n();
+  const nav = useNavigate();
+  const job = useActiveJob();
+  if (!job) return null;
+  const title = tOr(job.title_key, t(`jobs.${job.kind}`));
+  const stageName = job.stage ? (has(`stages.${job.stage}`) ? t(`stages.${job.stage}`) : job.stage) : "";
+  const pct = job.total > 0 ? Math.round(Math.min(1, Math.max(0, job.done / job.total)) * 100) : null;
+  const note = job.state === "paused" ? t("job.state.paused") : job.state === "queued" ? t("job.state.queued") : stageName || (pct === null ? t("job.working") : "");
+  const dest = pathForJobKind(job.kind);
+  const full = [t("job.running_now", { title }), note, pct !== null ? `${pct}%` : ""].filter(Boolean).join(" · ");
+  const body = (
+    <>
+      {pct === null && job.state !== "paused" ? <span className="spinner" aria-hidden="true" /> : null}
+      <span className="topbar-job-title">{title}</span>
+      {note ? <span className="topbar-job-stage">{note}</span> : null}
+      {pct !== null ? <span className="topbar-job-pct">{pct}%</span> : null}
+      {pct !== null ? <span className="topbar-job-fill" style={{ width: `${pct}%` }} aria-hidden="true" /> : null}
+    </>
+  );
+  return dest ? (
+    <button type="button" className="topbar-job" onClick={() => nav(dest)} title={full} data-testid="topbar-job" data-kind={job.kind}>
+      {body}
+    </button>
+  ) : (
+    <span className="topbar-job" title={full} data-testid="topbar-job" data-kind={job.kind}>
+      {body}
+    </span>
+  );
+}
+
 export function TopBar() {
   const t = useI18n().t;
   const { project, step } = useProject();
@@ -30,6 +62,7 @@ export function TopBar() {
           </span>
         ) : null}
       </div>
+      <TopBarJob />
       <nav className="topbar-nav" aria-label={t("app.menu")}>
         {!inWizard && project ? (
           <NavLink to={stepPath(step)} data-testid="nav-wizard">

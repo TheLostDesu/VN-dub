@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { api } from "../api/endpoints";
 import { toErrorInfo } from "../api/client";
 import { ACTIVE_STATES, type ErrorInfo, type JobInfo } from "../api/types";
@@ -6,32 +6,87 @@ import { useI18n } from "../i18n";
 import { ingestJob, useJobLog } from "../state/progress";
 import { fmtBytes, fmtDuration, fmtNumber, normalizeFiles } from "../util/format";
 import { ErrorPanel } from "./ErrorPanel";
-import { Button, Chip, Collapsible, ProgressBar } from "./ui";
+import { Button, Chip, Collapsible, ProgressBar, copyText } from "./ui";
+
+/** Every server log line starts with the local time `HH:MM:SS `; a line without it is shown as it is. */
+const LOG_TS = /^(\d{2}:\d{2}:\d{2}) /;
+
+function LogLine({ line }: { line: string }) {
+  const m = LOG_TS.exec(line);
+  if (!m) return <>{line}</>;
+  return (
+    <>
+      <span className="log-ts">{m[1]}</span>
+      {line.slice(8)}
+    </>
+  );
+}
 
 export function LogViewer({ jobId, fallback }: { jobId: string; fallback?: string[] }) {
   const t = useI18n().t;
   const lines = useJobLog(jobId, fallback);
   const ref = useRef<HTMLPreElement>(null);
   const stick = useRef(true);
+  const linesRef = useRef(lines);
+  linesRef.current = lines;
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<number | null>(null);
   useEffect(() => {
     const el = ref.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
   }, [lines.length]);
+  useEffect(
+    () => () => {
+      if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+
+  // the whole log file of the job from the server; when that is not possible, the lines this viewer already has
+  const copyLog = async () => {
+    let all = linesRef.current;
+    try {
+      const res = await api.jobLog(jobId);
+      if (Array.isArray(res.lines) && res.lines.length > 0) all = res.lines;
+    } catch {
+      /* older server or the job is gone: copy what is shown */
+    }
+    if (await copyText(all.join("\n"))) {
+      setCopied(true);
+      if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+      copiedTimer.current = window.setTimeout(() => setCopied(false), 1500);
+    }
+  };
+
   return (
-    <pre
-      ref={ref}
-      className="log-viewer"
-      role="log"
-      aria-label={t("job.log")}
-      tabIndex={0}
-      data-testid="job-log"
-      onScroll={(e) => {
-        const el = e.currentTarget;
-        stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-      }}
-    >
-      {lines.length === 0 ? t("job.log_empty") : lines.join("\n")}
-    </pre>
+    <div className="log-box">
+      <div className="log-head">
+        <Button small onClick={() => void copyLog()} data-testid="job-log-copy" aria-live="polite">
+          {copied ? t("common.copied") : t("common.copy")}
+        </Button>
+      </div>
+      <pre
+        ref={ref}
+        className="log-viewer"
+        role="log"
+        aria-label={t("job.log")}
+        tabIndex={0}
+        data-testid="job-log"
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+        }}
+      >
+        {lines.length === 0
+          ? t("job.log_empty")
+          : lines.map((line, i) => (
+              <Fragment key={i}>
+                <LogLine line={line} />
+                {"\n"}
+              </Fragment>
+            ))}
+      </pre>
+    </div>
   );
 }
 
@@ -117,8 +172,10 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
   const over = fractionOverride ? fractionOverride(job) : undefined;
   const stageFrac = over !== undefined ? over : own;
   const multi = job.stage_count > 1;
-  const overall = multi ? Math.min(1, (Math.max(0, job.stage_index - 1) + (own ?? 0)) / job.stage_count) : null;
   const finished = job.state === "done";
+  // a finished multi-stage job has nothing left to compare: one full bar, not a stage bar plus an identical overall bar
+  const twoBars = multi && !compact && !finished;
+  const overall = multi ? (finished ? 1 : Math.min(1, (Math.max(0, job.stage_index - 1) + (own ?? 0)) / job.stage_count)) : null;
   const eta = job.eta_s ?? job.stage_eta_s;
 
   const control = async (name: "pause" | "resume" | "cancel") => {
@@ -160,13 +217,13 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
 
       {job.state !== "failed" ? (
         <>
-          {stageName && !compact ? (
+          {stageName && !compact && !finished ? (
             <p className="job-stage" data-testid="job-stage">
               {multi ? t("job.stage_of", { i: job.stage_index, n: job.stage_count }) + ": " : ""}
               <strong>{stageName}</strong>
             </p>
           ) : null}
-          <ProgressBar value={multi && !compact ? stageFrac : (overall ?? stageFrac)} label={stageName || title} testid="job-bar" />
+          <ProgressBar value={twoBars ? stageFrac : finished ? 1 : (overall ?? stageFrac)} label={stageName || title} testid="job-bar" />
           <div className="job-numbers">
             {hasTotal ? (
               <span data-testid="job-counter">{t(counterKey(job.kind), { done: job.state === "done" ? job.total : job.done, total: job.total })}</span>
@@ -185,7 +242,7 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
               {t("job.current_item")}: <code>{job.item}</code>
             </p>
           ) : null}
-          {multi && !compact ? (
+          {twoBars ? (
             <div className="job-overall">
               <span className="sr-only">{t("job.overall")}</span>
               <ProgressBar value={overall} label={t("job.overall")} size="sm" testid="job-overall" />

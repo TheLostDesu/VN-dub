@@ -4,7 +4,7 @@ import { toErrorInfo } from "../api/client";
 import type { CustomModel, ErrorInfo, ModelRow } from "../api/types";
 import { ErrorPanel } from "../components/ErrorPanel";
 import { ReportProblem } from "../components/ReportProblem";
-import { Button, Callout, Card, Dialog, PageTitle, RadioGroup, SelectField, Slider, TextField, useToast } from "../components/ui";
+import { Button, Callout, Card, Checkbox, Dialog, PageTitle, RadioGroup, SelectField, Slider, TextField, useToast } from "../components/ui";
 import { useI18n, type Lang } from "../i18n";
 import { useSettings } from "../state/settings";
 
@@ -64,6 +64,12 @@ export default function SettingsScreen() {
     },
     [],
   );
+
+  // an older backend does not know the setting yet: the refused change must not stay ticked
+  const setDebugLog = async (on: boolean) => {
+    const res = await update({ debug_log: on });
+    if (!res) await reload();
+  };
 
   const pickDir = async () => {
     setError(null);
@@ -167,7 +173,7 @@ export default function SettingsScreen() {
           <h2>{t("settings.paths.title")}</h2>
           <p className="hint">{t("settings.paths.hint")}</p>
           {pathRows.map((r, i) => (
-            <div key={r.key} data-testid={`settings-path-${r.key}`}>
+            <div key={r.key} className="settings-path" data-testid={`settings-path-${r.key}`}>
               {i > 0 ? <hr /> : null}
               <h3>{r.label}</h3>
               <p>
@@ -249,14 +255,22 @@ export default function SettingsScreen() {
         />
       </Card>
 
+      <Card testid="settings-log">
+        <h2>{t("settings.log.title")}</h2>
+        <Checkbox checked={settings.debug_log ?? false} onChange={(v) => void setDebugLog(v)} label={t("settings.log.debug")} hint={t("settings.log.debug_hint")} testid="settings-debug-log" />
+        <p className="hint">{t("settings.log.where")}</p>
+        <div className="row-actions">
+          <Button onClick={() => void api.openFolder("logs").catch((e) => setError(toErrorInfo(e)))} data-testid="settings-open-logs">
+            {t("actions.open_logs")}
+          </Button>
+        </div>
+      </Card>
+
       <Card testid="settings-report">
         <h2>{t("settings.report.title")}</h2>
         <p className="hint">{t("settings.report.hint")}</p>
         <div className="row-actions">
           <ReportProblem label={t("settings.report.button")} variant="secondary" />
-          <Button onClick={() => void api.openFolder("logs").catch((e) => setError(toErrorInfo(e)))} data-testid="settings-open-logs">
-            {t("actions.open_logs")}
-          </Button>
         </div>
       </Card>
 

@@ -1238,5 +1238,16 @@
   "settings.paths.changed": "The folder was changed.",
   "errors.python_junction_blocked.title": "Windows did not let the program into the Python link folder: {path}.",
   "errors.python_junction_blocked.hint": "Delete that link folder in Explorer (the Python files themselves are in the neighbouring folder with the full version number and stay) and press Retry.",
-  "installer.msg.python": "Downloading Python {version} (done once)…"
+  "installer.msg.python": "Downloading Python {version} (done once)…",
+  "app.title_done": "[done] VNDub",
+  "app.title_failed": "[failed] VNDub",
+  "doctor.processes.title": "Background model processes",
+  "doctor.processes.green": "No background processes.",
+  "doctor.processes.yellow": "Processes left from earlier runs: {count} ({names}). They may hold video memory.",
+  "doctor.processes.red": "Background processes could not be checked.",
+  "doctor.fix.kill_processes": "End them",
+  "settings.log.title": "Log",
+  "settings.log.debug": "Detailed log (for diagnostics)",
+  "settings.log.debug_hint": "More details go to the log. Turn it on only when something does not work: the log grows faster.",
+  "settings.log.where": "The log is in the data folder, in the logs subfolder, and is included in the problem report."
 }

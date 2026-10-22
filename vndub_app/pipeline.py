@@ -194,6 +194,7 @@ def pipeline_ctx(
             ctx.models.close()
         finally:
             viewdata.clear_cache(h.slug)
+        session.sweep_orphans("leftover after a model job")  # a grandchild of an adapter outlives its graceful shutdown
 
 
 def config_has(section: str, key: str) -> bool:
@@ -647,10 +648,11 @@ def _build_rvc_train(slug: str, p: dict[str, Any]) -> FlowFn:
 # ----------------------------------------------------------------------------
 
 REPORT_MAX_FILE = 5 * 1024 * 1024
+REPORT_JOB_LOGS = 5  # the newest per-job log files (logs/jobs/) that go into the report
 
 
 def build_report_zip(slug: str | None, dest_dir: Path | None = None) -> Path:
-    """Zip logs + ``stage_status.json`` + ``project.yaml`` + ``app_state.json`` (no audio, no game data)."""
+    """Zip logs (``app.log*``, the newest 5 per-job logs) + ``stage_status.json`` + ``project.yaml`` + ``app_state.json`` (no audio, no game data)."""
     dest_dir = dest_dir or appdirs.sub("reports")
     dest_dir.mkdir(parents=True, exist_ok=True)
     ts = now_iso().replace(":", "").replace("-", "")[:15]
@@ -666,9 +668,14 @@ def build_report_zip(slug: str | None, dest_dir: Path | None = None) -> Path:
         except OSError:
             pass
 
+    jobs.flush_logs()  # the running jobs (this report job among them) have lines in their buffers
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in sorted(appdirs.logs_dir().glob("app.log*")):
             add(zf, f, f"logs/{f.name}")
+        add(zf, appdirs.logs_dir() / "reaper.log", "logs/reaper.log")  # what the reaper ended after the app was gone
+        job_logs = appdirs.logs_dir() / "jobs"
+        for f in sorted(job_logs.glob("*.log"), key=lambda p: p.name)[-REPORT_JOB_LOGS:] if job_logs.exists() else []:
+            add(zf, f, f"logs/jobs/{f.name}")
         add(zf, appdirs.settings_file(), "settings.json")
         if slug:
             h = appdirs.project_handle(slug)

@@ -5,6 +5,8 @@
 * :func:`read_ctx` returns a cached read-only :class:`StageContext` (cheap manifest
   access, never used to run a stage); :func:`job_ctx` builds a fresh one for a job,
   exactly as API.md section 1 describes.
+* :func:`sweep_orphans` terminates backend processes nobody uses any more (an adapter, a tool or ``llama-server`` whose
+  parent is gone: they keep VRAM) before a model is loaded: :func:`job_ctx` calls it first, :func:`short_ctx` before and after.
 * ``vndub.cli`` (typer, rich ...) costs ~1 s to import, so every pipeline import in this
   package is lazy; :func:`warm_up` imports them in a background thread after startup.
 """
@@ -87,6 +89,25 @@ def _sets_list(sets: dict[str, Any] | list[str] | None) -> list[str]:
     return [f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in sets.items()]
 
 
+def sweep_orphans(why: str = "orphan found before a model job") -> int:
+    """Terminate backend processes that nobody is using any more (an adapter or ``llama-server`` left by a crashed or killed run).
+
+    They keep their VRAM and file locks, and the model about to be loaded would share the card with them. Only processes
+    whose parent is gone and that are not ours are touched (``winproc.kill_orphans``: found by image path under the
+    environments / tools folders), so the adapters of a job that is running right now are safe. Never raises; returns the count.
+    """
+    try:
+        from vndub_app import installer, winproc
+
+        killed = winproc.kill_orphans(installer.process_roots(), reason=why)
+        if killed:
+            log.info("%s: terminated %d leftover process(es): %s", why, len(killed), winproc.describe(killed))
+        return len(killed)
+    except Exception as e:
+        log.warning("orphan sweep failed: %s", e)
+        return 0
+
+
 def job_ctx(
     h: appdirs.ProjectHandle,
     *,
@@ -96,9 +117,14 @@ def job_ctx(
     sets: dict[str, Any] | list[str] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> Any:
-    """Fresh pipeline context for a job (regenerates ``pipeline.yaml`` first). Caller closes ``ctx.models``."""
+    """Fresh pipeline context for a job (regenerates ``pipeline.yaml`` first). Caller closes ``ctx.models``.
+
+    Leftover backend processes are terminated first (:func:`sweep_orphans`), so a stale adapter or ``llama-server`` never
+    shares the GPU with the model this context is about to load.
+    """
     from vndub.cli import make_ctx
 
+    sweep_orphans()
     appdirs.write_project_config(h)
     return make_ctx(
         h.game_dir, h.config_file, force=force, only=",".join(only) if only else None, limit=limit,
@@ -134,6 +160,7 @@ def short_ctx(h: appdirs.ProjectHandle, **kw: Any) -> Iterator[Any]:
         yield ctx
     finally:
         ctx.models.close()
+        sweep_orphans("orphan left by a short model call")  # a tool an adapter started can outlive its adapter's graceful shutdown
 
 
 def work_paths(h: appdirs.ProjectHandle) -> Any:

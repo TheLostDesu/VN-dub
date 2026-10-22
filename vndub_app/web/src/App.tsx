@@ -6,6 +6,7 @@ import { ToastProvider } from "./components/ui";
 import { STEP_IDS, type StepId } from "./api/types";
 import { useI18n } from "./i18n";
 import { ProjectProvider, useProject } from "./state/project";
+import { useJobAttention } from "./state/attention";
 import { startProgress } from "./state/progress";
 import { SettingsProvider } from "./state/settings";
 import { stepPath } from "./state/wizard";
@@ -115,6 +116,12 @@ function Plain({ children }: { children: ReactNode }) {
   return <Page currentStep={null}>{children}</Page>;
 }
 
+/** Runs the "a job ended while the window was hidden" title signal (needs the language, so it sits inside the providers). */
+function Attention() {
+  useJobAttention();
+  return null;
+}
+
 export default function App() {
   useEffect(() => {
     startProgress();
@@ -122,6 +129,7 @@ export default function App() {
   return (
     <HashRouter>
       <SettingsProvider>
+        <Attention />
         <ToastProvider>
           <ProjectProvider>
             <Routes>

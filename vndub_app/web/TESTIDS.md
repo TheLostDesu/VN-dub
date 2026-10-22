@@ -49,6 +49,7 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 | `nav-home` | logo / back to the wizard |
 | `project-name` | current project name in the top bar |
 | `nav-wizard`, `nav-models`, `nav-settings`, `nav-help`, `nav-doctor` | top bar links |
+| `topbar-job` | chip with the active job (title, stage, percent); a button that opens the job's screen when it has one |
 | `stepper` | the step list; `step-<doctor|game|translate|casting|preview|run|review|install>` buttons (`aria-current=step` on the current one) |
 | `nav-back`, `nav-next` | step footer buttons (`nav-next` is `preview-approve` on Step 4); `nav-next-hint` explains a disabled Next |
 | `active-job-bar`, `active-job-show` | banner for a job running on another screen; "show" opens the page that has the job (wizard step, `/models`, `/tools`, `/#/step/doctor` for ffmpeg / Visual C++, `/settings` for the problem report); the bar is hidden on that page |
@@ -65,7 +66,7 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 | `manual-download-card`, `manual-copy-url`, `manual-open-data` | manual download card (unreachable download) |
 | `manual-target-dir`, `manual-copy-target`, `manual-open-target` | same card when the error carries `params.target_dir` ("put the file into this folder") |
 | `report-problem`, `report-button`, `report-done`, `report-open-folder` | "Собрать отчёт о проблеме" |
-| `job-progress` and variants `game-job`, `translate-job`, `preview-job`, `run-job`, `models-download-job`, `models-hf-job`, `models-check-job`, `tools-install-job`, `envs-install-job`, `install-apply-job`, `install-rollback-job`, `install-zip-job`, `review-apply-job`, `casting-gen-job-<sid>`, `casting-listen-job-<sid>` | job panel; inside: `job-title`, `job-stage`, `job-bar`, `job-overall`, `job-counter`, `job-eta`, `job-rate`, `job-item`, `job-stage-list`, `job-pause`, `job-resume`, `job-cancel`, `job-continue`, `job-log-toggle`, `job-log`, `job-control-error` |
+| `job-progress` and variants `game-job`, `translate-job`, `preview-job`, `run-job`, `models-download-job`, `models-hf-job`, `models-check-job`, `tools-install-job`, `envs-install-job`, `install-apply-job`, `install-rollback-job`, `install-zip-job`, `review-apply-job`, `casting-gen-job-<sid>`, `casting-listen-job-<sid>` | job panel; inside: `job-title`, `job-stage`, `job-bar`, `job-overall`, `job-counter`, `job-eta`, `job-rate`, `job-item`, `job-stage-list`, `job-pause`, `job-resume`, `job-cancel`, `job-continue`, `job-log-toggle`, `job-log`, `job-log-copy`, `job-control-error` (`job-stage` and `job-overall` are absent once a multi-stage job is `done`: one bar then) |
 | `files-progress`, `file-row-<id>` (`data-state`) | per-file rows of download / install jobs: bytes from `result.files[]`, environments show a state only. Download jobs (`models_download`, `tools_install`, `ffmpeg_download`) count megabytes, `envs_install` environments, `install_*` files; `job-rate` ("реплик в минуту") is only shown for line-based jobs |
 | `save-indicator` (`data-status`) | autosave state (`saving`, `saved`, `error`) |
 | players | `<base>` root with `<base>-play` (button), `<base>-volume` (range): `clip-<sid>-<neutral|emotional|longest>`, `sample-<sid>-<design_id>-<n>`, `review-original`, `candidate-player-<label>`, `library-player-<voice id>`, `listen-<sid>-<line_id>` (A/B: `-a`, `-b`, `-seq`), `preview-ab-<id>` (same suffixes) |
@@ -203,5 +204,5 @@ first visit. A page reload keeps only jobs that are still active on the server.
 `settings-title`, `settings-data`, `settings-data-dir`, `settings-open-data`, `settings-change-data`, `settings-data-path`,
 `settings-data-apply`, `settings-data-dialog`, `settings-data-confirm`, `settings-language`, `settings-lang` (select `ru`/`en`),
 `settings-gpu`, `settings-gpu-budget`, `settings-translation-llm` (card), `settings-translation-llm-select` (value `""` = default, a built-in `llm` backend name or `hf_<slug>`), `settings-license`, `settings-license-policy`, `settings-license-research`,
-`settings-license-commercial`, `settings-report`, `settings-open-logs`, `settings-version`;
+`settings-license-commercial`, `settings-report`, `settings-log` (the Log card: `settings-debug-log` checkbox, `settings-open-logs`), `settings-version`;
 `help-title`, `help-nav`, `help-doc-<id>`, `help-body`, `help-markdown`.

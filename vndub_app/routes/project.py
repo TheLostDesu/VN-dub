@@ -85,16 +85,22 @@ def list_projects() -> list[dict[str, Any]]:
 
 @router.post("/project/open")
 def open_project(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    created = False
     if body.get("slug"):
         h = appdirs.project_handle(str(body["slug"]))
     elif body.get("game_dir"):
         g = Path(str(body["game_dir"])).expanduser()
         if not g.is_dir():
             raise AppError("game_dir_invalid", params={"path": str(g)}, action="choose_game_dir", status=400)
+        created = appdirs.find_project_for_game(g) is None
         h = appdirs.create_project(g)
     else:
         raise AppError("bad_request", params={"field": "game_dir"}, status=422)
+    previous = session.current_slug()
     session.set_current(h.slug)
+    if previous and previous != h.slug:
+        log.info("project closed: %s", previous)
+    log.info("project %s: slug=%s game_dir=%s engine=%s", "created" if created else "opened", h.slug, h.game_dir, _engine_of(h) or "unknown")
     return project_info(h)
 
 

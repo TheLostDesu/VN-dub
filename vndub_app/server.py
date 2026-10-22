@@ -12,7 +12,9 @@ up in a background thread after startup), ``run(host, port)`` serves it with uvi
   (``GET /api/progress/sse`` carries the same events as Server-Sent Events: the fallback when uvicorn has no
   WebSocket library);
 * security: only loopback ``Host`` headers are served (DNS rebinding) and unsafe requests must not
-  carry a foreign ``Origin``.
+  carry a foreign ``Origin``;
+* logging: ``<data>/logs/app.log`` (``setup_logging``; INFO, or DEBUG with ``Settings.debug_log``). At DEBUG every HTTP
+  request (logger ``vndub_app.access``) and every WebSocket / SSE client is logged too.
 """
 
 from __future__ import annotations
@@ -35,10 +37,11 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
-from vndub_app import __version__, appdirs, errors, gpuinfo, jobs, session
+from vndub_app import __version__, appdirs, applog, errors, gpuinfo, jobs, session
 from vndub_app.errors import AppError
 
 log = logging.getLogger("vndub_app.server")
+access_log = logging.getLogger("vndub_app.access")  # one DEBUG line per HTTP request
 
 #: routers of task O (each module exposes ``router``)
 EXTERNAL_MODULES = ("vndub_app.doctor", "vndub_app.installer", "vndub_app.models_api", "vndub_app.hf_custom", "vndub_app.patch_install")
@@ -68,8 +71,22 @@ def ensure_std_streams() -> None:
             setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115
 
 
-def setup_logging(level: int = logging.INFO) -> Path:
-    """Rotating ``<data>/logs/app.log`` for the app, the pipeline loggers and uvicorn (idempotent)."""
+def configured_log_level() -> int:
+    """DEBUG when ``Settings.debug_log`` is on, else INFO."""
+    try:
+        return logging.DEBUG if appdirs.load_settings().debug_log else logging.INFO
+    except Exception:  # an unreadable settings file must not stop the logging
+        return logging.INFO
+
+
+def setup_logging(level: int | None = None) -> Path:
+    """Rotating ``<data>/logs/app.log`` for the app, the pipeline loggers and uvicorn (idempotent).
+
+    ``level`` defaults to :func:`configured_log_level` (``Settings.debug_log``). Calling it again with another level
+    changes the level of the handlers that are already there instead of adding new ones.
+    """
+    if level is None:
+        level = configured_log_level()
     path = appdirs.logs_dir() / "app.log"
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     for name in ("vndub_app", "vndub", "uvicorn.error"):
@@ -79,6 +96,7 @@ def setup_logging(level: int = logging.INFO) -> Path:
             if getattr(h, _FILE_HANDLER_MARK, False):
                 if Path(getattr(h, "baseFilename", "")) == path:
                     have = True
+                    h.setLevel(level)
                 else:
                     lg.removeHandler(h)
                     h.close()
@@ -88,8 +106,7 @@ def setup_logging(level: int = logging.INFO) -> Path:
             fh.setLevel(level)
             setattr(fh, _FILE_HANDLER_MARK, True)
             lg.addHandler(fh)
-        if lg.level == logging.NOTSET or lg.level > level:
-            lg.setLevel(level)
+        lg.setLevel(level)  # these loggers are ours (for uvicorn.error: uvicorn applies its own level before the lifespan starts)
     return path
 
 
@@ -128,8 +145,13 @@ def _origin_ok(origin: str | None) -> bool:
     return (host or "").lower() in ALLOWED_HOSTS
 
 
-def _forbidden() -> JSONResponse:
+def _forbidden(request: Request | None = None) -> JSONResponse:
     err = AppError("permission_denied", params={"path": "origin"}, status=403)
+    if request is not None:
+        log.warning(
+            "HTTP 403 %s %s -> permission_denied (host %r, origin %r refused)",
+            request.method, request.url.path, request.headers.get("host"), request.headers.get("origin"),
+        )
     return JSONResponse(status_code=403, content={"error": err.to_dict()})
 
 
@@ -187,6 +209,7 @@ def _spa_response(rel: str) -> Any:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     setup_logging()
+    applog.log_startup()
     jobs.runner()  # loads jobs.json: jobs that were active at the last exit come back as "interrupted"
     threading.Thread(target=session.warm_up, name="vndub-warmup", daemon=True).start()
     if importlib.util.find_spec("websockets") is None and importlib.util.find_spec("wsproto") is None:
@@ -197,7 +220,8 @@ async def _lifespan(app: FastAPI):
         r = jobs._RUNNER  # noqa: SLF001  (persist the last state; active jobs reload as interrupted)
         if r is not None:
             r._save(force=True)  # noqa: SLF001
-        close_logging()
+            r.flush_logs()
+        log.info("server stopped")  # the handlers stay open: shell.main (or a test teardown) closes them last
 
 
 def _sync_custom_models() -> None:
@@ -218,10 +242,15 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def _guard(request: Request, call_next):  # type: ignore[no-untyped-def]
         if not _host_ok(request.headers.get("host")):
-            return _forbidden()
+            return _forbidden(request)
         if request.method not in SAFE_METHODS and not _origin_ok(request.headers.get("origin")):
-            return _forbidden()
-        return await call_next(request)
+            return _forbidden(request)
+        if not access_log.isEnabledFor(logging.DEBUG):
+            return await call_next(request)
+        t0 = time.perf_counter()
+        response = await call_next(request)
+        access_log.debug("%s %s -> %s (%.0f ms)", request.method, request.url.path, response.status_code, (time.perf_counter() - t0) * 1000)
+        return response
 
     loaded = _include_routers(app)
     app.state.routers = loaded
@@ -229,9 +258,15 @@ def create_app() -> FastAPI:
     @app.websocket("/api/progress")
     async def progress(ws: WebSocket) -> None:
         if not _origin_ok(ws.headers.get("origin")) or not _host_ok(ws.headers.get("host")):
+            log.warning("WebSocket /api/progress refused (host %r, origin %r)", ws.headers.get("host"), ws.headers.get("origin"))
             await ws.close(code=1008)
             return
-        await _progress_loop(ws)
+        who = f"{ws.client.host}:{ws.client.port}" if ws.client else "?"
+        log.debug("WebSocket /api/progress: client %s connected", who)
+        try:
+            await _progress_loop(ws)
+        finally:
+            log.debug("WebSocket /api/progress: client %s disconnected", who)
 
     @app.get("/api/progress/sse", include_in_schema=False)
     async def progress_sse(request: Request) -> StreamingResponse:
@@ -338,11 +373,16 @@ def _sse(ev: dict[str, Any] | None) -> bytes:
 async def _progress_sse(request: Request) -> StreamingResponse:
     """Server-Sent Events twin of ``WS /api/progress`` for environments where uvicorn has no WebSocket library."""
     stop = asyncio.Event()
+    who = f"{request.client.host}:{request.client.port}" if request.client else "?"
 
     async def body() -> AsyncIterator[bytes]:
-        async with aclosing(_event_source(stop, keepalive_s=15.0)) as events:  # runs the unsubscribe on disconnect
-            async for ev in events:
-                yield _sse(ev)
+        log.debug("SSE /api/progress/sse: client %s connected", who)
+        try:
+            async with aclosing(_event_source(stop, keepalive_s=15.0)) as events:  # runs the unsubscribe on disconnect
+                async for ev in events:
+                    yield _sse(ev)
+        finally:
+            log.debug("SSE /api/progress/sse: client %s disconnected", who)
 
     return StreamingResponse(body(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 

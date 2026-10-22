@@ -65,7 +65,8 @@ export default function DoctorScreen() {
       else if (action === "add_defender_exclusion_help" && "command" in res) setDefender(res as DefenderHelp);
       // a page to open (driver, Visual C++ download): the backend never starts a browser itself
       else if ("url" in res && typeof res.url === "string") window.open(res.url, "_blank", "noopener,noreferrer");
-      else void load();
+      // a fix that finished on the spot ({ok: true}, e.g. kill_processes answers {ok, killed}): look at the machine again
+      else await load();
     } catch (e) {
       setError(toErrorInfo(e));
     } finally {

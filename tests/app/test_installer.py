@@ -14,7 +14,7 @@ import pytest
 import yaml
 from o_helpers import RangeServer, client_for, drop_runner, free_port, fresh_runner, make_env, sha, tool_entry, wait_job, write_manifest, zip_bytes
 
-from vndub_app import appdirs, doctor, downloads, installer
+from vndub_app import appdirs, doctor, downloads, installer, winproc
 from vndub_app.errors import AppError
 
 FAKE_EXE = b"MZ\x90\x00 fake rubberband " + bytes(range(256)) * 40
@@ -510,6 +510,60 @@ def test_env_install_failure_is_an_error_with_the_log(o_env: Path, tmp_path: Pat
     monkeypatch.setattr(installer, "run_stream", lambda cmd, ctx, **kw: (1, ["error: build failed for numpy"]))
     done = run_env_job(["main"], "cpu")
     assert done["error"]["code"] == "env_install_failed" and done["error"]["params"]["exit_code"] == 1 and "numpy" in done["error"]["details"]
+
+
+def env_process(env: Path, pid: int = 1234) -> winproc.ProcInfo:
+    exe = str(env / "Scripts" / "python.exe")
+    return winproc.ProcInfo(pid, 1, exe, "python.exe", env.name, "adapter", False, True, 77)
+
+
+def test_env_install_terminates_the_processes_of_the_environment_before_make_envs(o_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """uv cannot replace a venv whose interpreter is running ("file in use"): kill it first, and say so in the job log."""
+    monkeypatch.setattr(installer, "find_uv", lambda: Path("uv"))
+    events: list[str] = []
+    build = fake_make_envs(tmp_path)
+
+    def spy_build(*a: Any, **kw: Any) -> Any:
+        events.append("make_envs")
+        return build(*a, **kw)
+
+    monkeypatch.setattr(installer, "build_make_envs_command", spy_build)
+    main_env, new_env = installer.envs_dir() / "main", installer.envs_dir() / "funasr"
+    main_env.mkdir(parents=True)  # `funasr` does not exist yet (a first install): nothing can run from it
+    calls: list[tuple[list[Path], dict[str, Any]]] = []
+
+    def kill_all(roots: Any, **kw: Any) -> list[winproc.ProcInfo]:
+        calls.append((list(roots), kw))
+        events.append("kill")
+        return [env_process(main_env, 1234), env_process(main_env, 1300)]
+
+    monkeypatch.setattr(winproc, "kill_all_under", kill_all)
+    done = run_env_job(["main", "funasr"], "cpu")
+    assert done["state"] == "done", done.get("error")
+    assert events == ["kill", "make_envs"]
+    assert calls == [([main_env], {"with_descendants": True, "reason": "the environment is being reinstalled"})]  # only the folders that exist
+    log = "\n".join(done["log_tail"])
+    for pid in (1234, 1300):
+        assert f"terminated pid {pid} ({main_env / 'Scripts' / 'python.exe'}): the environment is being reinstalled" in log
+    assert str(new_env) not in log
+
+
+def test_env_install_of_new_environments_kills_nothing(o_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(installer, "find_uv", lambda: Path("uv"))
+    monkeypatch.setattr(installer, "build_make_envs_command", fake_make_envs(tmp_path))
+    monkeypatch.setattr(winproc, "kill_all_under", lambda *a, **kw: pytest.fail("no environment folder exists yet"))
+    assert run_env_job(["main"], "cpu")["state"] == "done"
+
+
+def test_free_folders_logs_one_line_per_process_and_returns_the_count(o_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    lines: list[str] = []
+    ctx = type("Ctx", (), {"log": staticmethod(lines.append)})()
+    folder = installer.envs_dir() / "rvc"
+    folder.mkdir(parents=True)
+    monkeypatch.setattr(winproc, "kill_all_under", lambda roots, **kw: [env_process(folder, 5)])
+    assert installer.free_folders([folder, folder.parent / "missing"], ctx, "the environment is being reinstalled") == 1  # type: ignore[arg-type]
+    assert lines == [f"terminated pid 5 ({folder / 'Scripts' / 'python.exe'}): the environment is being reinstalled"]
+    assert installer.free_folders([folder.parent / "missing"], ctx, "x") == 0  # type: ignore[arg-type]
 
 
 def test_env_install_needs_git_for_checkout_envs(o_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

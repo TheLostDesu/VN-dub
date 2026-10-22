@@ -169,7 +169,16 @@ function ModelsTab() {
 
       <Card testid="models-table-card">
         <div className="table-wrap">
-          <table className="data-table models-table" data-testid="models-table">
+          <table className="data-table is-fixed models-table" data-testid="models-table">
+            <colgroup>
+              <col className="col-select" />
+              <col className="col-name" />
+              <col className="col-num col-size" />
+              <col className="col-num col-vram" />
+              <col className="col-license" />
+              <col className="col-state" />
+              <col className="col-check" />
+            </colgroup>
             <thead>
               <tr>
                 <th scope="col">
@@ -260,12 +269,20 @@ function ModelRowView({ m, checked, onToggle, recommended, flash }: { m: ModelRo
       </td>
       <th scope="row">
         <span className="model-name">{name}</span>
-        {purpose ? <span className="hint block">{purpose}</span> : null}
-        {m.role ? <Chip>{tOr(`models.role.${m.role}`, m.role)}</Chip> : null}
-        {recommended ? (
-          <Chip tone="accent" testid={`model-recommended-${m.name}`}>
-            {t("models.chip.recommended")}
-          </Chip>
+        {purpose ? (
+          <span className="hint model-purpose" title={purpose}>
+            {purpose}
+          </span>
+        ) : null}
+        {m.role || recommended ? (
+          <span className="model-chips">
+            {m.role ? <Chip>{tOr(`models.role.${m.role}`, m.role)}</Chip> : null}
+            {recommended ? (
+              <Chip tone="accent" testid={`model-recommended-${m.name}`}>
+                {t("models.chip.recommended")}
+              </Chip>
+            ) : null}
+          </span>
         ) : null}
       </th>
       <td className="num">{fmtGb(m.size_gb)}</td>
@@ -345,7 +362,13 @@ function ToolsTab() {
       <Card testid="tools-card">
         <h2>{t("tools.list")}</h2>
         <div className="table-wrap">
-          <table className="data-table" data-testid="tools-table">
+          <table className="data-table is-fixed tools-table" data-testid="tools-table">
+            <colgroup>
+              <col className="col-name" />
+              <col className="col-for" />
+              <col className="col-num" />
+              <col className="col-state" />
+            </colgroup>
             <thead>
               <tr>
                 <th scope="col">{t("tools.col.name")}</th>
@@ -362,7 +385,9 @@ function ToolsTab() {
                   <th scope="row">
                     {tOr(`tools.${x.name}.name`, x.name)}
                     {x.version ? <span className="muted"> {x.version}</span> : null}
-                    <span className="hint block">{tOr(`tools.${x.name}.purpose`, "")}</span>
+                    <span className="hint block model-purpose" title={tOr(`tools.${x.name}.purpose`, "")}>
+                      {tOr(`tools.${x.name}.purpose`, "")}
+                    </span>
                   </th>
                   <td>{x.required_for.length ? x.required_for.join(", ") : t("tools.all_engines")}</td>
                   <td className="num">{x.size_mb ? fmtMb(x.size_mb) : ""}</td>

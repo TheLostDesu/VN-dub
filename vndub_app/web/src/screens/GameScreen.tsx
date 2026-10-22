@@ -133,8 +133,17 @@ export default function GameScreen() {
 
       {/* ---- choose a game ---------------------------------------------------------------- */}
       <Card testid="game-picker">
-        <div className="row-actions">
-          <Button variant={project ? "secondary" : "primary"} onClick={() => void pick()} busy={opening} disabled={importing} data-testid="game-pick-folder">
+        {/* label, then the field with all its buttons on one line; without the field: the two ways to choose a game */}
+        <div className="path-row">
+          {showPath ? (
+            <>
+              <TextField label={t("game.path_label")} value={path} onChange={setPath} placeholder={t("game.path_placeholder")} testid="game-path-input" onEnter={() => path.trim() && void openGame({ game_dir: path.trim() })} className="grow" />
+              <Button variant="primary" disabled={!path.trim() || importing} busy={opening} onClick={() => void openGame({ game_dir: path.trim() })} data-testid="game-path-open">
+                {t("game.open")}
+              </Button>
+            </>
+          ) : null}
+          <Button variant={project || showPath ? "secondary" : "primary"} onClick={() => void pick()} busy={opening && !showPath} disabled={importing} data-testid="game-pick-folder">
             {project ? t("game.pick_another") : t("game.pick_folder")}
           </Button>
           {!showPath ? (
@@ -143,14 +152,6 @@ export default function GameScreen() {
             </Button>
           ) : null}
         </div>
-        {showPath ? (
-          <div className="path-row">
-            <TextField label={t("game.path_label")} value={path} onChange={setPath} placeholder={t("game.path_placeholder")} testid="game-path-input" onEnter={() => path.trim() && void openGame({ game_dir: path.trim() })} className="grow" />
-            <Button variant="primary" disabled={!path.trim() || importing} busy={opening} onClick={() => void openGame({ game_dir: path.trim() })} data-testid="game-path-open">
-              {t("game.open")}
-            </Button>
-          </div>
-        ) : null}
         {pickError ? <ErrorPanel error={pickError} onRetry={() => void pick()} /> : null}
         {recent.filter((p) => p.slug !== project?.slug).length > 0 ? (
           <div className="recent" data-testid="game-recent">

@@ -584,28 +584,20 @@ export function Tabs<V extends string>({
 
 // ---- copy -----------------------------------------------------------------------------------
 
-export function CopyButton({ text, testid }: { text: string; testid?: string }) {
-  const t = useT();
-  const toast = useToast();
-  return (
-    <Button
-      small
-      onClick={() => {
-        const done = () => toast.show(t("common.copied"));
-        if (navigator.clipboard?.writeText) {
-          navigator.clipboard.writeText(text).then(done, () => legacyCopy(text, done));
-        } else {
-          legacyCopy(text, done);
-        }
-      }}
-      data-testid={testid}
-    >
-      {t("common.copy")}
-    </Button>
-  );
+/** Put text on the clipboard: the async API first, a hidden textarea when it is not allowed (no secure context, no permission). */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through to the textarea */
+  }
+  return legacyCopy(text);
 }
 
-function legacyCopy(text: string, done: () => void): void {
+function legacyCopy(text: string): boolean {
   const ta = document.createElement("textarea");
   ta.value = text;
   ta.style.position = "fixed";
@@ -613,11 +605,30 @@ function legacyCopy(text: string, done: () => void): void {
   document.body.appendChild(ta);
   ta.select();
   try {
-    document.execCommand("copy");
-    done();
+    return document.execCommand("copy");
+  } catch {
+    return false;
   } finally {
     document.body.removeChild(ta);
   }
+}
+
+export function CopyButton({ text, testid }: { text: string; testid?: string }) {
+  const t = useT();
+  const toast = useToast();
+  return (
+    <Button
+      small
+      onClick={() => {
+        void copyText(text).then((ok) => {
+          if (ok) toast.show(t("common.copied"));
+        });
+      }}
+      data-testid={testid}
+    >
+      {t("common.copy")}
+    </Button>
+  );
 }
 
 // ---- layout bits ----------------------------------------------------------------------------

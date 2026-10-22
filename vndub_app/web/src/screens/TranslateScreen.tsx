@@ -272,7 +272,6 @@ export default function TranslateScreen() {
           value={tr.address_default}
           onChange={(v) => updateTr({ address_default: v })}
           testid="translate-address"
-          inline
           options={[
             { value: "ты", label: t("translate.address.ty"), hint: t("translate.address.ty_hint"), testid: "address-ty" },
             { value: "вы", label: t("translate.address.vy"), hint: t("translate.address.vy_hint"), testid: "address-vy" },

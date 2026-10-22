@@ -11,7 +11,7 @@ from typing import Any, Iterator
 import pytest
 from o_helpers import RangeServer, client_for, drop_runner, fresh_runner, make_env, tool_entry, wait_job, write_manifest, zip_bytes
 
-from vndub_app import appdirs, doctor, installer, openers
+from vndub_app import appdirs, doctor, installer, openers, winproc
 
 GOOD_TOOLS = {"ffmpeg": {"present": True, "path": "C:/t/ffmpeg.exe", "required": True}, "ffprobe": {"present": True, "path": "C:/t/ffprobe.exe", "required": True}, "rubberband": {"present": False, "path": None, "required": False}}
 ALL_ENVS = {"needed": ["asr", "hf", "score"], "present": ["asr", "hf", "score"]}
@@ -37,6 +37,7 @@ def probes(**kw: Any) -> doctor.Probes:
         models=lambda: FULL_MODELS,
         data_dir=lambda: Path("C:/VNDub"),
         profile=lambda: "default",
+        processes=lambda: [],
         platform="win32",
     )
     base.update(kw)
@@ -318,6 +319,59 @@ def test_envs_and_models_rows(o_env: Path) -> None:
     assert rows(probes(models=lambda: part))["models"]["status"] == "yellow"
     m = rows(probes(models=lambda: zero))["models"]
     assert m["status"] == "red" and m["fix"]["action"] == "open_models"
+
+
+def orphan(pid: int, exe: str, name: str, env: str | None = "main", role: str = "adapter") -> winproc.ProcInfo:
+    return winproc.ProcInfo(pid, 1, exe, name, env, role, False, True, 5)
+
+
+def test_processes_row_is_green_without_orphans_and_yellow_with_names_and_a_fix(o_env: Path) -> None:
+    r = rows(probes())["processes"]
+    assert r["status"] == "green" and r["value"] == 0 and r["params"] == {"count": 0, "names": ""} and r["fix"] is None
+    found = [
+        orphan(11, r"C:\e\envs\main\Scripts\python.exe", "python.exe"),
+        orphan(12, r"C:\e\envs\hf\Scripts\python.exe", "python.exe", "hf"),
+        orphan(13, r"C:\e\tools\llama\llama-server.exe", "llama-server.exe", None, "llama_server"),
+    ]
+    y = rows(probes(processes=lambda: found))["processes"]
+    assert y["status"] == "yellow" and y["value"] == 3 and y["params"] == {"count": 3, "names": "python.exe x2, llama-server.exe"}
+    assert y["fix"] == {"action": "kill_processes", "label_key": "doctor.fix.kill_processes"}
+    assert "kill_processes" in doctor.FIX_ACTIONS and doctor.ROW_IDS[-1] == "processes"
+
+
+def test_orphans_make_the_summary_a_warning_and_a_failing_probe_is_not_an_error(o_env: Path) -> None:
+    rep = doctor.run_doctor(probes(processes=lambda: [orphan(11, r"C:\x\python.exe", "python.exe")]))
+    assert rep["summary"] == "warn" and [r["id"] for r in rep["rows"]] == list(doctor.ROW_IDS)
+
+    def broken() -> list[Any]:
+        raise OSError("snapshot refused")
+
+    r = rows(probes(processes=broken))["processes"]  # a probe that fails is "nothing found", never an HTTP 500
+    assert r["status"] == "green" and r["value"] == 0
+
+
+def test_the_real_processes_probe_only_reports_orphans_that_are_not_ours(o_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ours = winproc.ProcInfo(21, 1, "a", "python.exe", "main", "adapter", True, False)
+    ours_but_listed_as_orphan = winproc.ProcInfo(22, 1, "b", "python.exe", "main", "adapter", True, True)
+    left = winproc.ProcInfo(23, 9, "c", "llama-server.exe", None, "llama_server", False, True)
+    other_vndub = winproc.ProcInfo(24, 9, "d", "python.exe", "hf", "adapter", False, False)
+    seen: list[Any] = []
+    monkeypatch.setattr(winproc, "list_processes", lambda roots: seen.append(list(roots)) or [ours, ours_but_listed_as_orphan, left, other_vndub])
+    assert [p.pid for p in doctor.probe_processes()] == [23]
+    assert seen == [installer.process_roots()]
+
+
+def test_kill_processes_fix_terminates_the_orphans_synchronously(o_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[Any] = []
+    gone = [orphan(31, "x", "python.exe"), orphan(32, "y", "llama-server.exe", None, "llama_server")]
+    monkeypatch.setattr(winproc, "kill_orphans", lambda roots, **kw: calls.append((list(roots), kw)) or gone)
+    c = client_for(doctor)
+    r = c.post("/api/doctor/fix/kill_processes")
+    assert r.status_code == 200 and r.json() == {"ok": True, "killed": 2}  # no job: the answer is the result
+    assert calls[0][0] == installer.process_roots() and "Diagnostics" in calls[0][1]["reason"]
+    from vndub_app import jobs
+
+    assert jobs.runner().list() == []
 
 
 def test_mock_profile_does_not_ask_for_envs_or_models(o_env: Path) -> None:

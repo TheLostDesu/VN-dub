@@ -105,11 +105,8 @@ export default function PreviewScreen() {
                     {it.text_src}
                   </p>
                 </div>
-                {it.dub_url || it.original_url ? (
-                  <ABPlayer originalUrl={it.original_url} dubUrl={it.dub_url} kind="preview" testid={`preview-ab-${it.line_id}`} />
-                ) : (
-                  <p className="hint">{t("preview.no_audio")}</p>
-                )}
+                {/* both columns are always there: a missing recording shows an empty player of the same size */}
+                <ABPlayer originalUrl={it.original_url} dubUrl={it.dub_url} kind="preview" testid={`preview-ab-${it.line_id}`} />
               </li>
             ))}
           </ul>

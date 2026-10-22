@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import time
@@ -94,5 +95,6 @@ def test_progress_sse_fallback_carries_the_same_events(app_env: Path) -> None:
                 events.append(ev)
                 if ev["type"] == "job" and ev["job"]["id"] == job.id and ev["job"]["state"] == "done":
                     break
-        assert {"type": "log", "job_id": job.id, "line": "sse line"} in events
+        got = [e for e in events if e["type"] == "log" and e["job_id"] == job.id]
+        assert len(got) == 1 and re.fullmatch(r"\d\d:\d\d:\d\d sse line", got[0]["line"])
         assert events[-1]["job"]["result"] == {"x": 1}

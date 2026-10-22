@@ -15,7 +15,12 @@ export function GlossaryEditor({ value, onChange }: { value: Glossary; onChange:
       <h3>{t("glossary.characters")}</h3>
       <p className="hint">{t("glossary.characters_hint")}</p>
       <div className="table-wrap">
-        <table className="data-table" data-testid="glossary-characters">
+        <table className="data-table is-fixed is-form" data-testid="glossary-characters">
+          <colgroup>
+            <col className="col-gl-src" />
+            <col className="col-gl-tgt" />
+            <col className="col-gl-gender" />
+          </colgroup>
           <thead>
             <tr>
               <th scope="col">{t("glossary.src")}</th>
@@ -47,7 +52,13 @@ export function GlossaryEditor({ value, onChange }: { value: Glossary; onChange:
       <p className="hint">{t("glossary.terms_hint")}</p>
       {value.terms.length > 0 ? (
         <div className="table-wrap">
-          <table className="data-table" data-testid="glossary-terms">
+          <table className="data-table is-fixed is-form" data-testid="glossary-terms">
+            <colgroup>
+              <col className="col-gl-term" />
+              <col className="col-gl-term" />
+              <col className="col-gl-note" />
+              <col className="col-gl-remove" />
+            </colgroup>
             <thead>
               <tr>
                 <th scope="col">{t("glossary.src")}</th>

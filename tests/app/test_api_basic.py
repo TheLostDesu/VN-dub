@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -476,7 +477,7 @@ def test_progress_websocket_hello_and_events(client: Any) -> None:
         for _ in range(50):
             ev = ws.receive_json()
             if ev["type"] == "log" and ev["job_id"] == j2.id:
-                got_log = ev["line"] == "second line"
+                got_log = re.fullmatch(r"\d\d:\d\d:\d\d second line", ev["line"]) is not None
             if ev["type"] == "job" and ev["job"]["id"] == j2.id and ev["job"]["state"] == "done":
                 got_done = True
                 assert ev["job"]["result"] == {"x": 1}
@@ -532,3 +533,219 @@ def test_routers_of_other_tasks_are_optional(app_env: Path, monkeypatch: pytest.
     with TestClient(app) as c:
         assert c.get("/api/health").status_code == 200
     assert "vndub_app.does_not_exist" not in app.state.routers and "vndub_app.errors" not in app.state.routers
+
+
+# ----------------------------------------------------------------------------
+# logging: job log endpoint, debug_log, what app.log says about requests
+# ----------------------------------------------------------------------------
+
+
+def _marked_handlers(name: str) -> list[Any]:
+    import logging
+
+    from vndub_app import server
+
+    return [h for h in logging.getLogger(name).handlers if getattr(h, server._FILE_HANDLER_MARK, False)]  # noqa: SLF001
+
+
+def test_job_log_endpoint(client: Any, app_env: Path) -> None:
+    from vndub_app import jobs
+
+    jobs.reset_runner(jobs.JobRunner(None, None, log_dir=app_env / "logs" / "jobs"))
+
+    def fn(ctx: Any) -> dict[str, Any]:
+        ctx.log("alpha")
+        ctx.log("beta")
+        return {"x": 1}
+
+    job = jobs.runner().submit("report", fn, gpu=False, project="p")
+    jobs.runner().wait(job.id, 10)
+    info = client.get(f"/api/jobs/{job.id}").json()
+    assert info["log_path"] and Path(info["log_path"]).is_file() and Path(info["log_path"]).parent == app_env / "logs" / "jobs"
+    assert "log_path" in client.get("/api/jobs").json()[0]
+    r = client.get(f"/api/jobs/{job.id}/log")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"path", "lines"} and body["path"] == info["log_path"]
+    texts = [l[9:] for l in body["lines"]]
+    assert all(re.match(r"\d\d:\d\d:\d\d ", l) for l in body["lines"])
+    assert texts[0].startswith(f"=== job {job.id} kind=report project=p ") and re.fullmatch(r"=== done after \d+\.\ds", texts[-1])
+    assert texts[1:-1] == ["alpha", "beta"]
+    # the file is gone (pruned, cleaned): the in-memory tail answers, without a path
+    Path(info["log_path"]).unlink()
+    body = client.get(f"/api/jobs/{job.id}/log").json()
+    assert body["path"] is None and body["lines"] == info["log_tail"] and [l[9:] for l in body["lines"]] == ["alpha", "beta"]
+    assert_error(client.get("/api/jobs/zzz/log"), "job_not_found", 404)
+
+
+def test_job_log_endpoint_without_a_log_folder_returns_the_tail(client: Any) -> None:
+    from vndub_app import jobs
+
+    job = jobs.runner().submit("report", lambda ctx: ctx.log("only in memory"), gpu=False)
+    jobs.runner().wait(job.id, 10)
+    body = client.get(f"/api/jobs/{job.id}/log").json()
+    assert body["path"] is None and [l[9:] for l in body["lines"]] == ["only in memory"]
+    assert client.get(f"/api/jobs/{job.id}").json()["log_path"] is None
+
+
+def test_debug_log_toggles_the_log_level_at_once(client: Any, app_env: Path) -> None:
+    import logging
+
+    names = ("vndub_app", "vndub", "uvicorn.error")
+    s = client.get("/api/settings").json()
+    assert s["debug_log"] is False
+    for n in names:
+        hs = _marked_handlers(n)
+        assert len(hs) == 1 and hs[0].level == logging.INFO and logging.getLogger(n).level == logging.INFO
+    app_log = app_env / "logs" / "app.log"
+    client.get("/api/health")
+    assert "GET /api/health ->" not in app_log.read_text(encoding="utf-8")  # INFO stays quiet about requests
+
+    r = client.put("/api/settings", json={"debug_log": True})
+    assert r.status_code == 200 and r.json()["debug_log"] is True
+    assert json.loads((app_env / "settings.json").read_text(encoding="utf-8"))["debug_log"] is True
+    for n in names:  # the same handler, a new level: no second handler
+        hs = _marked_handlers(n)
+        assert len(hs) == 1 and hs[0].level == logging.DEBUG and logging.getLogger(n).level == logging.DEBUG
+    client.get("/api/health")
+    text = app_log.read_text(encoding="utf-8")
+    assert re.search(r"DEBUG\s+vndub_app\.access: GET /api/health -> 200 \(\d+ ms\)", text)
+
+    r = client.patch("/api/settings", json={"debug_log": False})  # PATCH is the same partial update
+    assert r.status_code == 200 and r.json()["debug_log"] is False
+    for n in names:
+        hs = _marked_handlers(n)
+        assert len(hs) == 1 and hs[0].level == logging.INFO and logging.getLogger(n).level == logging.INFO
+    n_before = app_log.read_text(encoding="utf-8").count("GET /api/health ->")
+    client.get("/api/health")
+    assert app_log.read_text(encoding="utf-8").count("GET /api/health ->") == n_before
+
+    for bad in ("yes", 1, None, "true"):
+        assert_error(client.put("/api/settings", json={"debug_log": bad}), "bad_request", 422)
+    assert client.get("/api/settings").json()["debug_log"] is False
+
+
+def test_debug_log_from_the_settings_file_applies_at_startup(app_env: Path) -> None:
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    from vndub_app.server import create_app
+
+    (app_env / "settings.json").write_text(json.dumps({"debug_log": True}), encoding="utf-8")
+    with TestClient(create_app()) as c:
+        assert c.get("/api/settings").json()["debug_log"] is True
+        assert [h.level for h in _marked_handlers("vndub_app")] == [logging.DEBUG]
+    for n in ("vndub_app", "vndub", "uvicorn.error"):  # do not leave DEBUG behind for the next test
+        logging.getLogger(n).setLevel(logging.INFO)
+
+
+def test_websocket_clients_are_logged_at_debug(client: Any, caplog: pytest.LogCaptureFixture) -> None:
+    import time
+
+    caplog.set_level("DEBUG", logger="vndub_app")
+    with client.websocket_connect("/api/progress") as ws:
+        assert ws.receive_json()["type"] == "hello"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not any("disconnected" in r.getMessage() for r in caplog.records):
+        time.sleep(0.05)
+    msgs = [r.getMessage() for r in caplog.records if r.name == "vndub_app.server"]
+    assert any(m.startswith("WebSocket /api/progress: client ") and m.endswith(" connected") for m in msgs)
+    assert any(m.startswith("WebSocket /api/progress: client ") and m.endswith(" disconnected") for m in msgs)
+
+
+def test_the_app_log_starts_with_a_banner(client: Any, app_env: Path) -> None:
+    from vndub_app import __version__
+
+    text = (app_env / "logs" / "app.log").read_text(encoding="utf-8")
+    line = next(l for l in text.splitlines() if "vndub_app.applog:" in l)
+    assert f"VNDub {__version__} starting" in line and "python " in line and "profile=apptest" in line
+    assert f"data={app_env}" in line and "envs=" in line and "models=" in line and "job_object=" in line
+
+
+def test_error_responses_are_logged_as_warnings(client: Any, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO", logger="vndub_app")
+    assert_error(client.get("/api/project"), "no_project", 404)
+    assert_error(client.post("/api/project/open", json={"game_dir": "Z:/definitely/not/here"}), "game_dir_invalid", 400)
+    assert_error(client.put("/api/settings", json={"ui_lang": "de"}), "bad_request", 422)
+    assert client.post("/api/health").status_code == 405  # a method no route owns
+    recs = [(r.levelno, r.getMessage()) for r in caplog.records if r.name == "vndub_app.errors"]
+    import logging
+
+    assert (logging.WARNING, "HTTP 404 GET /api/project -> no_project") in recs
+    assert any(lv == logging.WARNING and m.startswith("HTTP 400 POST /api/project/open -> game_dir_invalid (") and "definitely" in m for lv, m in recs)
+    assert any(lv == logging.WARNING and m.startswith("HTTP 422 PUT /api/settings -> bad_request (") for lv, m in recs)
+    assert any(lv == logging.WARNING and m.startswith("HTTP 405 POST /api/health") for lv, m in recs)
+    # a refused Host is a warning too
+    client.get("/api/health", headers={"host": "evil.example.com"})
+    assert any(r.levelno == logging.WARNING and r.getMessage().startswith("HTTP 403 GET /api/health -> permission_denied (host 'evil.example.com'") for r in caplog.records)
+
+
+def test_an_unexpected_exception_is_logged_as_an_error_with_its_traceback(client: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    import logging
+
+    from vndub_app import appdirs
+
+    def kaput() -> None:
+        raise RuntimeError("kaput")
+
+    monkeypatch.setattr(appdirs, "load_settings", kaput)
+    caplog.set_level("INFO", logger="vndub_app")
+    r = client.get("/api/health")
+    assert_error(r, "internal", 500)
+    rec = next(r for r in caplog.records if r.name == "vndub_app.errors")
+    assert rec.levelno == logging.ERROR and rec.getMessage().startswith("HTTP 500 GET /api/health -> internal (RuntimeError: kaput)")
+    assert rec.exc_info and rec.exc_info[0] is RuntimeError
+
+
+def test_settings_changes_are_logged_by_key(client: Any, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO", logger="vndub_app")
+    client.put("/api/settings", json={"ui_lang": "en", "gpu_budget_gb": 6, "player_volume": {"dub": 0.2}})
+    msgs = [r.getMessage() for r in caplog.records if r.name == "vndub_app.routes.general"]
+    assert msgs == ["settings changed: ui_lang: 'ru' -> 'en'; gpu_budget_gb: 7.5 -> 6.0"]  # the volume slider is not logged at INFO
+    caplog.clear()
+    client.put("/api/settings", json={"ui_lang": "en", "gpu_budget_gb": 6})  # nothing changed: nothing logged
+    client.put("/api/settings", json={"player_volume": {"dub": 0.5}})
+    assert [r for r in caplog.records if r.name == "vndub_app.routes.general"] == []
+    client.put("/api/settings", json={"shutdown_when_done": True})
+    assert [r.getMessage() for r in caplog.records if r.name == "vndub_app.routes.general"] == ["settings changed: shutdown_when_done: False -> True"]
+
+
+def test_data_dir_change_is_logged(client: Any, app_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO", logger="vndub_app")
+    monkeypatch.delenv("VNDUB_DATA")
+    new = tmp_path / "elsewhere" / "VNDub"
+    assert client.post("/api/settings/data-dir", json={"path": str(new)}).status_code == 200
+    assert any(r.getMessage().startswith("data folder changed: ") and f" -> {new.resolve()} " in r.getMessage() for r in caplog.records)
+    banner = (new.resolve() / "logs" / "app.log").read_text(encoding="utf-8")  # the new folder's log starts with its own banner
+    assert "starting" in banner and f"data={new.resolve()}" in banner
+
+
+def test_project_open_create_and_close_are_logged(client: Any, game_dir: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+    import shutil
+
+    caplog.set_level("INFO", logger="vndub_app")
+    assert client.post("/api/project/open", json={"game_dir": str(game_dir)}).status_code == 200
+    assert client.post("/api/project/open", json={"game_dir": str(game_dir)}).status_code == 200
+    other = tmp_path / "games" / "second"
+    shutil.copytree(game_dir, other)
+    assert client.post("/api/project/open", json={"game_dir": str(other)}).status_code == 200
+    assert client.post("/api/project/open", json={"slug": "renpy-mini"}).status_code == 200
+    msgs = [r.getMessage() for r in caplog.records if r.name == "vndub_app.routes.project" and r.levelno == logging.INFO]
+    assert msgs[0] == f"project created: slug=renpy-mini game_dir={game_dir.resolve()} engine=unknown"
+    assert msgs[1].startswith("project opened: slug=renpy-mini ")
+    assert msgs[2:4] == ["project closed: renpy-mini", f"project created: slug=second game_dir={other.resolve()} engine=unknown"]
+    assert msgs[4:] == ["project closed: second", f"project opened: slug=renpy-mini game_dir={game_dir.resolve()} engine=unknown"]
+
+
+def test_problem_report_carries_the_newest_five_job_logs(client: Any, project: dict[str, Any], app_env: Path) -> None:
+    jl = app_env / "logs" / "jobs"
+    jl.mkdir(parents=True)
+    for i in range(7):
+        (jl / f"20260101-00000{i}-stage-job{i}.log").write_text(f"log {i}", encoding="utf-8")
+    j = run_job(client, client.post("/api/system/report"))
+    zf = zipfile.ZipFile(Path(j["result"]["path"]))
+    got = sorted(n for n in zf.namelist() if n.startswith("logs/jobs/"))
+    assert got == [f"logs/jobs/20260101-00000{i}-stage-job{i}.log" for i in range(2, 7)]
+    assert zf.read(got[-1]).decode("utf-8") == "log 6"

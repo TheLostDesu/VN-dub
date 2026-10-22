@@ -106,13 +106,14 @@ export function HfModelCard({ onBuiltin, onAdded }: { onBuiltin: (name: string) 
           placeholder="https://huggingface.co/owner/model"
           testid="models-hf-url"
           className="grow"
-          hint={t("models.hf.url_hint")}
           onEnter={() => void inspect()}
         />
         <Button variant="primary" busy={inspecting} disabled={!url.trim() || add.busy} onClick={() => void inspect()} data-testid="models-hf-inspect">
           {t("models.hf.inspect")}
         </Button>
       </div>
+      {/* under the row, not inside the field: the button stays level with the input */}
+      <p className="hint">{t("models.hf.url_hint")}</p>
 
       {reco.length > 0 ? (
         <div className="hf-reco" data-testid="models-hf-recommended">

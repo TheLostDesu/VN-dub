@@ -14,9 +14,13 @@ Wire format (HTTP error body and ``JobInfo.error``)::
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 import traceback
 from typing import Any
+
+log = logging.getLogger("vndub_app.errors")
 
 # Buttons the UI can perform for an error (labels: i18n ``actions.<name>``).
 ACTIONS = (
@@ -100,22 +104,60 @@ def error_from_exception(e: BaseException, *, stage: str | None = None) -> AppEr
     return AppError("internal", params=params, action="report_problem", details=details, status=500)
 
 
+def _short(text: str | None, limit: int = 200) -> str:
+    """The first non-empty line of ``text``, cut to ``limit`` characters."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            return line if len(line) <= limit else line[: limit - 3] + "..."
+    return ""
+
+
+def log_http_error(method: str, path: str, err: AppError, exc: BaseException | None = None) -> None:
+    """One log line for an error response: ``HTTP 404 GET /api/project -> no_project (first line of details)``.
+
+    WARNING for a 4xx, ERROR for a 5xx. ``exc`` is the unexpected exception behind an error the app did not raise
+    itself: its traceback goes with the line. Details and parameters are cut to one short line (no query string, no body).
+    """
+    why = _short(err.details)
+    if not why and err.params:
+        try:
+            why = _short(json.dumps(err.params, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            why = ""
+    log.log(
+        logging.ERROR if err.status >= 500 else logging.WARNING,
+        "HTTP %s %s %s -> %s%s", err.status, method, path, err.code, f" ({why})" if why else "",
+        exc_info=(type(exc), exc, exc.__traceback__) if exc is not None else None,
+    )
+
+
 def install_handlers(app: Any) -> None:
-    """Register FastAPI exception handlers that emit the wire format above."""
+    """Register FastAPI exception handlers that emit the wire format above (and log every error response)."""
     from fastapi import Request
+    from fastapi.exception_handlers import http_exception_handler
     from fastapi.exceptions import RequestValidationError
     from fastapi.responses import JSONResponse
+    from starlette.exceptions import HTTPException as StarletteHTTPException
 
     @app.exception_handler(AppError)
-    async def _app_error(_: Request, exc: AppError) -> JSONResponse:
+    async def _app_error(request: Request, exc: AppError) -> JSONResponse:
+        log_http_error(request.method, request.url.path, exc)
         return JSONResponse(status_code=exc.status, content={"error": exc.to_dict()})
 
     @app.exception_handler(RequestValidationError)
-    async def _validation(_: Request, exc: RequestValidationError) -> JSONResponse:
+    async def _validation(request: Request, exc: RequestValidationError) -> JSONResponse:
         err = AppError("bad_request", action="none", details=str(exc.errors()), status=422)
+        log_http_error(request.method, request.url.path, err)
         return JSONResponse(status_code=422, content={"error": err.to_dict()})
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _http(request: Request, exc: StarletteHTTPException) -> Any:  # a bad method / path that no route owns
+        log.warning("HTTP %s %s %s -> %s", exc.status_code, request.method, request.url.path, _short(str(exc.detail)))
+        return await http_exception_handler(request, exc)
+
     @app.exception_handler(Exception)
-    async def _any(_: Request, exc: Exception) -> JSONResponse:
+    async def _any(request: Request, exc: Exception) -> JSONResponse:
         err = error_from_exception(exc)
+        log_http_error(request.method, request.url.path, err, exc)
         return JSONResponse(status_code=err.status, content={"error": err.to_dict()})

@@ -19,19 +19,24 @@
   from ``work/stage_status.json`` + its caches).
 * Every change is published to subscribers (the ``/api/progress`` WebSocket) as
   ``{"type": "job", "job": JobInfo}`` and ``{"type": "log", "job_id", "line"}``.
+* Logging: every job log line carries the local time (``HH:MM:SS text``); with a ``log_dir`` the runner also keeps one
+  buffered UTF-8 file per job (``<YYYYMMDD-HHMMSS>-<kind>-<id>.log``: header, every line, footer; the newest 30 are
+  kept) and writes job / stage / pause / cancel events to ``app.log`` through the ``vndub_app.jobs`` logger.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
+import re
 import subprocess
 import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 
 from vndub.util import now_iso
 
@@ -44,6 +49,34 @@ ACTIVE = frozenset({"queued", "running", "paused"})
 FINAL = frozenset({"done", "failed", "cancelled", "interrupted"})
 LOG_TAIL = 300
 EMIT_INTERVAL_S = 0.25
+JOB_LOG_KEEP = 30  # per-job log files kept in <data>/logs/jobs (the newest by name = by start time)
+JOB_LOG_FLUSH_S = 2.0  # the flusher thread writes buffered job log lines to disk at least this often
+JOB_LOG_READ_MAX = 5 * 1024 * 1024  # GET /api/jobs/{id}/log returns at most this much (newest lines)
+_PARAMS_LOG_MAX = 2000
+_SECRET_KEY_RE = re.compile(r"token|secret|passw|api_?key", re.IGNORECASE)
+
+
+def _stamp() -> str:
+    """Local wall-clock time ``HH:MM:SS`` that prefixes every job log line."""
+    return time.strftime("%H:%M:%S")
+
+
+def _first_line(text: str | None, limit: int = 200) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            line = line.strip()
+            return line if len(line) <= limit else line[: limit - 3] + "..."
+    return ""
+
+
+def _params_json(params: dict[str, Any]) -> str:
+    """Compact JSON of the job parameters for the log file header (secrets masked, long values cut)."""
+    safe = {k: ("***" if _SECRET_KEY_RE.search(str(k)) else v) for k, v in params.items()}
+    try:
+        text = json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        text = repr(safe)
+    return text if len(text) <= _PARAMS_LOG_MAX else text[: _PARAMS_LOG_MAX - 3] + "..."
 
 
 class JobCancelled(Exception):
@@ -193,6 +226,7 @@ class JobRecord:
     message_params: dict[str, Any] = field(default_factory=dict)
     error: dict[str, Any] | None = None
     result: dict[str, Any] = field(default_factory=dict)
+    log_path: str | None = None  # the per-job log file (set when the job starts running; None without a log folder)
     log_tail: list[str] = field(default_factory=list)
 
     def info(self, with_log: bool = False) -> dict[str, Any]:
@@ -200,6 +234,74 @@ class JobRecord:
         if not with_log:
             d.pop("log_tail", None)
         return d
+
+
+class _JobLogFile:
+    """The buffered UTF-8 log file of one job. Writing never raises: the first failure is warned about once, then ignored.
+
+    Lines go into the stdio buffer; :meth:`flush` (called by the runner's flusher thread every couple of seconds, and
+    before the file is read) puts them on disk, so a job that prints thousands of lines costs no per-line disk write.
+    """
+
+    def __init__(self, path: Path, job_id: str) -> None:
+        self.path = path
+        self.job_id = job_id
+        self._lock = threading.Lock()
+        self._f: TextIO | None = None
+        self._dirty = False
+        self._warned = False
+
+    def _failed(self, e: BaseException) -> None:
+        if not self._warned:
+            self._warned = True
+            log.warning("job %s: cannot write its log file %s: %s (the job goes on without it)", self.job_id, self.path, e)
+        f, self._f = self._f, None
+        if f is not None:
+            try:
+                f.close()
+            except (OSError, ValueError):
+                pass
+
+    def open(self) -> bool:
+        with self._lock:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._f = open(self.path, "w", encoding="utf-8", newline="\n")  # noqa: SIM115  (closed by close())
+            except OSError as e:
+                self._failed(e)
+                return False
+            return True
+
+    def write(self, line: str) -> None:
+        with self._lock:
+            if self._f is None:
+                return
+            try:
+                self._f.write(line + "\n")
+                self._dirty = True
+            except (OSError, ValueError) as e:
+                self._failed(e)
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._f is None or not self._dirty:
+                return
+            try:
+                self._f.flush()
+                self._dirty = False
+            except (OSError, ValueError) as e:
+                self._failed(e)
+
+    def close(self) -> None:
+        with self._lock:
+            f, self._f = self._f, None
+            if f is None:
+                return
+            try:
+                f.close()
+            except (OSError, ValueError) as e:
+                self._warned = True
+                log.warning("job %s: cannot finish its log file %s: %s", self.job_id, self.path, e)
 
 
 class JobContext:
@@ -212,6 +314,8 @@ class JobContext:
         self._pause.set()  # set = running
         self._cancel = threading.Event()
         self.eta = EtaEstimator()
+        self.t_queued = time.monotonic()
+        self.t_started: float | None = None  # set by the runner when the job starts running
         self._stage_t0: float | None = None
         self.n_items_hint: int = 0  # lines the job will process (for future-stage ETA)
         self._procs: list["subprocess.Popen[Any]"] = []
@@ -307,11 +411,25 @@ class JobContext:
         self._stage_t0 = time.monotonic()
         self.eta.reset(self._stage_t0)  # the time before the first report (loading a model) is the stage's too
         self.runner._update(self.job, stage=name, stage_index=idx, done=0, total=0, item=None, stage_eta_s=None, force=True)
+        count = self.job.stage_count or len(stages)
+        log.info("job %s stage %s begin (%d/%d)", self.job.id, name, idx, count)
+        self.runner._file_note(self.job, f"--- stage {name} begin ({idx}/{count})")
         self.checkpoint()
 
     def _finish_stage(self) -> None:
+        """The current stage ended normally: remember its throughput and log it."""
         if self.job.stage and self.eta.sec_per_item is not None and self.n_items_hint > 0 and self.job.total > 0:
             self.runner.throughput.record(self.job.stage, self.eta.sec_per_item * self.job.total / self.n_items_hint)
+        self._end_stage_log("done")
+
+    def _end_stage_log(self, outcome: str) -> None:
+        """Log the end of the current stage once (``done`` / ``failed`` / ``cancelled``), with its duration and item count."""
+        t0, self._stage_t0 = self._stage_t0, None
+        if t0 is None or not self.job.stage:
+            return
+        dt = time.monotonic() - t0
+        log.info("job %s stage %s %s in %.1fs (%d/%d)", self.job.id, self.job.stage, outcome, dt, self.job.done, self.job.total)
+        self.runner._file_note(self.job, f"--- stage {self.job.stage} {outcome} in {dt:.1f}s ({self.job.done}/{self.job.total})")
 
     def progress(self, done: int, total: int, item: str | None = None) -> None:
         stage_eta = self.eta.update(done, total)
@@ -357,9 +475,13 @@ class JobContext:
 
 
 class JobRunner:
-    def __init__(self, state_file: Path | None = None, throughput_file: Path | None = None) -> None:
+    def __init__(self, state_file: Path | None = None, throughput_file: Path | None = None, log_dir: Path | None = None) -> None:
         self.state_file = state_file
         self.throughput = ThroughputStore(throughput_file)
+        self.log_dir = log_dir  # per-job log files go here (None: no files, the tail in the record only)
+        self._files: dict[str, _JobLogFile] = {}
+        self._flush_stop = threading.Event()
+        self._flusher: threading.Thread | None = None
         self._lock = threading.RLock()
         self._jobs: dict[str, JobRecord] = {}
         self._ctx: dict[str, JobContext] = {}
@@ -430,8 +552,12 @@ class JobRunner:
 
     def _update(self, job: JobRecord, force: bool = False, **fields: Any) -> None:
         with self._lock:
+            old_state = job.state
             for k, v in fields.items():
                 setattr(job, k, v)
+            new_state = job.state
+        if new_state != old_state:
+            self._on_state(job, old_state, new_state)
         now = time.monotonic()
         if force or now - self._last_emit.get(job.id, 0.0) >= EMIT_INTERVAL_S:
             self._last_emit[job.id] = now
@@ -439,11 +565,117 @@ class JobRunner:
             self._save(force=force and job.state in FINAL)
 
     def _log(self, job: JobRecord, line: str) -> None:
+        """One job log line: ``HH:MM:SS text`` into the record's tail, the job's log file and the subscribers."""
+        line = f"{_stamp()} {line}"
         with self._lock:
             job.log_tail.append(line)
             if len(job.log_tail) > LOG_TAIL:
                 del job.log_tail[: len(job.log_tail) - LOG_TAIL]
+        f = self._files.get(job.id)  # the disk write happens outside the runner lock (the file has its own)
+        if f is not None:
+            f.write(line)
         self._emit({"type": "log", "job_id": job.id, "line": line})
+
+    # -- per-job log files -----------------------------------------------------
+    def _file_note(self, job: JobRecord, text: str) -> None:
+        """An event line (stage / pause / cancel) for the job's log file only: the UI log shows what the job itself printed."""
+        f = self._files.get(job.id)
+        if f is not None:
+            f.write(f"{_stamp()} {text}")
+
+    def _open_job_log(self, job: JobRecord) -> None:
+        if self.log_dir is None:
+            return
+        safe_kind = re.sub(r"[^\w.-]+", "_", job.kind) or "job"
+        path = self.log_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{safe_kind}-{job.id}.log"
+        f = _JobLogFile(path, job.id)
+        if not f.open():
+            return
+        with self._lock:
+            self._files[job.id] = f
+            job.log_path = str(path)
+            if self._flusher is None:
+                self._flusher = threading.Thread(target=self._flush_loop, name="vndub-job-log-flush", daemon=True)
+                self._flusher.start()
+        f.write(f"{_stamp()} === job {job.id} kind={job.kind} project={job.project or '-'} created={job.created} params={_params_json(job.params)}")
+        self._prune_job_logs()
+
+    def _prune_job_logs(self) -> None:
+        """Keep the newest ``JOB_LOG_KEEP`` files (names start with the start time, so name order is time order)."""
+        if self.log_dir is None:
+            return
+        try:
+            files = sorted(self.log_dir.glob("*.log"), key=lambda p: p.name)
+        except OSError:
+            return
+        with self._lock:
+            busy = {f.path for f in self._files.values()}
+        for p in files[: max(0, len(files) - JOB_LOG_KEEP)]:
+            if p in busy:
+                continue
+            try:
+                p.unlink()
+            except OSError:  # open in an editor, or already gone
+                pass
+
+    def _flush_loop(self) -> None:
+        while not self._flush_stop.wait(JOB_LOG_FLUSH_S):
+            self.flush_logs()
+
+    def flush_logs(self) -> None:
+        """Write the buffered lines of every running job's log file to disk (before the file is read or zipped)."""
+        with self._lock:
+            files = list(self._files.values())
+        for f in files:
+            f.flush()
+
+    def read_log(self, job_id: str) -> dict[str, Any]:
+        """``{"path", "lines"}``: the job's whole log file (newest ``JOB_LOG_READ_MAX`` bytes), else the in-memory tail."""
+        job = self.get(job_id)
+        f = self._files.get(job_id)
+        if f is not None:
+            f.flush()
+        if job.log_path:
+            path = Path(job.log_path)
+            try:
+                size = path.stat().st_size
+                with open(path, "rb") as fh:
+                    if size > JOB_LOG_READ_MAX:
+                        fh.seek(size - JOB_LOG_READ_MAX)
+                        data = fh.read().split(b"\n", 1)[-1]  # the first line is cut in half
+                    else:
+                        data = fh.read()
+                return {"path": str(path), "lines": data.decode("utf-8", "replace").splitlines()}
+            except OSError:
+                pass  # pruned, or the folder was cleaned: the tail is what is left
+        with self._lock:
+            return {"path": None, "lines": list(job.log_tail)}
+
+    def _on_state(self, job: JobRecord, old: str, new: str) -> None:
+        """A job changed state: open / close its log file and write the event to app.log."""
+        ctx = self._ctx.get(job.id)
+        if new == "running":
+            if ctx is not None and ctx.t_started is None:  # the first time: it left the queue
+                ctx.t_started = time.monotonic()
+                self._open_job_log(job)
+                log.info("job %s started: kind=%s (waited %.1fs in the queue)", job.id, job.kind, ctx.t_started - ctx.t_queued)
+            else:
+                self._file_note(job, "=== resumed")
+        elif new == "paused":
+            self._file_note(job, "=== paused")
+        elif new in FINAL:
+            self._on_final(job, ctx)
+
+    def _on_final(self, job: JobRecord, ctx: JobContext | None) -> None:
+        dur = time.monotonic() - ctx.t_started if ctx is not None and ctx.t_started is not None else 0.0
+        code = (job.error or {}).get("code")
+        why = _first_line((job.error or {}).get("details")) if job.error else ""
+        log.info("job %s %s: kind=%s duration=%.1fs%s%s", job.id, job.state, job.kind, dur, f" error={code}" if code else "", f" ({why})" if why else "")
+        with self._lock:
+            f = self._files.pop(job.id, None)
+        if f is not None:
+            f.write(f"{_stamp()} === {job.state} after {dur:.1f}s" + (f" error={code}" if code else ""))
+            f.close()
 
     # -- public API ----------------------------------------------------------
     def submit(
@@ -465,6 +697,7 @@ class JobRunner:
             self._ctx[job.id] = JobContext(self, job)
             self._fns[job.id] = fn
             self._done_events[job.id] = threading.Event()
+        log.info("job %s submitted: kind=%s project=%s gpu=%s params=%s", job.id, kind, project or "-", gpu, sorted(job.params))
         self._update(job, force=True)
         if gpu:
             self._gpu_q.put(job.id)
@@ -501,6 +734,8 @@ class JobRunner:
         job = self.get(job_id)
         ctx = self._ctx.get(job_id)
         if ctx and job.state in ("running", "queued"):
+            log.info("job %s: pause requested (%s)", job.id, job.state)
+            self._file_note(job, "=== pause requested")
             ctx._set_paused(True)
             if job.state == "queued":
                 self._update(job, state="paused", force=True)
@@ -510,6 +745,8 @@ class JobRunner:
         job = self.get(job_id)
         ctx = self._ctx.get(job_id)
         if ctx and job.state == "paused":
+            log.info("job %s: resume requested", job.id)
+            self._file_note(job, "=== resume requested")
             ctx._set_paused(False)
             if job.started is None:
                 self._update(job, state="queued", force=True)
@@ -519,6 +756,8 @@ class JobRunner:
         job = self.get(job_id)
         ctx = self._ctx.get(job_id)
         if ctx and job.state in ACTIVE:
+            log.info("job %s: cancel requested (%s)", job.id, job.state)
+            self._file_note(job, "=== cancel requested")
             self._update(job, cancel_requested=True, force=True)
             ctx._set_cancelled()
             if job.started is None:
@@ -544,6 +783,8 @@ class JobRunner:
         for j in self.list(active_only=True):
             self.cancel(j.id)
         self._gpu_q.put(None)
+        self._flush_stop.set()  # the files of jobs still winding down are closed by their own final state
+        self.flush_logs()
 
     # -- execution -----------------------------------------------------------
     def _gpu_worker(self) -> None:
@@ -574,11 +815,14 @@ class JobRunner:
                 job.result.update(res)
             self._update(job, state="done", finished=now_iso(), eta_s=0.0, stage_eta_s=0.0, force=True)
         except JobCancelled:
+            ctx._end_stage_log("cancelled")
             self._update(job, state="cancelled", finished=now_iso(), force=True)
         except Exception as e:
             if ctx.cancelled:  # Cancel killed what the job was waiting on: that error is the cancel, not a failure
+                ctx._end_stage_log("cancelled")
                 self._update(job, state="cancelled", finished=now_iso(), force=True)
                 return
+            ctx._end_stage_log("failed")
             from vndub_app.errors import error_from_exception
 
             err = error_from_exception(e, stage=job.stage)
@@ -602,7 +846,7 @@ def runner() -> JobRunner:
             from vndub_app import appdirs
 
             d = appdirs.data_dir()
-            _RUNNER = JobRunner(d / "jobs.json", d / "throughput_v2.json")
+            _RUNNER = JobRunner(d / "jobs.json", d / "throughput_v2.json", d / "logs" / "jobs")
         return _RUNNER
 
 
@@ -613,3 +857,10 @@ def reset_runner(r: JobRunner | None = None) -> None:
         if _RUNNER is not None and _RUNNER is not r:
             _RUNNER.shutdown()
         _RUNNER = r
+
+
+def flush_logs() -> None:
+    """Write the buffered per-job log lines of the process-wide runner to disk (the problem report calls this first)."""
+    r = _RUNNER
+    if r is not None:
+        r.flush_logs()

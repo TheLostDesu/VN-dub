@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -410,6 +411,7 @@ class ExitRecorder:
         self.calls: list[tuple[int, str]] = []
         self.fired = threading.Event()
         self.events = events
+        self.startups = 0  # how often main() ran the startup housekeeping (it would start a real reaper)
 
     def __call__(self, code: int) -> None:
         name = threading.current_thread().name
@@ -438,7 +440,15 @@ def main_env(o_env: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[ExitRecor
         events.append(f"watchdog_alive_at_cleanup:{any(t.is_alive() for t in _watchdogs())}")
         return real_stop_jobs(*a, **kw)
 
+    def spy_sweep() -> None:  # the real sweep would terminate the descendants of the pytest process itself
+        events.append("final_sweep")
+
+    def spy_startup() -> None:  # the real one terminates orphans and starts a reaper
+        rec.startups += 1
+
     monkeypatch.setattr(shell, "_hard_exit", rec)
+    monkeypatch.setattr(shell, "_final_sweep", spy_sweep)
+    monkeypatch.setattr(shell, "_startup_housekeeping", spy_startup)
     monkeypatch.setattr(shell, "stop_jobs", spy_stop_jobs)
 
     def fake_logging_shutdown(handlers: Any = None) -> None:
@@ -448,6 +458,7 @@ def main_env(o_env: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[ExitRecor
     monkeypatch.setattr(logging, "shutdown", fake_logging_shutdown)
     monkeypatch.setattr(winproc, "hide_child_consoles", lambda: (lambda: None))  # a global Popen patch / Job Object would outlive the test
     monkeypatch.setattr(winproc, "kill_children_on_exit", lambda: True)
+    monkeypatch.setattr(shell, "_ROOTS_SEEN", [])
     monkeypatch.setattr(webbuild, "ensure_built", lambda *a, **kw: {})  # never `npm run build` from a test
     yield rec
     for wd in _watchdogs():  # a leftover one would end the whole pytest run when it fires
@@ -465,7 +476,8 @@ def test_main_ends_the_process_directly_after_the_cleanup(main_env: ExitRecorder
         shell.main(["--browser", "--idle-exit", "1"])  # real server, real browser-mode loop; leaves when the "tab" is gone
     assert e.value.code == 0
     assert main_env.calls == [(0, "MainThread")]  # called directly and synchronously, not from a helper thread
-    assert main_env.events == ["stop_jobs", "watchdog_alive_at_cleanup:True", "logging.shutdown", "exit:MainThread"]
+    assert main_env.events == ["stop_jobs", "watchdog_alive_at_cleanup:True", "final_sweep", "logging.shutdown", "exit:MainThread"]  # swept before app.log is closed
+    assert main_env.startups == 1  # the startup housekeeping (orphans of an earlier run, the reaper) ran once, in the server thread
     assert not (o_env / "app.instance.json").exists()  # the instance lock was released before the exit
     (wd,) = _watchdogs()
     assert wd.daemon and wd.is_alive()  # armed (it is the safety net) and not fired
@@ -479,11 +491,17 @@ def test_main_without_hard_exit_returns_normally(main_env: ExitRecorder, monkeyp
     assert main_env.events[0] == "stop_jobs"
 
 
-def test_hard_exit_is_os_exit(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen: list[int] = []
-    monkeypatch.setattr(os, "_exit", seen.append)
+def test_hard_exit_sweeps_and_then_ends_the_process_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Job Object or not: the sweep comes first, the end is ``winproc.end_process`` (TerminateProcess), never a plain return."""
+    seen: list[Any] = []
+    monkeypatch.setattr(shell, "_final_sweep", lambda: seen.append("sweep"))
+    monkeypatch.setattr(winproc, "end_process", seen.append)
     shell._hard_exit(3)
-    assert seen == [3]
+    assert seen == ["sweep", 3]
+    monkeypatch.setattr(winproc, "job_object_status", lambda: {"installed": True, "error": None})  # the Job Object does not excuse the sweep
+    seen.clear()
+    shell._hard_exit(4)
+    assert seen == ["sweep", 4]
 
 
 def test_the_watchdog_forces_the_exit_when_the_cleanup_hangs(main_env: ExitRecorder, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -549,7 +567,7 @@ def test_a_window_that_cannot_start_falls_back_to_the_browser_and_exits_the_same
     monkeypatch.setattr(shell, "run_browser", lambda state, idle_exit_s, **kw: 0)
     with pytest.raises(_Exited) as e:
         shell.main([])
-    assert e.value.code == 0 and main_env.events == ["stop_jobs", "watchdog_alive_at_cleanup:True", "logging.shutdown", "exit:MainThread"]
+    assert e.value.code == 0 and main_env.events == ["stop_jobs", "watchdog_alive_at_cleanup:True", "final_sweep", "logging.shutdown", "exit:MainThread"]
 
 
 def test_a_failing_cleanup_step_does_not_skip_the_next_ones(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
@@ -704,7 +722,7 @@ def test_the_real_app_process_ends_at_once_and_takes_its_children_with_it(tmp_pa
     )
     env = {
         **os.environ, "VNDUB_DATA": str(tmp_path / "data"), "VNDUB_APP_PROFILE": "apptest", "VNDUB_NO_BROWSER": "1",
-        "VNDUB_NO_WEB_BUILD": "1", "VNDUB_NO_SHUTDOWN": "1", "LOCALAPPDATA": str(tmp_path / "local"), "APPDATA": str(tmp_path / "roaming"),
+        "VNDUB_NO_WEB_BUILD": "1", "VNDUB_NO_SHUTDOWN": "1", "VNDUB_ENVS_DIR": str(tmp_path / "envs"), "LOCALAPPDATA": str(tmp_path / "local"), "APPDATA": str(tmp_path / "roaming"),
     }
     p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     pid = 0
@@ -724,3 +742,320 @@ def test_the_real_app_process_ends_at_once_and_takes_its_children_with_it(tmp_pa
             p.kill()
         if pid and _pid_alive(pid):
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+
+
+# ---- nothing the app started may outlive it: the sweeps --------------------------------------------------------------------------
+
+
+def _fake_proc(pid: int, exe: str = r"C:\d\envs\main\Scripts\python.exe") -> winproc.ProcInfo:
+    return winproc.ProcInfo(pid, 1, exe, Path(exe).name, "main", "adapter", False, True, 3)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the sweeps are Windows only")
+def test_final_sweep_takes_the_children_then_the_orphans_and_logs_it(o_env: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """Job Object or not: the exit sweeps. Twice in a row (main's, then _hard_exit's) it only runs once."""
+    from vndub_app import installer
+
+    monkeypatch.setattr(shell, "_SWEPT_AT", None)
+    monkeypatch.setattr(shell, "_ROOTS_SEEN", [])
+    calls: list[Any] = []
+    monkeypatch.setattr(winproc, "kill_descendants", lambda *a: calls.append("descendants") or 2)
+    monkeypatch.setattr(winproc, "kill_orphans", lambda roots, reason="": calls.append(("orphans", list(roots), reason)) or [_fake_proc(7)])
+    monkeypatch.setattr(winproc, "job_object_status", lambda: {"installed": True, "error": None})  # the Job Object does not excuse it
+    caplog.set_level(logging.INFO, logger="vndub_app.shell")
+    shell._final_sweep()
+    shell._final_sweep()
+    assert calls == ["descendants", ("orphans", installer.process_roots(), "orphan at the end of the app")]
+    msg = next(r.getMessage() for r in caplog.records if "exit sweep" in r.getMessage())
+    assert "terminated 2 child process(es) and 1 orphan(s)" in msg and "pid 7" in msg
+    monkeypatch.setattr(shell, "_SWEPT_AT", time.monotonic() - shell.SWEEP_ONCE_S - 1)  # later it runs again (a watchdog after a stuck cleanup)
+    shell._final_sweep()
+    assert len(calls) == 4
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the sweeps are Windows only")
+def test_final_sweep_never_raises(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    monkeypatch.setattr(shell, "_SWEPT_AT", None)
+
+    def boom(*a: Any) -> int:
+        raise OSError("no snapshot")
+
+    monkeypatch.setattr(winproc, "kill_descendants", boom)
+    shell._final_sweep()
+    assert "exit sweep failed: no snapshot" in caplog.text
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the sweeps are Windows only")
+def test_startup_housekeeping_terminates_the_orphans_of_an_earlier_run_and_starts_the_reaper(o_env: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    from vndub_app import installer
+
+    monkeypatch.setattr(shell, "_ROOTS_SEEN", [])
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(winproc, "kill_orphans", lambda roots, reason="": seen.setdefault("orphans", (list(roots), reason)) and [_fake_proc(11), _fake_proc(12, r"C:\d\tools\llama\llama-server.exe")])
+    monkeypatch.setattr(winproc, "start_reaper", lambda roots, log_file: seen.setdefault("reaper", (list(roots), Path(log_file))) and {"pid": 4242, "breakaway": True, "error": None})
+    caplog.set_level(logging.INFO, logger="vndub_app.shell")
+    shell._startup_housekeeping()
+    roots = installer.process_roots()
+    assert seen["orphans"] == (roots, "orphan left by a previous run") and seen["reaper"] == (roots, appdirs.logs_dir() / "reaper.log")
+    text = caplog.text
+    assert "startup: terminated 2 orphan process(es) left by a previous run: pid 11" in text and "pid 12" in text and "llama-server.exe" in text
+    assert "reaper started (pid 4242)" in text
+    assert shell._current_roots() == roots  # the exit sweep knows the same folders
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the sweeps are Windows only")
+def test_startup_housekeeping_is_quiet_without_orphans_and_says_when_the_reaper_is_inside_the_job(o_env: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    monkeypatch.setattr(shell, "_ROOTS_SEEN", [])
+    monkeypatch.setattr(winproc, "kill_orphans", lambda roots, reason="": [])
+    monkeypatch.setattr(winproc, "start_reaper", lambda roots, log_file: {"pid": 9, "breakaway": False, "error": "breakaway from the job refused (denied); the reaper runs inside the app's job"})
+    caplog.set_level(logging.INFO, logger="vndub_app.shell")
+    shell._startup_housekeeping()
+    assert "orphan process" not in caplog.text  # nothing to report
+    warning = next(r for r in caplog.records if r.levelno == logging.WARNING)
+    assert "reaper started (pid 9)" in warning.getMessage() and "breakaway from the job refused" in warning.getMessage()
+    monkeypatch.setattr(winproc, "start_reaper", lambda roots, log_file: {"pid": None, "breakaway": False, "error": "OSError: no exe"})
+    caplog.clear()
+    shell._startup_housekeeping()
+    assert "reaper not started: OSError: no exe" in caplog.text
+
+
+def test_startup_housekeeping_never_raises(o_env: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise RuntimeError("process table unreadable")
+
+    monkeypatch.setattr(winproc, "kill_orphans", boom)
+    shell._startup_housekeeping()
+    if os.name == "nt":
+        assert "startup housekeeping failed: process table unreadable" in caplog.text
+
+
+def test_the_startup_hook_runs_in_the_server_thread_after_logging_and_before_the_app_exists(o_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vndub_app import server
+
+    events: list[str] = []
+    real_setup = server.setup_logging
+
+    def setup() -> Any:
+        events.append("setup_logging")
+        return real_setup()
+
+    def factory() -> Any:
+        events.append("create_app")
+        return tiny_app()
+
+    monkeypatch.setattr(server, "setup_logging", setup)
+    monkeypatch.setattr(shell, "_log_job_object_status", lambda: events.append("job_object_status"))
+    state = shell.start_server_async(0, app_factory=factory, startup=lambda: events.append("startup:" + threading.current_thread().name))
+    try:
+        assert shell.wait_for_health(state, 30.0) == state.url
+        assert events == ["setup_logging", "job_object_status", "startup:vndub-server-start", "create_app"]  # no job can run before the sweep
+    finally:
+        state.stop()
+
+    def failing_hook() -> None:
+        raise RuntimeError("sweep failed")
+
+    broken = shell.start_server_async(0, app_factory=tiny_app, startup=failing_hook)
+    try:
+        assert shell.wait_for_health(broken, 30.0) == broken.url  # a failing hook never stops the app from starting
+    finally:
+        broken.stop()
+
+
+def test_main_runs_the_startup_housekeeping_only_for_a_real_run(main_env: ExitRecorder, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shell, "run_browser", lambda state, idle_exit_s, **kw: 0)
+    started: list[Any] = []
+
+    def fake_start(*a: Any, **kw: Any) -> shell.ServerState:
+        started.append(kw.get("startup"))
+        return shell.ServerState()
+
+    monkeypatch.setattr(shell, "start_server_async", fake_start)
+    shell.main(["--browser"], hard_exit=False)
+    with pytest.raises(_Exited):
+        shell.main(["--browser"])
+    assert started[0] is None and started[1] is shell._startup_housekeeping  # `hard_exit=False` is the tests' / tools' way in: no reaper, no sweeping
+
+
+# ---- a window that breaks after it was shown -----------------------------------------------------------------------------------
+
+
+def test_a_window_that_breaks_after_it_was_shown_ends_the_app_instead_of_carrying_on_in_a_browser(main_env: ExitRecorder, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """pythonnet / WebView2 can raise while the window closes. The user sees the app gone, so it must not live on headless
+    (jobs, models and VRAM for the idle-exit minutes) behind a browser tab nobody asked for."""
+
+    def window(state: shell.ServerState, debug: bool = False) -> int:
+        state.window_shown = True  # boot() loaded the interface
+        raise RuntimeError("System.ObjectDisposedException while closing the form")
+
+    monkeypatch.setattr(shell, "start_server_async", lambda *a, **kw: shell.ServerState())
+    monkeypatch.setattr(shell, "run_window", window)
+    monkeypatch.setattr(shell, "run_browser", lambda *a, **kw: pytest.fail("no browser fallback for a window that was up"))
+    with pytest.raises(_Exited) as e:
+        shell.main([])
+    assert e.value.code == 1 and main_env.events[:1] == ["stop_jobs"]
+    assert "the window stopped unexpectedly" in caplog.text and "ObjectDisposedException" in caplog.text
+
+
+def test_boot_marks_the_window_as_shown_and_hooks_the_attention(monkeypatch: pytest.MonkeyPatch, o_env: Path) -> None:
+    """``run_window``'s boot thread: the interface is loaded, then ``install_attention`` subscribes (a failing hook must not break the boot)."""
+    shown: list[Any] = []
+
+    class Closed:
+        def __iadd__(self, fn: Any) -> "Closed":
+            return self
+
+    class Window:
+        events = types.SimpleNamespace(closed=Closed())
+
+        def load_url(self, url: str) -> None:
+            shown.append(url)
+
+        def load_html(self, html: str) -> None:
+            shown.append("html")
+
+    win = Window()
+    boots: list[Any] = []
+    fake_webview = types.SimpleNamespace(create_window=lambda *a, **kw: win, settings={}, start=lambda fn, **kw: boots.append(fn))
+    monkeypatch.setitem(sys.modules, "webview", fake_webview)
+    from vndub_app import system
+
+    monkeypatch.setattr(system, "set_window", lambda w: None)
+    monkeypatch.setattr(shell, "wait_for_health", lambda state, timeout=0: "http://127.0.0.1:1")
+    hooked: list[Any] = []
+
+    def failing_hook(w: Any, *a: Any, **kw: Any) -> None:
+        hooked.append(w)
+        raise RuntimeError("no runner")
+
+    monkeypatch.setattr(shell, "install_attention", failing_hook)
+    state = shell.ServerState()
+    shell.run_window(state)
+    assert len(boots) == 1
+    boots[0]()
+    assert shown == ["http://127.0.0.1:1"] and state.window_shown is True and hooked == [win]  # the failing hook did not stop anything
+
+
+# ---- the taskbar flash -----------------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def flashes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    flashed: list[int] = []
+    monkeypatch.setattr(winproc, "flash_window", lambda hwnd, *a, **kw: flashed.append(hwnd) or True)
+    return flashed
+
+
+def _wait_state(job_id: str, states: tuple[str, ...]) -> None:
+    t0 = time.monotonic()
+    while jobs.runner().get(job_id).state not in states and time.monotonic() - t0 < 10:
+        time.sleep(0.02)
+    time.sleep(0.15)  # the event of the final state is emitted just after the state changes
+
+
+def test_a_finished_job_flashes_the_taskbar_button_when_the_window_is_not_in_front(o_env: Path, monkeypatch: pytest.MonkeyPatch, flashes: list[int]) -> None:
+    monkeypatch.setattr(winproc, "is_foreground", lambda hwnd: False)
+    window = types.SimpleNamespace(native=types.SimpleNamespace(Handle=types.SimpleNamespace(ToInt64=lambda: 777)))  # a WinForms Form: Handle is a System.IntPtr
+    unsubscribe = shell.install_attention(window)
+
+    def failing(ctx: Any) -> None:
+        raise RuntimeError("model failed")
+
+    try:
+        ok = jobs.runner().submit("report", lambda ctx: None, gpu=False)
+        _wait_state(ok.id, ("done",))
+        assert flashes == [777]  # once, however many events the job emitted
+        bad = jobs.runner().submit("report", failing, gpu=False)
+        _wait_state(bad.id, ("failed",))
+        assert flashes == [777, 777]
+    finally:
+        unsubscribe()
+
+
+def test_nothing_flashes_while_the_window_is_in_front_or_for_other_states(o_env: Path, monkeypatch: pytest.MonkeyPatch, flashes: list[int]) -> None:
+    front = {"on": True}
+    monkeypatch.setattr(winproc, "is_foreground", lambda hwnd: front["on"])
+    window = types.SimpleNamespace(native=types.SimpleNamespace(Handle=555))
+    unsubscribe = shell.install_attention(window)
+    release = threading.Event()
+
+    def spin(ctx: Any) -> None:
+        while True:
+            ctx.checkpoint()
+            time.sleep(0.02)
+
+    try:
+        j = jobs.runner().submit("report", lambda ctx: None, gpu=False)
+        _wait_state(j.id, ("done",))
+        assert flashes == []  # the user is looking at the window
+        front["on"] = False
+        slow = jobs.runner().submit("report", lambda ctx: release.wait(10) and None, gpu=False)
+        time.sleep(0.3)  # queued / running events: no flash
+        assert flashes == []
+        cancelled = jobs.runner().submit("report", spin, gpu=False)
+        time.sleep(0.2)
+        jobs.runner().cancel(cancelled.id)  # cancelled: not a result to look at
+        _wait_state(cancelled.id, ("cancelled",))
+        assert jobs.runner().get(cancelled.id).state == "cancelled" and flashes == []
+        release.set()
+        _wait_state(slow.id, ("done",))
+        assert flashes == [555]  # only the job that really finished
+    finally:
+        release.set()
+        unsubscribe()
+
+
+def test_attention_finds_the_window_by_title_without_a_native_handle_and_survives_having_none(o_env: Path, monkeypatch: pytest.MonkeyPatch, flashes: list[int]) -> None:
+    monkeypatch.setattr(winproc, "is_foreground", lambda hwnd: False)
+    looked_for: list[str] = []
+    monkeypatch.setattr(winproc, "find_own_window", lambda title="VNDub": looked_for.append(title) or 4711)
+    unsubscribe = shell.install_attention(types.SimpleNamespace(native=None), title="VNDub")  # not the EdgeChromium backend
+    try:
+        _wait_state(jobs.runner().submit("report", lambda ctx: None, gpu=False).id, ("done",))
+        assert flashes == [4711] and looked_for == ["VNDub"]
+    finally:
+        unsubscribe()
+    monkeypatch.setattr(winproc, "find_own_window", lambda title="VNDub": None)  # no window at all: nothing happens, nothing raises
+    flashes.clear()
+    unsubscribe = shell.install_attention(object())
+    try:
+        _wait_state(jobs.runner().submit("report", lambda ctx: None, gpu=False).id, ("done",))
+        assert flashes == []
+    finally:
+        unsubscribe()
+
+
+def test_native_handle_accepts_an_intptr_or_an_int_and_nothing_else() -> None:
+    assert shell._native_handle(types.SimpleNamespace(native=types.SimpleNamespace(Handle=types.SimpleNamespace(ToInt64=lambda: 9)))) == 9
+    assert shell._native_handle(types.SimpleNamespace(native=types.SimpleNamespace(Handle=12))) == 12
+    assert shell._native_handle(types.SimpleNamespace(native=types.SimpleNamespace(Handle=0))) is None
+    assert shell._native_handle(types.SimpleNamespace()) is None and shell._native_handle(None) is None
+
+
+def test_cleanup_sweeps_between_the_jobs_and_the_server_stop_when_asked_to(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """Stopping the server closes app.log, so the sweep (and what it says) comes before that; a test run (sweep=False) never sweeps."""
+    order: list[str] = []
+
+    class State:
+        def stop(self) -> None:
+            order.append("server")
+
+    class Lock:
+        def release(self) -> None:
+            order.append("lock")
+
+    monkeypatch.setattr(shell, "stop_jobs", lambda *a, **kw: order.append("jobs") or [])
+    monkeypatch.setattr(shell, "_final_sweep", lambda: order.append("sweep"))
+    shell._cleanup_for_exit(State(), Lock())  # type: ignore[arg-type]
+    assert order == ["jobs", "server", "lock"]
+    order.clear()
+    shell._cleanup_for_exit(State(), Lock(), sweep=True)  # type: ignore[arg-type]
+    assert order == ["jobs", "sweep", "server", "lock"]
+
+    def boom() -> None:
+        raise OSError("sweep broke")
+
+    monkeypatch.setattr(shell, "_final_sweep", boom)
+    order.clear()
+    shell._cleanup_for_exit(State(), Lock(), sweep=True)  # type: ignore[arg-type]
+    assert order == ["jobs", "server", "lock"] and "terminating leftover processes failed: sweep broke" in caplog.text

@@ -3,11 +3,12 @@ r"""Diagnostics ("Doctor", wizard step 0): green / yellow / red rows with a fix 
 ``GET  /api/doctor``                   ``{summary, gpu, rows, torch, mock, profile, data_dir}``
 ``POST /api/doctor/fix/{action}``      ``download_ffmpeg`` (Job) | ``install_vcredist`` (Job) | ``open_data_dir``
                                       | ``open_driver_page`` | ``open_vcredist_page`` | ``add_defender_exclusion_help``
-                                      (``{ok, ...}``)
+                                      | ``kill_processes`` (the first two answer with a Job, ``kill_processes`` with
+                                      ``{ok, killed}`` at once, the others with ``{ok, ...}``)
 
 The router carries full ``/api/...`` paths; include it without a prefix.
 
-Rows (ids): ``gpu driver vram disk ffmpeg vcredist git internet defender envs models``. Each row is
+Rows (ids): ``gpu driver vram disk ffmpeg vcredist git internet defender envs models processes``. Each row is
 ``{id, status: green|yellow|red, value, params, fix: {action, label_key}|null}``; the UI shows
 ``doctor.<id>.title`` and ``doctor.<id>.<status>`` interpolated with ``params``. The backend sends
 no display text. ``fix.action`` is either one of the fix actions above (button label
@@ -28,6 +29,10 @@ Thresholds (also in docs/decisions/O.md):
   ``redist\vc_redist.x64.exe`` next to ``VNDub.exe`` (a job), or, without that file (a dev run), opens Microsoft's page.
 * Git: green when ``git`` is on PATH or bundled (``git\cmd\git.exe`` next to ``VNDub.exe``); yellow otherwise, naming the
   envs whose installation clones repositories.
+* Processes: yellow while orphans are running (``winproc`` ledger: a backend ``python.exe`` / ``llama-server`` / tool under the
+  environments or tools folders whose parent is gone; ``value`` and ``params.count`` = how many, ``params.names`` =
+  ``"python.exe x2, llama-server.exe"``), green otherwise. The fix ``kill_processes`` terminates them and returns
+  ``{ok: true, killed: n}``; the processes of a running job are not orphans and are never touched.
 
 Every probe is injectable (:class:`Probes`) so tests need neither a GPU nor a network. The Windows
 Defender row is a manual card: the app never changes security settings, it only shows the command.
@@ -78,8 +83,8 @@ VC_REG_KEY = r"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
 VC_MIN = (14, 40)  # binaries built with VS 2022 17.10+ (llama.cpp b11469, torch 2.8) need runtime 14.40+
 VC_DLLS = ("msvcp140.dll", "vcruntime140_1.dll")
 
-FIX_ACTIONS = ("download_ffmpeg", "install_vcredist", "open_data_dir", "open_driver_page", "open_vcredist_page", "add_defender_exclusion_help")
-ROW_IDS = ("gpu", "driver", "vram", "disk", "ffmpeg", "vcredist", "git", "internet", "defender", "envs", "models")
+FIX_ACTIONS = ("download_ffmpeg", "install_vcredist", "open_data_dir", "open_driver_page", "open_vcredist_page", "add_defender_exclusion_help", "kill_processes")
+ROW_IDS = ("gpu", "driver", "vram", "disk", "ffmpeg", "vcredist", "git", "internet", "defender", "envs", "models", "processes")
 
 
 # ----------------------------------------------------------------------------
@@ -197,6 +202,13 @@ def probe_models() -> dict[str, Any]:
 
 def probe_profile() -> str:
     return appdirs.load_settings().profile
+
+
+def probe_processes() -> list[Any]:
+    """Orphans: processes under the app's environments / tools folders that nobody who is still running started (``winproc.ProcInfo``)."""
+    from vndub_app import installer, winproc
+
+    return [i for i in winproc.list_processes(installer.process_roots()) if i.orphan and not i.ours]
 
 
 @dataclass
@@ -323,6 +335,7 @@ class Probes:
     models: Callable[[], dict[str, Any]] = probe_models
     data_dir: Callable[[], Path] = appdirs.data_dir
     profile: Callable[[], str] = probe_profile
+    processes: Callable[[], list[Any]] = probe_processes
     platform: str = sys.platform
     cache_internet: bool = False  # only the default probes cache the network check
 
@@ -493,6 +506,14 @@ def row_models(models: dict[str, Any], mock: bool) -> dict[str, Any]:
     return _row("models", "red", val, p, _fix("open_models"))
 
 
+def row_processes(procs: list[Any]) -> dict[str, Any]:
+    """Yellow while orphan backend processes run (they keep VRAM and file locks); the fix terminates them."""
+    from vndub_app import winproc
+
+    n = len(procs)
+    return _row("processes", "green" if n == 0 else "yellow", n, {"count": n, "names": winproc.summarize_names(procs)}, _fix("kill_processes") if n else None)
+
+
 def summarize(rows: list[dict[str, Any]]) -> str:
     """``fail`` if any row is red, else ``warn`` if any is yellow. The Defender row is a standing hint and does not count."""
     counted = [r for r in rows if r["id"] != "defender"]
@@ -535,8 +556,9 @@ def run_doctor(probes: Probes | None = None, *, refresh: bool = False) -> dict[s
         f_vc = pool.submit(_safe, probes.vcredist, None, "vcredist")
         f_vcb = pool.submit(_safe, probes.vcredist_bundled, False, "vcredist_bundled")
         f_git = pool.submit(_safe, probes.git, {"path": None, "source": None, "frozen": False, "envs": []}, "git")
+        f_procs = pool.submit(_safe, probes.processes, [], "processes")
         gpu, net, tools, envs, models, free = (f.result() for f in (f_gpu, f_net, f_tools, f_envs, f_models, f_disk))
-        vc, vc_bundled, git = (f.result() for f in (f_vc, f_vcb, f_git))
+        vc, vc_bundled, git, procs = (f.result() for f in (f_vc, f_vcb, f_git, f_procs))
     drive = os.path.splitdrive(str(data_dir))[0] or str(data_dir)
     rows = [
         row_gpu(gpu),
@@ -550,6 +572,7 @@ def run_doctor(probes: Probes | None = None, *, refresh: bool = False) -> dict[s
         row_defender(probes.platform, Path(data_dir)),
         row_envs(envs, mock),
         row_models(models, mock),
+        row_processes(procs),
     ]
     return {
         "summary": summarize(rows),
@@ -585,6 +608,11 @@ def apply_fix(action: str) -> dict[str, Any]:
         from vndub_app import installer
 
         return {"ok": True, "url": installer.VCREDIST_URL}
+    if action == "kill_processes":  # synchronous, no job: the orphans only (what the row counts)
+        from vndub_app import installer, winproc
+
+        killed = winproc.kill_orphans(installer.process_roots(), reason="terminated from Diagnostics")
+        return {"ok": True, "killed": len(killed)}
     if action == "add_defender_exclusion_help":
         return {
             "ok": True,

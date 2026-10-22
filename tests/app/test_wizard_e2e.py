@@ -29,6 +29,42 @@ FAIL_SHOT = Path(os.environ.get("VNDUB_E2E_FAIL_SHOT", REPO / "tests" / "app" / 
 
 S = 1000  # ms
 
+# Layout audit, run on every screen of the walk: the checks behind "the UI is even". It returns a list of problems
+# (empty = fine): a page or a table that is wider than the window / its card, a card whose content sticks out of it, and
+# buttons that share a row (of a button row, the step footer, a path field) but not a height.
+AUDIT_JS = """() => {
+  const out = [];
+  const label = (el) => el.dataset.testid || (typeof el.className === 'string' && el.className) || el.tagName.toLowerCase();
+  const shown = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
+  const root = document.documentElement;
+  if (root.scrollWidth > window.innerWidth + 1) out.push('the page scrolls sideways: ' + root.scrollWidth + ' > ' + window.innerWidth);
+  for (const wrap of document.querySelectorAll('.table-wrap')) {
+    if (shown(wrap) && wrap.scrollWidth > wrap.clientWidth + 1) out.push('table wider than its card: ' + label(wrap.firstElementChild || wrap));
+  }
+  for (const card of document.querySelectorAll('.card')) {
+    const box = card.getBoundingClientRect();
+    for (const el of card.querySelectorAll('*')) {
+      if (!shown(el) || el.closest('.sr-only, .table-wrap, .log-viewer, .progress, [hidden]')) continue;
+      const r = el.getBoundingClientRect();
+      if (r.right > box.right + 1 || r.left < box.left - 1) { out.push('sticks out of its card (' + label(card) + '): ' + label(el)); break; }
+    }
+  }
+  const rows = '.row-actions, .job-controls, .step-footer-right, .error-actions, .dialog-actions, .path-row';
+  for (const row of document.querySelectorAll(rows)) {
+    const items = [...row.querySelectorAll(':scope > .btn, :scope > input, :scope > select, :scope > .field > input, :scope > .field > select')].filter(shown);
+    const lines = new Map();
+    for (const el of items) {
+      const r = el.getBoundingClientRect();
+      const key = Math.round(r.top / 8);
+      lines.set(key, [...(lines.get(key) || []), r.height]);
+    }
+    for (const heights of lines.values()) {
+      if (heights.length > 1 && Math.max(...heights) - Math.min(...heights) > 1) out.push('controls of different heights in ' + label(row) + ': ' + heights.map((h) => Math.round(h)).join(', '));
+    }
+  }
+  return out;
+}"""
+
 
 def _sha(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -64,16 +100,23 @@ def test_wizard_walk(server: Any, game_dir: Path) -> None:
             browser = p.chromium.launch()
         except Exception as e:  # browser binaries missing
             pytest.skip(f"Playwright Chromium not available: {e}")
-        page = browser.new_page(viewport=VIEWPORT, locale="ru-RU")
+        # the log viewer copies to the clipboard: let the page do that and read it back
+        context = browser.new_context(viewport=VIEWPORT, locale="ru-RU", permissions=["clipboard-read", "clipboard-write"])
+        page = context.new_page()
         page_errors: list[str] = []
         page.on("pageerror", lambda e: page_errors.append(str(e)))
 
         def tid(name: str) -> Any:
             return page.get_by_test_id(name)
 
+        layout_problems: list[str] = []
+
         def shot(name: str, full: bool = False) -> None:
+            if full:
+                page.evaluate("window.scrollTo(0, 0)")  # a full-page shot of a page that was scrolled would draw the sticky bar mid-page
             page.wait_for_timeout(400)  # let animations / waveforms settle
             page.screenshot(path=str(SHOTS / f"{name}.png"), full_page=full)
+            layout_problems.extend(f"{name}: {p}" for p in page.evaluate(AUDIT_JS))
 
         try:
             _walk(page, tid, shot, expect, server, game_dir)
@@ -83,6 +126,7 @@ def test_wizard_walk(server: Any, game_dir: Path) -> None:
         browser.close()
 
     assert not page_errors, f"uncaught errors in the page: {page_errors}"
+    assert not layout_problems, "uneven layout:\n  " + "\n  ".join(layout_problems)
     # the patch really replaced the original voice file, and a backup of it exists
     assert _sha(voice) != orig_hash
     backups = list((Path(server_data_dir()) / "backups").rglob("sak_0001.ogg"))
@@ -110,8 +154,13 @@ def _walk(page: Any, tid: Any, shot: Any, expect: Any, server: Any, game_dir: Pa
         # Step 2 -- translation (mock translator) + settings
         expect(tid("screen-translate")).to_be_visible(timeout=30 * S)
         shot("02-translate", full=True)
+        # a job that ends while the window is hidden puts its result in the page title, until the window is shown again
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, get: () => true})")
         tid("translate-run-button").click()
         expect(tid("translate-done-chip")).to_be_visible(timeout=300 * S)
+        expect(page).to_have_title("[готово] VNDub")
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, get: () => false}); document.dispatchEvent(new Event('visibilitychange'))")
+        expect(page).to_have_title("VNDub")
         tid("nav-next").click()
 
         # Step 3 -- casting: automatic, then open one tuning panel
@@ -145,8 +194,14 @@ def _walk(page: Any, tid: Any, shot: Any, expect: Any, server: Any, game_dir: Pa
         # Step 5 -- full run (starts by itself after the preview approval)
         expect(tid("screen-run")).to_be_visible(timeout=30 * S)
         expect(tid("run-job")).to_be_visible(timeout=60 * S)
+        expect(tid("topbar-job")).to_be_visible()  # the running job, as a chip in the top bar (opens this page)
         page.wait_for_timeout(3 * S)
         shot("05-run")
+        tid("job-log-toggle").click()  # the log viewer: a copy button next to the log
+        expect(tid("job-log")).to_be_visible()
+        tid("job-log-copy").click()
+        expect(tid("job-log-copy")).to_have_text("Скопировано")
+        tid("job-log-toggle").click()
         expect(tid("run-done")).to_be_visible(timeout=900 * S)
         shot("05-run-done")
         tid("run-to-review").click()
@@ -186,7 +241,7 @@ def _walk(page: Any, tid: Any, shot: Any, expect: Any, server: Any, game_dir: Pa
         shot("08-models")
         page.goto(server.url + "/#/settings")
         expect(tid("settings-title")).to_be_visible(timeout=30 * S)
-        shot("09-settings")
+        shot("09-settings", full=True)
         page.goto(server.url + "/#/help")
         expect(tid("help-body")).to_be_visible(timeout=30 * S)
         shot("10-help")

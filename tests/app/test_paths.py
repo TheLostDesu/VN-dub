@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterator
 import pytest
 from o_helpers import client_for, drop_runner, fresh_runner, make_env, wait_job
 
-from vndub_app import appdirs, installer, jobs
+from vndub_app import appdirs, installer, jobs, winproc
 from vndub_app.routes import general
 
 PATH_KEYS = {"data", "models", "envs", "tools", "python", "uv_cache"}
@@ -268,6 +268,47 @@ def test_pytools_venv_is_made_from_the_concrete_interpreter(p_env: Path, monkeyp
     done, out = run_job(lambda ctx: installer.ensure_pytools(ctx))
     assert done["state"] == "done", done.get("error")
     assert seen == [["uv", "venv", str(installer.pytools_dir()), "--python", str(base)]]
+
+
+def test_a_broken_tools_environment_is_rebuilt_after_its_processes_are_terminated(p_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    base = p_env.parent / "py" / EXE_NAME
+    venv = installer.pytools_dir()
+    stale = installer._venv_python(venv)
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"MZ")  # a venv without pyvenv.cfg: not usable, rebuilt
+    events: list[str] = []
+
+    def kill_all(roots: Any, **kw: Any) -> list[winproc.ProcInfo]:
+        events.append(f"kill {[str(r) for r in roots]} {kw['reason']} exists={venv.exists()}")
+        return [winproc.ProcInfo(4321, 1, str(stale), "python.exe", None, "tool", False, True, 9)]
+
+    def fake_stream(cmd: list[str], ctx: Any, **kw: Any) -> tuple[int, list[str]]:
+        events.append("uv venv")
+        py = installer._venv_python(Path(cmd[2]))
+        py.parent.mkdir(parents=True, exist_ok=True)
+        py.write_bytes(b"MZ")
+        (Path(cmd[2]) / "pyvenv.cfg").write_text("home = x\n", encoding="utf-8")
+        return 0, []
+
+    monkeypatch.setattr(installer, "find_uv", lambda: Path("uv"))
+    monkeypatch.setattr(installer, "ensure_python", lambda version, ctx: base)
+    monkeypatch.setattr(installer, "run_stream", fake_stream)
+    monkeypatch.setattr(installer, "ensure_utf8_output", lambda py: None)
+    monkeypatch.setattr(winproc, "kill_all_under", kill_all)
+    done, _ = run_job(lambda ctx: installer.ensure_pytools(ctx))
+    assert done["state"] == "done", done.get("error")
+    assert events == [f"kill {[str(venv)]} the tools environment is being rebuilt exists=True", "uv venv"]  # killed while the folder was still there
+    assert f"terminated pid 4321 ({stale}): the tools environment is being rebuilt" in "\n".join(done["log_tail"])
+    events.clear()
+    done, _ = run_job(lambda ctx: installer.ensure_pytools(ctx))  # a working venv is left alone
+    assert done["state"] == "done" and events == []
+
+
+def test_process_roots_are_the_envs_and_the_tools_folder_and_in_the_packaged_app_the_bundled_helpers(p_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert installer.process_roots() == [installer.envs_dir(), appdirs.tools_dir()]  # the envs folder first: it is the ledger's "env" root
+    assert Path(installer.uv_dirs()["UV_PYTHON_INSTALL_DIR"]).is_relative_to(installer.process_roots()[0])  # uv's Pythons (the real interpreters behind the launchers) are covered
+    monkeypatch.setattr(installer, "app_dir", lambda: tmp_path / "app")
+    assert installer.process_roots() == [installer.envs_dir(), appdirs.tools_dir(), tmp_path / "app" / "bin", tmp_path / "app" / "git"]
 
 
 def test_make_envs_command_gets_the_interpreter(p_env: Path) -> None:

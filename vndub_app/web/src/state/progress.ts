@@ -39,8 +39,27 @@ function getSnapshot(): ProgressState {
   return state;
 }
 
+// Jobs this UI session has seen queued / running / paused. When one of them reaches a final state the listeners hear
+// about it once (a job that was already over when the page learned about it is not "tracked": nobody waited for it).
+const watched = new Set<string>();
+const finalListeners = new Set<(job: JobInfo) => void>();
+
+function noteJob(job: JobInfo): void {
+  if (ACTIVE_STATES.includes(job.state)) watched.add(job.id);
+  else if (FINAL_STATES.includes(job.state) && watched.delete(job.id)) finalListeners.forEach((l) => l(job));
+}
+
+/** Call `cb` once for every tracked job that ends (any final state). Returns the unsubscribe function. */
+export function onJobFinal(cb: (job: JobInfo) => void): () => void {
+  finalListeners.add(cb);
+  return () => {
+    finalListeners.delete(cb);
+  };
+}
+
 export function ingestJob(job: JobInfo): void {
   emit({ ...state, jobs: { ...state.jobs, [job.id]: job }, seen: { ...state.seen, [job.id]: Date.now() } });
+  noteJob(job);
 }
 
 function ingestLog(jobId: string, line: string): void {
@@ -65,6 +84,7 @@ function handleEvent(ev: ProgressEvent): void {
         seen[j.id] = now;
       }
       emit({ ...state, jobs, seen });
+      ev.jobs.forEach(noteJob);
       void reconcile(new Set(ev.jobs.map((j) => j.id)));
       break;
     }

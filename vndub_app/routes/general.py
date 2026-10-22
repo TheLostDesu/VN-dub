@@ -10,7 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Body
 from fastapi.responses import FileResponse
 
-from vndub_app import __version__, appdirs, installer, jobs, pipeline, session, system
+from vndub_app import __version__, appdirs, applog, installer, jobs, pipeline, session, system
 from vndub_app.errors import AppError
 
 log = logging.getLogger("vndub_app.routes.general")
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/api")
 
 MEDIA_TYPES = {".wav": "audio/wav", ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".flac": "audio/flac", ".opus": "audio/ogg", ".m4a": "audio/mp4", ".weba": "audio/webm"}
 
-SETTINGS_KEYS = {"ui_lang", "gpu_budget_gb", "license_policy", "models_dir", "envs_dir", "player_volume", "shutdown_when_done", "profile", "translation_llm"}
+SETTINGS_KEYS = {"ui_lang", "gpu_budget_gb", "license_policy", "models_dir", "envs_dir", "player_volume", "shutdown_when_done", "profile", "translation_llm", "debug_log"}
 
 
 def _bad(field: str, value: Any = None) -> AppError:
@@ -120,12 +120,30 @@ def get_settings() -> dict[str, Any]:
     return _settings_out()
 
 
+def _log_settings_change(before: dict[str, Any], after: dict[str, Any], keys: list[str]) -> None:
+    """One INFO line with the settings that really changed (``key: old -> new``); the volume slider only at DEBUG."""
+    changes = []
+    for k in keys:
+        if k not in SETTINGS_KEYS or before.get(k) == after.get(k):
+            continue
+        if k == "player_volume":
+            log.debug("settings changed: player_volume")  # a slider drag sends dozens of these
+        elif isinstance(after.get(k), (dict, list)):
+            changes.append(k)
+        else:
+            changes.append(f"{k}: {before.get(k)!r} -> {after.get(k)!r}")
+    if changes:
+        log.info("settings changed: %s", "; ".join(changes))
+
+
 @router.put("/settings")
+@router.patch("/settings")
 def put_settings(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     unknown = set(body) - SETTINGS_KEYS - {"data_dir", "last_project"}
     if unknown:
         raise _bad("settings", sorted(unknown))
     s = appdirs.load_settings()
+    before = s.model_dump(mode="json")
     if "ui_lang" in body:
         if body["ui_lang"] not in ("ru", "en"):
             raise _bad("ui_lang", body["ui_lang"])
@@ -161,7 +179,16 @@ def put_settings(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         s.profile = body["profile"]
     if "translation_llm" in body:
         s.translation_llm = _check_translation_llm(body["translation_llm"])
+    if "debug_log" in body:
+        if not isinstance(body["debug_log"], bool):
+            raise _bad("debug_log", body["debug_log"])
+        s.debug_log = body["debug_log"]
     appdirs.save_settings(s)
+    if "debug_log" in body:  # the file handlers follow at once, no restart
+        from vndub_app import server
+
+        server.setup_logging(logging.DEBUG if s.debug_log else logging.INFO)
+    _log_settings_change(before, s.model_dump(mode="json"), list(body))
     if "envs_dir" in body:  # the pipeline in this process and the installer's child processes follow at once
         installer.configure_environment(force=True)
     slug = session.current_slug()
@@ -181,10 +208,12 @@ def set_data_dir(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     active = jobs.runner().list(active_only=True)
     if active:
         raise AppError("job_busy", params={"job_id": active[-1].id, "kind": active[-1].kind}, status=409)
+    old_dir = appdirs.data_dir()
     try:
         appdirs.set_data_dir(Path(raw))
     except OSError as e:
         raise AppError("permission_denied", params={"path": raw}, action="open_data_dir", details=str(e)) from e
+    log.info("data folder changed: %s -> %s (nothing is moved; the app log continues in the new folder)", old_dir, appdirs.data_dir())
     jobs.reset_runner(None)  # the next runner() binds to the new folder
     session.reset()
     if os.environ.get("VNDUB_ENVS_DIR"):  # already decided for the old folder: <data>/envs follows the data folder, unless Settings or an outside variable say otherwise
@@ -192,6 +221,7 @@ def set_data_dir(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     from vndub_app import server
 
     server.setup_logging()
+    applog.log_startup()  # the new app.log gets its own banner
     server._sync_custom_models()  # noqa: SLF001  (the custom models list lives in the data folder)
     return _settings_out()
 

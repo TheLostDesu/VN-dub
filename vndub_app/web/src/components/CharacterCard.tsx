@@ -310,7 +310,7 @@ export function CharacterCard({ c, expanded, onToggle, onChanged, allNames, refr
                 </Button>
                 {!c.chosen ? <span className="hint">{t("casting.listen_need_choice")}</span> : null}
                 {c.chosen ? (
-                  <Button small variant="ghost" onClick={() => { setVoiceName(name); setSaveVoiceOpen(true); }} data-testid={`casting-save-voice-${sid}`}>
+                  <Button variant="ghost" onClick={() => { setVoiceName(name); setSaveVoiceOpen(true); }} data-testid={`casting-save-voice-${sid}`}>
                     {t("casting.library.save")}
                   </Button>
                 ) : null}

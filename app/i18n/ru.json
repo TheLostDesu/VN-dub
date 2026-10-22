@@ -1238,5 +1238,16 @@
   "settings.paths.changed": "Папка изменена.",
   "errors.python_junction_blocked.title": "Windows не пустила программу в служебную папку-ссылку Python: {path}.",
   "errors.python_junction_blocked.hint": "Удалите эту папку-ссылку в Проводнике (сами файлы Python лежат в соседней папке с полным номером версии и останутся) и нажмите «Повторить».",
-  "installer.msg.python": "Скачиваю Python {version} (делается один раз)…"
+  "installer.msg.python": "Скачиваю Python {version} (делается один раз)…",
+  "app.title_done": "[готово] VNDub",
+  "app.title_failed": "[ошибка] VNDub",
+  "doctor.processes.title": "Фоновые процессы моделей",
+  "doctor.processes.green": "Фоновых процессов нет.",
+  "doctor.processes.yellow": "Осталось процессов от прошлых запусков: {count} ({names}). Они могут держать видеопамять.",
+  "doctor.processes.red": "Не удалось проверить фоновые процессы.",
+  "doctor.fix.kill_processes": "Завершить",
+  "settings.log.title": "Журнал",
+  "settings.log.debug": "Подробный журнал (для диагностики)",
+  "settings.log.debug_hint": "В журнал попадает больше подробностей. Включайте, только если что-то не работает: так журнал растёт быстрее.",
+  "settings.log.where": "Журнал лежит в папке данных, в подпапке logs, и входит в отчёт о проблеме."
 }

@@ -11,16 +11,22 @@
 * closing the window stops the job runner (an active job is stopped cleanly - adapter processes, install
   scripts and ``llama-server`` are closed - and recorded as ``interrupted`` so the next start offers to continue)
   within one shared deadline (``JOBS_STOP_TIMEOUT_S``) however many jobs were active, then the process ends
-  itself with a direct ``os._exit`` (see :func:`main`): pythonnet / WebView2 threads can keep a normally returning
-  process alive for good, and while ``VNDub.exe`` lives every child it started lives too. A watchdog thread
-  (``EXIT_WATCHDOG_S``), started before the cleanup, forces the same exit if the cleanup itself hangs;
+  itself without finalization (:func:`_hard_exit`, ``TerminateProcess`` on itself, see :func:`main`): pythonnet / WebView2 threads
+  can keep a normally returning process alive for good, and while ``VNDub.exe`` lives every child it started lives too. A watchdog
+  thread (``EXIT_WATCHDOG_S``), started before the cleanup, forces the same exit if the cleanup itself hangs;
 * if pywebview cannot start (no WebView2, no GUI) the app logs it and falls back to the default
   browser; in browser mode the process ends when the tab is closed (no open connection, no active job,
   idle for ``--idle-exit`` seconds) because there is no window to close;
 * one instance per data folder: a second start opens the running instance in the browser and exits
   (``VNDUB_NO_BROWSER=1`` never opens a browser: tests, headless runs);
 * console programs started by the pipeline (ffmpeg, nvidia-smi ...) get ``CREATE_NO_WINDOW``, and processes the app starts die with it
-  (Windows Job Object, ``vndub_app.winproc``; whether it could be installed is written to ``app.log`` at start);
+  (Windows Job Object, ``vndub_app.winproc``; whether it could be installed is written to ``app.log`` at start). The Job Object
+  is only one of four layers that keep adapters and ``llama-server`` from outliving the app (they hold the GPU):
+  at start the orphans of an earlier run are terminated (process ledger by image path, ``winproc.kill_orphans``) and a
+  *reaper* is started (``VNDub.exe --reaper``: a ~20 MB helper (stdlib only: no server, no GUI) that waits for this process to end, however it ends, and
+  sweeps once more; it logs to ``<data>/logs/reaper.log``); at the end of the app :func:`_final_sweep` terminates the
+  descendants and the orphans before :func:`_hard_exit` ends the process; ``session.job_ctx`` sweeps again before every model job;
+* when a job ends while the window is not in front, its taskbar button flashes (:func:`install_attention`);
 * hidden ``--selfcheck [--selfcheck-out FILE]``: starts the server on a throw-away data folder, checks
   ``/api/health`` and the bundled resources/imports, prints one JSON line and exits 0 (ok) / 1 (verifies
   the packaged exe; a windowed exe has no console, so the line is also written to ``FILE``).
@@ -42,8 +48,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
 import webbrowser
 import zlib
 from pathlib import Path
@@ -77,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--idle-exit", type=float, default=IDLE_EXIT_DEFAULT_S, help=argparse.SUPPRESS)
     p.add_argument("--no-idle-exit", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--reaper", action="store_true", help=argparse.SUPPRESS)  # the helper process: main() hands it to winproc.reaper_main before parsing
     return p
 
 
@@ -347,6 +352,7 @@ class ServerState:
         self.url: str | None = None
         self.error: BaseException | None = None
         self.tracker = ActivityTracker()
+        self.window_shown = False  # the SPA was loaded into the window: a later crash of the window is not "no GUI available"
 
     def stop(self) -> None:
         if self.server is not None:
@@ -372,8 +378,13 @@ def start_server_async(
     app_factory: Callable[[], Any] | None = None,
     tracker: ActivityTracker | None = None,
     on_started: Callable[[str], None] | None = None,
+    startup: Callable[[], None] | None = None,
 ) -> ServerState:
-    """Import and start the API server in a thread so the window is not blocked by the import."""
+    """Import and start the API server in a thread so the window is not blocked by the import.
+
+    ``startup`` runs in that thread once logging exists and before the server accepts requests (``main`` passes
+    :func:`_startup_housekeeping`): no job can start before the leftovers of an earlier run are gone.
+    """
     state = ServerState()
     if tracker is not None:
         state.tracker = tracker
@@ -385,6 +396,11 @@ def start_server_async(
             installer.configure_environment()
             server.setup_logging()
             _log_job_object_status()  # the Job Object is installed before there is a log to write to
+            if startup is not None:
+                try:
+                    startup()
+                except Exception as e:  # housekeeping is never a reason not to start
+                    log.warning("startup housekeeping failed: %s", e)
             app = (app_factory or server.create_app)()
             srv = None
             for attempt in range(3):  # the chosen port may be taken between the check and the bind
@@ -411,12 +427,16 @@ def start_server_async(
 
 
 def http_get_json(url: str, timeout: float = 5.0) -> Any:
+    import urllib.request  # not at the top: the reaper process starts through this module and has no use for http / ssl
+
     with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}), timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
 def wait_for_health(state: ServerState, timeout: float = HEALTH_TIMEOUT_S) -> str | None:
     """Wait until the server answers ``/api/health``; returns the base URL or ``None`` (``state.error`` says why)."""
+    import urllib.error
+
     deadline = time.monotonic() + timeout
     if not state.ready.wait(timeout):
         return None
@@ -469,25 +489,118 @@ def stop_jobs(timeout: float = JOBS_STOP_TIMEOUT_S) -> list[str]:
 
 
 # ----------------------------------------------------------------------------
+# processes that must not outlive the app
+# ----------------------------------------------------------------------------
+
+_ROOTS_SEEN: list[Path] = []  # the folders swept so far in this run: the envs folder may be changed in Settings meanwhile
+_ROOTS_LOCK = threading.Lock()
+
+
+def _remember_roots(roots: list[Path]) -> list[Path]:
+    with _ROOTS_LOCK:
+        for r in roots:
+            if r not in _ROOTS_SEEN:
+                _ROOTS_SEEN.append(r)
+        return list(_ROOTS_SEEN)
+
+
+def _current_roots() -> list[Path]:
+    """Folders to sweep now: the installer's current ones (it is loaded once the server has started) plus the earlier ones."""
+    mod = sys.modules.get("vndub_app.installer")
+    if mod is not None:
+        try:
+            return _remember_roots(mod.process_roots())
+        except Exception as e:
+            log.debug("process_roots failed: %s", e)
+    with _ROOTS_LOCK:
+        return list(_ROOTS_SEEN)
+
+
+def _startup_housekeeping() -> None:
+    """Terminate what an earlier run left behind and start the reaper (server-start thread, after ``setup_logging``). Never raises.
+
+    The orphans are found by image path (``winproc.kill_orphans``): a ``python.exe`` of an environment or a ``llama-server``
+    whose parent is gone keeps its VRAM and its file locks, and the new run would load its models next to it.
+    """
+    if os.name != "nt":
+        return
+    try:
+        from vndub_app import appdirs, installer, winproc
+
+        roots = installer.process_roots()
+        _remember_roots(roots)
+        t0 = time.perf_counter()
+        killed = winproc.kill_orphans(roots, reason="orphan left by a previous run")
+        took = (time.perf_counter() - t0) * 1000
+        if killed:
+            log.info("startup: terminated %d orphan process(es) left by a previous run: %s", len(killed), winproc.describe(killed))
+        else:
+            log.debug("startup: no orphan processes under %s (%.0f ms)", ", ".join(str(r) for r in roots), took)
+        r = winproc.start_reaper(roots, appdirs.logs_dir() / "reaper.log")
+        if r["pid"] and r["breakaway"]:
+            log.info("reaper started (pid %s): it outlives the app and sweeps once more when the app ends", r["pid"])
+        elif r["pid"]:
+            log.warning("reaper started (pid %s) but %s", r["pid"], r["error"] or "it runs inside the app's Job Object and ends together with the app")
+        else:
+            log.warning("reaper not started: %s", r["error"])
+    except Exception as e:
+        log.warning("startup housekeeping failed: %s", e)
+
+
+_SWEPT_AT: float | None = None
+SWEEP_ONCE_S = 5.0  # a second _final_sweep within this time (main's, then _hard_exit's) is skipped
+
+
+def _log_nonblocking(level: int, msg: str, *args: Any) -> None:
+    """Log from a helper thread and wait at most 2 s: at the very end the logging lock may be held by the stuck cleanup."""
+    t = threading.Thread(target=log.log, args=(level, msg, *args), daemon=True)
+    t.start()
+    t.join(2.0)
+
+
+def _final_sweep() -> None:
+    """The last act before the process ends, Job Object or not (the Job Object stays the net for a crash): terminate the
+    descendants of this process, then every orphan under the app's folders. Never raises; skipped when it just ran."""
+    global _SWEPT_AT
+    if os.name != "nt":
+        return
+    now = time.monotonic()
+    if _SWEPT_AT is not None and now - _SWEPT_AT < SWEEP_ONCE_S:
+        return
+    _SWEPT_AT = now
+    try:
+        from vndub_app import winproc
+
+        t0 = time.perf_counter()
+        children = winproc.kill_descendants()
+        orphans = winproc.kill_orphans(_current_roots(), reason="orphan at the end of the app")
+        _log_nonblocking(
+            logging.INFO, "exit sweep: terminated %d child process(es) and %d orphan(s) in %.0f ms%s",
+            children, len(orphans), (time.perf_counter() - t0) * 1000, (": " + winproc.describe(orphans)) if orphans else "",
+        )
+    except Exception as e:
+        _log_nonblocking(logging.WARNING, "exit sweep failed: %s", e)
+
+
+# ----------------------------------------------------------------------------
 # ending the process
 # ----------------------------------------------------------------------------
 
 
 def _hard_exit(code: int) -> None:
-    """End the process now, without interpreter finalization (tests replace this or ``os._exit``).
+    """End the process now, without interpreter finalization (tests replace this).
 
     Returning from ``main`` and ``sys.exit`` run finalization, which waits for non-daemon threads and for pythonnet's
     CLR shutdown; a WebView2 / .NET thread that never ends keeps the process (and so its Job Object handle and every
-    child) alive. ``os._exit`` skips all of that: the OS then closes the handles and the Job Object kills the children.
-    Without a Job Object (it could not be installed, which app.log says) the descendants are terminated here instead.
+    child) alive. ``winproc.end_process`` skips all of that, including the DLL detach step that ``os._exit`` still goes
+    through. Before it, :func:`_final_sweep` makes sure nothing the app started is left, Job Object or not: the Job Object
+    only covers a process that really ends and only when it could be installed, and it cannot reach an orphan whose
+    parent died earlier.
     """
     from vndub_app import winproc
 
-    if os.name == "nt" and not winproc.job_object_status()["installed"]:
-        n = winproc.kill_descendants()
-        if n:
-            log.info("no Job Object: terminated %d child process(es) before the exit", n)
-    os._exit(code)
+    _final_sweep()
+    winproc.end_process(code)
 
 
 class ExitWatchdog(threading.Thread):
@@ -496,7 +609,7 @@ class ExitWatchdog(threading.Thread):
     It is started at the *beginning* of the cleanup, while the interpreter is fully alive: a daemon thread that is only
     created at the very end can no longer run Python code once finalization has begun, which is how the old
     "sleep, then ``os._exit``" thread silently never fired. :meth:`disarm` exists for tests (the real app never
-    outlives the watchdog: the direct ``os._exit`` after the cleanup ends the process and the thread with it).
+    outlives the watchdog: the direct exit (``winproc.end_process``) after the cleanup ends the process and the thread with it).
     """
 
     def __init__(self, code: int, delay: float) -> None:
@@ -535,9 +648,17 @@ def _arm_close_watchdog() -> None:
         _CLOSE_WATCHDOG = _start_exit_watchdog(0, EXIT_WATCHDOG_S)
 
 
-def _cleanup_for_exit(state: ServerState, lock: InstanceLock) -> None:
-    """The ordered shutdown of :func:`main`; a failing step is logged and never skips the next one."""
-    for what, step in (("stopping jobs", stop_jobs), ("stopping the server", state.stop), ("releasing the instance lock", lock.release)):
+def _cleanup_for_exit(state: ServerState, lock: InstanceLock, sweep: bool = False) -> None:
+    """The ordered shutdown of :func:`main`; a failing step is logged and never skips the next one.
+
+    ``sweep`` (a real exit, not a test) adds :func:`_final_sweep` right after the jobs were stopped: whatever they left running
+    is terminated while ``app.log`` still exists (stopping the server closes it) and before the server's 10 s stop can keep it alive.
+    """
+    steps = [("stopping jobs", stop_jobs)]
+    if sweep:
+        steps.append(("terminating leftover processes", _final_sweep))
+    steps += [("stopping the server", state.stop), ("releasing the instance lock", lock.release)]
+    for what, step in steps:
         try:
             step()
         except Exception as e:
@@ -672,6 +793,8 @@ def selfcheck(args: argparse.Namespace) -> int:
                 except Exception as e:
                     problems.append(f"GET {path} failed: {type(e).__name__}: {e}")
             try:
+                import urllib.request
+
                 with urllib.request.urlopen(url + "/", timeout=10) as r:
                     result["index_status"] = r.status
             except Exception as e:
@@ -742,6 +865,54 @@ def run_browser(state: ServerState, idle_exit_s: float | None, open_browser: boo
     return 0
 
 
+ATTENTION_STATES = ("done", "failed")  # job states that flash the taskbar button
+
+
+def _native_handle(window: Any) -> int | None:
+    """HWND of a pywebview window: with the EdgeChromium backend ``window.native`` is the WinForms Form and ``Handle`` its window handle."""
+    try:
+        h = window.native.Handle
+        to_int = getattr(h, "ToInt64", None)  # System.IntPtr
+        return (int(to_int()) if to_int is not None else int(h)) or None
+    except Exception:
+        return None
+
+
+def install_attention(window: Any, runner: Any = None, title: str = "VNDub") -> Callable[[], None]:
+    """Flash the window's taskbar button when a job ends (``done`` / ``failed``) while the window is not in front.
+
+    Subscribes to the job runner (``{"type": "job", "job": {...}}`` events); each job flashes at most once. The window
+    handle is looked up on the first event (``window.native.Handle``, else a visible window of this process titled
+    ``title``) and without one nothing happens. Returns the unsubscribe function. Never raises into the runner.
+    """
+    from vndub_app import jobs, winproc
+
+    flashed: set[str] = set()
+    cached: list[int | None] = [None]
+
+    def hwnd() -> int | None:
+        if not cached[0]:
+            cached[0] = _native_handle(window) or winproc.find_own_window(title)
+        return cached[0]
+
+    def on_event(ev: dict[str, Any]) -> None:
+        try:
+            if ev.get("type") != "job":
+                return
+            job = ev.get("job") or {}
+            jid = str(job.get("id") or "")
+            if not jid or job.get("state") not in ATTENTION_STATES or jid in flashed:
+                return
+            flashed.add(jid)
+            h = hwnd()
+            if h and not winproc.is_foreground(h):
+                winproc.flash_window(h)
+        except Exception as e:  # a window problem must never reach the job runner
+            log.debug("attention failed: %s", e)
+
+    return (runner or jobs.runner()).subscribe(on_event)
+
+
 def run_window(state: ServerState, debug: bool = False) -> int:
     """pywebview window: loading page now, the SPA when the server answers. Raises if no GUI can start."""
     import webview  # type: ignore[import-not-found]
@@ -763,6 +934,11 @@ def run_window(state: ServerState, debug: bool = False) -> int:
         url = wait_for_health(state)
         if url:
             window.load_url(url)
+            state.window_shown = True
+            try:
+                install_attention(window)
+            except Exception as e:
+                log.debug("no taskbar attention: %s", e)
         else:
             detail = repr(state.error) if state.error else "server did not answer /api/health"
             log.error("window boot failed: %s", detail)
@@ -784,6 +960,11 @@ def run_window(state: ServerState, debug: bool = False) -> int:
 
 
 def main(argv: list[str] | None = None, *, hard_exit: bool = True) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if "--reaper" in raw:  # the helper process (winproc.start_reaper): no parsing, no instance lock, no server, nothing heavy imported
+        from vndub_app import winproc
+
+        return winproc.reaper_main(raw)
     args = build_parser().parse_args(argv)
     if args.selfcheck or args.version:
         _attach_parent_console()
@@ -813,15 +994,20 @@ def main(argv: list[str] | None = None, *, hard_exit: bool = True) -> int:
     from vndub_app import webbuild
 
     webbuild.ensure_built()  # from source: rebuild an interface build older than its sources (needs Node.js)
-    state = start_server_async(args.port, on_started=lock.publish)
+    state = start_server_async(args.port, on_started=lock.publish, startup=_startup_housekeeping if hard_exit else None)
     code = 0
     try:
         if not args.browser:
             try:
                 code = run_window(state, debug=args.debug)
-            except Exception as e:  # no WebView2 / no GUI toolkit: keep the user going in the browser
-                log.warning("window could not start (%s: %s): falling back to the browser", type(e).__name__, e)
-                args.browser = True
+            except Exception as e:
+                if state.window_shown:  # the window was up and then broke (pythonnet / WebView2 teardown): the user sees an app that is
+                    # gone, so it must be gone; carrying on headless in a browser would keep jobs, models and VRAM for minutes
+                    log.exception("the window stopped unexpectedly (%s: %s): ending the app", type(e).__name__, e)
+                    code = 1
+                else:  # no WebView2 / no GUI toolkit: keep the user going in the browser
+                    log.warning("window could not start (%s: %s): falling back to the browser", type(e).__name__, e)
+                    args.browser = True
         if args.browser:
             code = run_browser(state, None if args.no_idle_exit else args.idle_exit)
     except BaseException as e:  # the window / browser loop died: still clean up, and end with a failing code
@@ -838,13 +1024,20 @@ def main(argv: list[str] | None = None, *, hard_exit: bool = True) -> int:
         if _CLOSE_WATCHDOG is not None:  # main() is in charge from here on: its own watchdog covers the cleanup
             _CLOSE_WATCHDOG.disarm()
         try:
-            _cleanup_for_exit(state, lock)
+            _cleanup_for_exit(state, lock, sweep=hard_exit)
         finally:
             if hard_exit:  # pythonnet / GUI threads must not keep a closed app (and its children) alive
                 log.info("cleanup done: ending the process now with code %s", code)
-            logging.shutdown()  # flushes app.log, the "ending" line included
+            try:
+                from vndub_app import applog, server
+
+                applog.log_shutdown(code)  # "exiting with code N after 1m05s": the last line of app.log
+                logging.shutdown()  # flushes app.log, the "exiting" line included
+                server.close_logging()
+            except Exception:
+                pass
             if hard_exit:
-                for stream in (sys.stdout, sys.stderr):  # os._exit does not flush them (a stuck flush is the watchdog's job)
+                for stream in (sys.stdout, sys.stderr):  # TerminateProcess does not flush them (a stuck flush is the watchdog's job)
                     try:
                         stream.flush()
                     except Exception:

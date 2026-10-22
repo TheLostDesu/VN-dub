@@ -191,9 +191,13 @@ export const WavePlayer = forwardRef<WavePlayerHandle, Props>(function WavePlaye
   );
 
   if (!url) {
+    // same box as a real player (label row + player row), so a missing recording does not shift its neighbour
     return (
-      <div className="wave-player is-empty" data-testid={testid}>
-        <span className="hint">{t("player.no_audio")}</span>
+      <div className={`wave-player is-empty ${compact ? "is-compact" : ""}`} data-testid={testid}>
+        {showLabel ? <div className="wave-label">{label}</div> : null}
+        <div className="wave-row">
+          <span className="hint">{t("player.no_audio")}</span>
+        </div>
       </div>
     );
   }
