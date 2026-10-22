@@ -13,7 +13,7 @@
   kills the whole process tree at once instead of waiting for its next line of output.
 * ETA: :class:`EtaEstimator` (EMA of seconds per item inside the current stage) plus
   :class:`ThroughputStore` (measured seconds per line for every stage, persisted in
-  ``<data>/throughput.json``) for the stages still ahead.
+  ``<data>/throughput_v2.json``) for the stages still ahead.
 * Records are persisted to ``<data>/jobs.json``; jobs that were active when the app
   stopped come back as ``interrupted`` and the UI offers to continue (the pipeline resumes
   from ``work/stage_status.json`` + its caches).
@@ -58,9 +58,13 @@ class JobCancelled(Exception):
 class EtaEstimator:
     """Remaining time of the current stage from measured per-item throughput.
 
-    Keeps an exponential moving average of seconds per item over progress updates;
-    returns ``None`` until ``min_items`` items were measured.
+    Keeps an exponential moving average of seconds per item over progress updates (a chunk of
+    several items weighs as much as that many single steps); returns ``None`` until ``min_items``
+    items were measured. Items that "finish" at once (a scan of cached results at the start of a
+    stage) are not throughput: they move the baseline but are not measured.
     """
+
+    INSTANT_S_PER_ITEM = 0.01
 
     def __init__(self, alpha: float = 0.3, min_items: int = 2) -> None:
         self.alpha = alpha
@@ -73,6 +77,11 @@ class EtaEstimator:
         self._measured = 0
         self.sec_per_item: float | None = None
 
+    def rebase(self, now: float | None = None) -> None:
+        """Forget the time since the last update (the job was paused): it was not work."""
+        if self._t_last is not None:
+            self._t_last = time.monotonic() if now is None else now
+
     def update(self, done: int, total: int, now: float | None = None) -> float | None:
         now = time.monotonic() if now is None else now
         if self._t_last is None or done < self._done_last:
@@ -80,9 +89,15 @@ class EtaEstimator:
             return self.eta(done, total)
         delta = done - self._done_last
         if delta > 0:
-            spi = (now - self._t_last) / delta
-            self.sec_per_item = spi if self.sec_per_item is None else self.alpha * spi + (1 - self.alpha) * self.sec_per_item
-            self._measured += delta
+            dt = now - self._t_last
+            if delta == 1 or dt / delta >= self.INSTANT_S_PER_ITEM:
+                spi = dt / delta
+                if self.sec_per_item is None:
+                    self.sec_per_item = spi
+                else:
+                    a = 1 - (1 - self.alpha) ** delta
+                    self.sec_per_item = a * spi + (1 - a) * self.sec_per_item
+                self._measured += delta
             self._t_last, self._done_last = now, done
         return self.eta(done, total)
 
@@ -99,7 +114,11 @@ class EtaEstimator:
 
 
 class ThroughputStore:
-    """Persisted seconds-per-line per stage (EMA across runs) for whole-job ETA."""
+    """Persisted seconds per voiced line for each stage (EMA across runs) for whole-job ETA.
+
+    Per line, not per progress item: a stage counts its own units (candidates, parts, chunks), so only
+    the per-line figure can be added up across stages.
+    """
 
     def __init__(self, path: Path | None) -> None:
         self.path = path
@@ -124,7 +143,7 @@ class ThroughputStore:
 
     def estimate(self, stages: list[str], n_items: int) -> float | None:
         vals = [self.data.get(s) for s in stages]
-        if not stages or any(v is None for v in vals):
+        if not stages or n_items <= 0 or any(v is None for v in vals):
             return None
         return sum(vals) * n_items  # type: ignore[arg-type]
 
@@ -260,6 +279,7 @@ class JobContext:
                 pass
             if self._cancel.is_set():
                 raise JobCancelled("cancelled by user")
+            self.eta.rebase()  # the pause is not part of the next item's time
             self.runner._update(self.job, state="running", force=True)
 
     # -- reporting -----------------------------------------------------------
@@ -277,15 +297,19 @@ class JobContext:
         self.checkpoint()
 
     def _finish_stage(self) -> None:
-        if self.job.stage and self.eta.sec_per_item is not None:
-            self.runner.throughput.record(self.job.stage, self.eta.sec_per_item)
+        if self.job.stage and self.eta.sec_per_item is not None and self.n_items_hint > 0 and self.job.total > 0:
+            self.runner.throughput.record(self.job.stage, self.eta.sec_per_item * self.job.total / self.n_items_hint)
 
     def progress(self, done: int, total: int, item: str | None = None) -> None:
         stage_eta = self.eta.update(done, total)
+        if stage_eta is None and total > 0 and self.n_items_hint > 0 and self.job.stage:
+            known = self.runner.throughput.get(self.job.stage)  # not measured yet: what the last run took
+            if known is not None:
+                stage_eta = known * self.n_items_hint * max(0.0, 1 - done / total)
         eta = stage_eta
         if stage_eta is not None and self.job.stages and self.job.stage in self.job.stages:
             ahead = self.job.stages[self.job.stages.index(self.job.stage) + 1 :]
-            rest = self.runner.throughput.estimate(ahead, self.n_items_hint or total)
+            rest = self.runner.throughput.estimate(ahead, self.n_items_hint)
             eta = stage_eta + rest if rest is not None else stage_eta
         self.runner._update(
             self.job, done=done, total=total, item=item, stage_eta_s=stage_eta, eta_s=eta, rate_per_min=self.eta.rate_per_min
@@ -563,7 +587,7 @@ def runner() -> JobRunner:
             from vndub_app import appdirs
 
             d = appdirs.data_dir()
-            _RUNNER = JobRunner(d / "jobs.json", d / "throughput.json")
+            _RUNNER = JobRunner(d / "jobs.json", d / "throughput_v2.json")
         return _RUNNER
 
 

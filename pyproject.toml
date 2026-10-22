@@ -1,6 +1,6 @@
 [project]
 name = "vndub"
-version = "0.6.1"
+version = "0.6.2"
 description = "Fully local visual-novel dubbing pipeline: game assets -> who said what -> expression passport -> expressive TTS/VC in the same voice -> patch."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"

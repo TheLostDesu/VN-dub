@@ -1,6 +1,6 @@
 ﻿; VNDub installer (Inno Setup 6.3 or newer). Build: packaging\build_app.ps1 (does everything), or only the installer:
 ;   packaging\build_app.ps1 -InstallerOnly                 -> installer\VNDub-Setup.exe from the existing dist\VNDub
-;   iscc /DAppVersion=0.6.1 packaging\VNDub.iss            -> the same, by hand
+;   iscc /DAppVersion=0.6.2 packaging\VNDub.iss            -> the same, by hand
 ; Per-user install (no administrator rights): %LOCALAPPDATA%\Programs\VNDub, Start-menu shortcut, entry under HKCU in
 ; "Apps & features". The one exception is the Microsoft Visual C++ Redistributable the models need: when the runtime
 ; of the machine is missing or older than 14.40, Setup runs {app}\redist\vc_redist.x64.exe, which shows Microsoft's own
@@ -31,7 +31,7 @@
 
 #define AppName "VNDub"
 #ifndef AppVersion
-  #define AppVersion "0.6.1"
+  #define AppVersion "0.6.2"
 #endif
 #define AppPublisher "VNDub"
 #define AppExe "VNDub.exe"
@@ -201,6 +201,7 @@ begin
   DeleteFile(Dir + '\settings.json');
   DeleteFile(Dir + '\jobs.json');
   DeleteFile(Dir + '\throughput.json');
+  DeleteFile(Dir + '\throughput_v2.json');
   DeleteFile(Dir + '\model_selftests.json');
   RemoveDir(Dir);
 end;

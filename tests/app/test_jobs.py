@@ -36,9 +36,9 @@ def test_eta_needs_measurements_then_converges() -> None:
     eta = e.update(2, 10, now=4.0)  # 2 s per item, 8 left
     assert eta == pytest.approx(16.0)
     assert e.rate_per_min == pytest.approx(30.0)
-    # the EMA follows a change of speed
+    # the EMA follows a change of speed; a chunk of 2 items weighs as two steps
     e.update(4, 10, now=6.0)  # 1 s per item
-    assert e.sec_per_item == pytest.approx(0.5 * 1.0 + 0.5 * 2.0)
+    assert e.sec_per_item == pytest.approx(0.75 * 1.0 + 0.25 * 2.0)
     assert e.eta(10, 10) == 0.0
 
 
@@ -50,6 +50,19 @@ def test_eta_resets_when_progress_goes_backwards() -> None:
     e.update(0, 5, now=10.0)  # a new pass (regen round): the clock restarts, the average stays
     assert e._done_last == 0 and e._t_last == 10.0  # noqa: SLF001
     assert e.eta(0, 0) is None
+
+
+def test_eta_ignores_cached_scan_and_pauses() -> None:
+    e = EtaEstimator(alpha=0.5, min_items=2)
+    e.update(0, 100, now=0.0)
+    e.update(60, 100, now=0.05)  # 60 cached results found at once: not throughput
+    assert e.sec_per_item is None and e.eta(60, 100) is None
+    e.update(61, 100, now=2.05)
+    e.update(62, 100, now=4.05)  # 2 s per item, 38 left
+    assert e.eta(62, 100) == pytest.approx(76.0)
+    e.rebase(now=1000.0)  # paused for a long time
+    e.update(63, 100, now=1002.0)
+    assert e.sec_per_item == pytest.approx(2.0)
 
 
 def test_throughput_store_persists_and_estimates(tmp_path: Path) -> None:
@@ -84,7 +97,9 @@ def test_job_progress_reports_eta_and_whole_job_estimate() -> None:
     assert job.stage == "synth" and job.stage_index == 1 and job.stage_count == 2
     assert job.done == 5 and job.total == 5 and job.item == "line5"
     assert job.eta_s == 0.0
-    assert r.throughput.get("synth") is not None  # measured and stored for the next job's estimate
+    # measured and stored per voiced line (5 progress items of 10 lines), for the next job's estimate
+    assert r.throughput.get("synth") is not None
+    assert r.throughput.get("synth") == pytest.approx(0.02 * 5 / 10, abs=0.02)
     r.shutdown()
 
 

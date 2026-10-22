@@ -4,7 +4,7 @@ Layout of the data folder (DEFAULT ``%LOCALAPPDATA%\\VNDub``, ``~/.local/share/v
 
     <data>/settings.json            app settings (UI language, GPU budget, license policy ...)
     <data>/jobs.json                job records (resume after restart)
-    <data>/throughput.json          measured seconds per line per stage (ETA)
+    <data>/throughput_v2.json       measured seconds per voiced line per stage (ETA)
     <data>/logs/app.log             rotating app log
     <data>/configs/tools.local.yaml external tool paths written by the installer
     <data>/tools/                   external tools (ffmpeg, vgmstream ...)
