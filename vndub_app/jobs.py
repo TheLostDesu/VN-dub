@@ -143,6 +143,7 @@ class JobRecord:
     project: str | None = None
     gpu: bool = True
     state: str = "queued"
+    cancel_requested: bool = False  # Cancel pressed, the job has not stopped yet
     created: str = ""
     started: str | None = None
     finished: str | None = None
@@ -183,6 +184,7 @@ class JobContext:
         self.n_items_hint: int = 0  # lines the job will process (for future-stage ETA)
         self._procs: list["subprocess.Popen[Any]"] = []
         self._procs_lock = threading.Lock()
+        self._on_cancel: list[Callable[[], None]] = []
 
     # -- control (called by the runner) -------------------------------------
     def _set_paused(self, paused: bool) -> None:
@@ -196,8 +198,33 @@ class JobContext:
         self._pause.set()
         with self._procs_lock:
             procs = list(self._procs)
+            hooks = list(self._on_cancel)
         for p in procs:  # outside the lock: taskkill takes a moment
             winproc.kill_tree(p)
+        for h in hooks:
+            try:
+                h()
+            except Exception:
+                log.exception("job %s: cancel hook failed", self.job.id)
+
+    def on_cancel(self, fn: Callable[[], None]) -> Callable[[], None]:
+        """Run ``fn`` (from the thread that pressed Cancel) when this job is cancelled; runs at once if it already was.
+
+        For work that blocks without reaching a checkpoint (a model process answering a long request): ``fn`` ends it.
+        Returns a function that removes the hook.
+        """
+        with self._procs_lock:
+            self._on_cancel.append(fn)
+            cancelled = self._cancel.is_set()
+        if cancelled:
+            fn()
+
+        def remove() -> None:
+            with self._procs_lock:
+                if fn in self._on_cancel:
+                    self._on_cancel.remove(fn)
+
+        return remove
 
     def watch_process(self, proc: "subprocess.Popen[Any]") -> Callable[[], None]:
         """Kill ``proc`` and everything it started the moment this job is cancelled.
@@ -454,6 +481,7 @@ class JobRunner:
         job = self.get(job_id)
         ctx = self._ctx.get(job_id)
         if ctx and job.state in ACTIVE:
+            self._update(job, cancel_requested=True, force=True)
             ctx._set_cancelled()
             if job.started is None:
                 self._update(job, state="cancelled", finished=now_iso(), force=True)
@@ -509,6 +537,9 @@ class JobRunner:
         except JobCancelled:
             self._update(job, state="cancelled", finished=now_iso(), force=True)
         except Exception as e:
+            if ctx.cancelled:  # Cancel killed what the job was waiting on: that error is the cancel, not a failure
+                self._update(job, state="cancelled", finished=now_iso(), force=True)
+                return
             from vndub_app.errors import error_from_exception
 
             err = error_from_exception(e, stage=job.stage)

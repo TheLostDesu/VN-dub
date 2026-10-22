@@ -201,6 +201,24 @@ class AdapterProcess:
         except OSError:
             pass
 
+    def abort(self) -> None:
+        """Kill the adapter and its children at once (a job was cancelled); the call waiting on it fails fast."""
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
+        if sys.platform.startswith("win"):
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
     def close(self, timeout: float = 15.0) -> None:
         if self.proc is None:
             return
@@ -339,6 +357,9 @@ class RemoteBackend(_RoleMixin):
         timeout = float(kwargs.pop("timeout_s", 120 + self.timeout_item * n))
         params = {"op": op, "items": items, **kwargs}
         return self._with_restart("run", params, timeout)
+
+    def abort(self) -> None:
+        self.proc.abort()
 
     def unload(self) -> None:
         if self.proc.alive:

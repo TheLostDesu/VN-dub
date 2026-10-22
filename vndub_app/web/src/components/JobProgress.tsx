@@ -231,8 +231,8 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
               {t("job.pause")}
             </Button>
           )}
-          <Button variant="danger" onClick={() => void control("cancel")} busy={busy === "cancel"} data-testid="job-cancel">
-            {t("job.cancel")}
+          <Button variant="danger" onClick={() => void control("cancel")} busy={busy === "cancel" || !!job.cancel_requested} disabled={!!job.cancel_requested} data-testid="job-cancel">
+            {job.cancel_requested ? t("job.cancelling") : t("job.cancel")}
           </Button>
         </div>
       ) : null}

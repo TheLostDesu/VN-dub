@@ -1024,6 +1024,15 @@ def translate_llm(
     llm = t.llm
     key_backend = _llm_key_backend(ctx)
     lock = threading.Lock()  # ``entries`` is shared by the scene threads when llm.parallel > 1
+    total = len(todo)
+    n_done = 0
+
+    def tick(n: int, item: str) -> None:
+        # progress (and the job's pause / cancel checkpoint) after every batch, cached or not
+        nonlocal n_done
+        with lock:
+            n_done += n
+            ctx.progress(min(n_done, total), total, item)
 
     def do_scene(scene: str, scene_lines: list[LineRecord]) -> None:
         rows = [row(l) for l in scene_lines if l.line_id not in delivery_ids]
@@ -1059,6 +1068,7 @@ def translate_llm(
                         continue
                     entries[b["id"]] = {**e, "source": f"llm:{backend_name or key_backend}"}
                     history.append({"speaker": b["speaker"], "text": b["text"], tgt: e["text_tgt"]})
+            tick(len(batch), batch[-1]["id"])
         # delivery stream: lines nobody voices, translated with the surrounding script as context
         for i in range(0, len(t_rows), max(1, t.batch_lines)):
             batch = t_rows[i : i + t.batch_lines]
@@ -1079,7 +1089,9 @@ def translate_llm(
                     e = got.get(b["id"])
                     if e is not None:
                         entries[b["id"]] = {**e, "source": f"llm:{backend_name or key_backend}"}
+            tick(len(batch), batch[-1]["id"])
 
+    ctx.progress(0, total, None)
     workers = max(1, int(llm.parallel))
     if workers > 1 and len(scenes) > 1:
         # scenes are independent (the rolling context never crosses a scene): each worker drives one llama-server
@@ -1120,6 +1132,8 @@ def translate_deliveries(
     scenes: dict[str, list[LineRecord]] = {}
     for l in targets:
         scenes.setdefault(l.scene, []).append(l)
+    n_done = 0
+    ctx.progress(0, len(targets), None)
     for scene, scene_lines in scenes.items():
         rows = [
             {
@@ -1145,6 +1159,8 @@ def translate_deliveries(
             for b in batch:
                 if b["id"] in got:
                     entries[b["id"]]["delivery"] = got[b["id"]]
+            n_done += len(batch)
+            ctx.progress(min(n_done, len(targets)), len(targets), batch[-1]["id"])
     store.save()
 
 

@@ -55,6 +55,7 @@ export interface JobInfo {
   params: Record<string, unknown>;
   project: string | null;
   gpu: boolean;
+  cancel_requested?: boolean;
   state: JobState;
   created: string;
   started: string | null;

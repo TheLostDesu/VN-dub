@@ -451,3 +451,23 @@ def test_unwatch_removes_the_process_and_watching_twice_is_harmless() -> None:
             winproc.kill_tree(seen["proc"])
             seen["proc"].wait(10)
         r.shutdown()
+
+
+def test_cancel_runs_hooks_and_a_failure_after_it_is_a_cancel(tmp_path):
+    r = JobRunner(tmp_path / "jobs.json", tmp_path / "t.json")
+    hooked = threading.Event()
+    started = threading.Event()
+
+    def fn(ctx):
+        ctx.on_cancel(hooked.set)
+        started.set()
+        hooked.wait(10)  # a blocking call that only the hook can end
+        raise RuntimeError("backend process killed")  # what the broken call raises
+
+    job = r.submit("stage", fn)
+    assert started.wait(10)
+    r.cancel(job.id)
+    rec = r.wait(job.id, 10)
+    assert hooked.is_set()
+    assert rec.state == "cancelled" and rec.error is None
+    assert rec.cancel_requested

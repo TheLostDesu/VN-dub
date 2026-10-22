@@ -184,9 +184,11 @@ def pipeline_ctx(
         log.warning("cannot write the project glossary: %s", e)
     ctx = session.job_ctx(h, only=only, limit=limit, force=force, sets=_with_unvoiced(sets), extra=ex)
     bridge = JobLogBridge(job).attach()
+    unhook = job.on_cancel(ctx.models.abort_all)  # Cancel ends a model process mid-request, not after its answer
     try:
         yield ctx
     finally:
+        unhook()
         bridge.detach()
         try:
             ctx.models.close()

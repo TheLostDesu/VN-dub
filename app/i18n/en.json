@@ -280,6 +280,7 @@
   "job.pause": "Pause",
   "job.resume": "Resume",
   "job.cancel": "Cancel",
+  "job.cancelling": "Cancelling...",
   "job.continue": "Continue where it stopped",
   "job.counter": "{done} of {total}",
   "job.eta": "About {time} left",

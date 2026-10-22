@@ -280,6 +280,7 @@
   "job.pause": "Пауза",
   "job.resume": "Продолжить",
   "job.cancel": "Отменить",
+  "job.cancelling": "Отменяется...",
   "job.continue": "Продолжить с того места, где остановились",
   "job.counter": "{done} из {total}",
   "job.eta": "Осталось примерно: {time}",

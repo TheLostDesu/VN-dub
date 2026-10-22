@@ -323,6 +323,17 @@ class ModelRegistry:
     def close(self) -> None:
         self.release(None)
 
+    def abort_all(self) -> None:
+        """Kill the processes of every resident backend now (a job was cancelled); ``close()`` tidies up after."""
+        residents = ([self.heavy] if self.heavy else []) + list(self.light.values())
+        for res in residents:
+            fn = getattr(res.backend, "abort", None)
+            if fn is not None:
+                try:
+                    fn()
+                except Exception as e:
+                    self.log.warning("abort %s failed: %s", res.name, e)
+
     @contextmanager
     def use(self, name: str, options: dict[str, Any] | None = None) -> Iterator[Backend]:
         b = self.acquire(name, options)

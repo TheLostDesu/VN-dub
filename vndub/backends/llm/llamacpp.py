@@ -310,6 +310,15 @@ class LlamaCppBackend(LocalBackend):
         }
         return {"port": self.port, **self.load_info}
 
+    def abort(self) -> None:
+        """Kill the server at once (a job was cancelled): a request in flight fails instead of running to its end."""
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
     def unload(self) -> None:
         if self.proc is not None:
             self.proc.terminate()
