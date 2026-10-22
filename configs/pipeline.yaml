@@ -233,6 +233,7 @@ score:
   emotion: emotion2vec_plus_large  # must match analyze.e2v
   adv: audeering_adv
   regen_rounds: 2
+  regen_cer_max: 0.2             # the most intelligible take misreads more than this -> review at once, no regen rounds (0 = off)
   interjection_cer_max: 0.5
 
 master:

@@ -66,6 +66,14 @@ export interface JobInfo {
   stage: string | null;
   stage_index: number;
   stage_count: number;
+  /**
+   * A regen round in progress: score found lines without a passing candidate and synth + score run again for them
+   * inside the quality step (`stage_index` stays at score). 0 / absent outside a round; `round_total` = the rounds the
+   * config allows, `round_lines` = the lines this round re-does.
+   */
+  stage_round?: number;
+  round_total?: number;
+  round_lines?: number;
   done: number;
   total: number;
   item: string | null;

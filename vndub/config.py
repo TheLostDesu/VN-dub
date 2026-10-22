@@ -363,6 +363,9 @@ class ScoreSection(_Section):
     emotion: str = "emotion2vec_plus_large"
     adv: str = "audeering_adv"
     regen_rounds: int = 2
+    # a line whose most intelligible take still misreads the text by more than this CER goes to review at once instead of
+    # through the regen rounds (a new seed changes the delivery, not the words); never below the line's gate; 0 = off
+    regen_cer_max: float = 0.2
     # interjections get a softer CER gate
     interjection_cer_max: float = 0.5
 

@@ -7,6 +7,7 @@ import { useI18n } from "../i18n";
 import { useActiveJob, ingestJob } from "../state/progress";
 import { useProject } from "../state/project";
 import { furthestStep, pathForJobKind, STEP_NUMBER, stepForJobKind, stepPath, useWizard } from "../state/wizard";
+import { stageLabel } from "../util/format";
 import { ErrorPanel } from "./ErrorPanel";
 import { Button, Checkbox, Dialog, ProgressBar } from "./ui";
 
@@ -17,7 +18,7 @@ function TopBarJob() {
   const job = useActiveJob();
   if (!job) return null;
   const title = tOr(job.title_key, t(`jobs.${job.kind}`));
-  const stageName = job.stage ? (has(`stages.${job.stage}`) ? t(`stages.${job.stage}`) : job.stage) : "";
+  const stageName = stageLabel(job, { t, has });
   const pct = job.total > 0 ? Math.round(Math.min(1, Math.max(0, job.done / job.total)) * 100) : null;
   const note = job.state === "paused" ? t("job.state.paused") : job.state === "queued" ? t("job.state.queued") : stageName || (pct === null ? t("job.working") : "");
   const dest = pathForJobKind(job.kind);

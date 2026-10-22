@@ -4,7 +4,7 @@ import { toErrorInfo } from "../api/client";
 import { ACTIVE_STATES, type ErrorInfo, type JobInfo, type JobWarning } from "../api/types";
 import { useI18n } from "../i18n";
 import { ingestJob, useJobLog } from "../state/progress";
-import { fmtBytes, fmtDuration, fmtNumber, jobWarnings, normalizeFiles } from "../util/format";
+import { fmtBytes, fmtDuration, fmtNumber, jobWarnings, normalizeFiles, stageLabel, stageSlotFraction } from "../util/format";
 import { ErrorPanel } from "./ErrorPanel";
 import { Button, Callout, Chip, Collapsible, ProgressBar, copyText } from "./ui";
 
@@ -175,10 +175,13 @@ export function FilesProgress({ files }: { files: unknown }) {
 const BYTE_JOBS = ["models_download", "models_hf_add", "tools_install", "ffmpeg_download"];
 const FILE_JOBS = ["install_apply", "install_rollback", "install_zip"];
 
-function counterKey(kind: string): string {
+/** The unit of a stage's counter: synth counts takes (several per line), score the checks it runs on them. */
+function counterKey(kind: string, stage: string | null): string {
   if (BYTE_JOBS.includes(kind)) return "job.counter_mb";
   if (kind === "envs_install") return "job.counter_envs";
   if (FILE_JOBS.includes(kind)) return "job.counter_files";
+  if (stage === "synth") return "job.counter_takes";
+  if (stage === "score") return "job.counter_checks";
   return "job.counter";
 }
 
@@ -204,7 +207,7 @@ interface Props {
   fractionOverride?: (job: JobInfo) => number | null | undefined;
 }
 
-export function JobProgress({ job, compact, showStages, showLog, onRetry, stageLabel, hideControls, testid = "job-progress", footer, fractionOverride }: Props) {
+export function JobProgress({ job, compact, showStages, showLog, onRetry, stageLabel: customStageLabel, hideControls, testid = "job-progress", footer, fractionOverride }: Props) {
   const { t, has, tOr } = useI18n();
   const [busy, setBusy] = useState<string | null>(null);
   const [controlError, setControlError] = useState<ErrorInfo | null>(null);
@@ -212,8 +215,9 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
   const active = ACTIVE_STATES.includes(job.state);
   const title = tOr(job.title_key, t(`jobs.${job.kind}`));
   const stage = job.stage;
-  const custom = stage && stageLabel ? stageLabel(stage) : null;
-  const stageName = custom ?? (stage ? (has(`stages.${stage}`) ? t(`stages.${stage}`) : stage) : "");
+  const custom = stage && customStageLabel ? customStageLabel(stage) : null;
+  const stageName = custom ?? stageLabel(job, { t, has });
+  const round = job.stage_round ?? 0;
   const hasTotal = job.total > 0;
   const own = job.state === "done" ? 1 : hasTotal ? Math.min(1, job.done / job.total) : null;
   const over = fractionOverride ? fractionOverride(job) : undefined;
@@ -222,7 +226,7 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
   const finished = job.state === "done";
   // a finished multi-stage job has nothing left to compare: one full bar, not a stage bar plus an identical overall bar
   const twoBars = multi && !compact && !finished;
-  const overall = multi ? (finished ? 1 : Math.min(1, (Math.max(0, job.stage_index - 1) + (own ?? 0)) / job.stage_count)) : null;
+  const overall = multi ? (finished ? 1 : Math.min(1, (Math.max(0, job.stage_index - 1) + stageSlotFraction(job, own)) / job.stage_count)) : null;
   const eta = job.eta_s ?? job.stage_eta_s;
 
   const control = async (name: "pause" | "resume" | "cancel") => {
@@ -265,7 +269,7 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
       {job.state !== "failed" ? (
         <>
           {stageName && !compact && !finished ? (
-            <p className="job-stage" data-testid="job-stage">
+            <p className="job-stage" data-testid="job-stage" data-round={round > 0 ? round : undefined}>
               {multi ? t("job.stage_of", { i: job.stage_index, n: job.stage_count }) + ": " : ""}
               <strong>{stageName}</strong>
             </p>
@@ -273,7 +277,7 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
           <ProgressBar value={twoBars ? stageFrac : finished ? 1 : (overall ?? stageFrac)} label={stageName || title} testid="job-bar" />
           <div className="job-numbers">
             {hasTotal ? (
-              <span data-testid="job-counter">{t(counterKey(job.kind), { done: job.state === "done" ? job.total : job.done, total: job.total })}</span>
+              <span data-testid="job-counter">{t(counterKey(job.kind, job.stage), { done: job.state === "done" ? job.total : job.done, total: job.total })}</span>
             ) : active ? (
               <span>{t("job.working")}</span>
             ) : null}

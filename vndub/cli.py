@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import typer
 import yaml
@@ -305,15 +305,22 @@ def run_cmd(
     console.print(f"[green]done.[/green] work: {ctx.paths.work}  out: {ctx.paths.out}")
 
 
-def _regen_loop(ctx: StageContext) -> None:
+def _regen_loop(ctx: StageContext, on_round: Callable[[int, int, int], None] | None = None) -> None:
+    """Up to ``score.regen_rounds`` rounds of ``synth --regen`` + ``score`` for the lines whose candidates all failed the
+    gates. ``on_round(round, rounds, n_lines)`` is told before a round starts: the desktop app shows the round as a
+    retry inside the quality step, not as the pipeline going back to synth."""
     from vndub.manifest.io import SelectionRecord, read_jsonl
 
-    for rnd in range(1, ctx.cfg.score.regen_rounds + 1):
+    total = ctx.cfg.score.regen_rounds
+    for rnd in range(1, total + 1):
         sel = read_jsonl(ctx.paths.selection, SelectionRecord)
         todo = [s.line_id for s in sel if s.status == "regen"]
         if not todo:
-            return
-        console.print(f"[cyan]regen round {rnd}: {len(todo)} line(s)[/cyan]")
+            break
+        console.print(f"[cyan]regen round {rnd}/{total}: {len(todo)} line(s)[/cyan]")
+        ctx.log.info("regen round %d/%d: %d line(s) have no candidate passing the gates, new takes are synthesized for them", rnd, total, len(todo))
+        if on_round is not None:
+            on_round(rnd, total, len(todo))
         ctx.extra["regen"] = True
         ctx.extra["regen_round"] = rnd
         run_stage("synth", ctx)

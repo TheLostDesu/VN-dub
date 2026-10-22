@@ -353,7 +353,9 @@ def run_stages(ctx: Any, job: JobContext, names: list[str], *, regen: bool = Fal
         if n == "score" and regen:
             from vndub.cli import _regen_loop
 
-            _regen_loop(ctx)
+            # the rounds re-enter synth and score: the job reports them as retries inside the quality step
+            _regen_loop(ctx, on_round=job.begin_round)
+            job.end_rounds()
     return out
 
 

@@ -1,5 +1,32 @@
-import type { JobWarning, StageRecord } from "../api/types";
+import type { JobInfo, JobWarning, StageRecord } from "../api/types";
 import type { TFunc } from "../i18n";
+
+/** The stage line of a job: the stage's name, or, in a regen round (`stage_round` > 0), what the round does. */
+export function stageLabel(job: Pick<JobInfo, "stage" | "stage_round" | "round_total" | "round_lines">, i18n: { t: TFunc; has: (key: string) => boolean }): string {
+  const { t, has } = i18n;
+  const stage = job.stage;
+  if (!stage) return "";
+  const name = has(`stages.${stage}`) ? t(`stages.${stage}`) : stage;
+  const rnd = job.stage_round ?? 0;
+  if (rnd <= 0) return name;
+  const p = { i: rnd, n: Math.max(rnd, job.round_total ?? 0), lines: job.round_lines ?? 0 };
+  if (stage === "synth") return t("job.round_synth", p);
+  if (stage === "score") return t("job.round_score", p);
+  return t("job.round_stage", { ...p, stage: name });
+}
+
+/**
+ * How much of the current stage's slot of the overall bar is filled. In a regen round the slot belongs to the quality
+ * step and fills over the rounds (synth is the first half of a round, score the second), so the bar never shows the
+ * job back at the voicing step.
+ */
+export function stageSlotFraction(job: Pick<JobInfo, "stage" | "stage_round" | "round_total">, own: number | null): number {
+  const rnd = job.stage_round ?? 0;
+  const total = Math.max(rnd, job.round_total ?? 0);
+  if (rnd <= 0 || total <= 0) return own ?? 0;
+  const half = 0.5 * (own ?? 0);
+  return (rnd - 1 + (job.stage === "score" ? 0.5 + half : half)) / total;
+}
 
 export function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));

@@ -287,6 +287,11 @@ class JobRecord:
     rate_per_min: float | None = None
     message_key: str | None = None
     message_params: dict[str, Any] = field(default_factory=dict)
+    # a regen round (score found lines without a passing candidate; synth and score run again for them inside the
+    # quality step): its number (0 outside a round), how many rounds the config allows, how many lines it re-does
+    stage_round: int = 0
+    round_total: int = 0
+    round_lines: int = 0
     error: dict[str, Any] | None = None
     result: dict[str, Any] = field(default_factory=dict)
     log_path: str | None = None  # the per-job log file (set when the job starts running; None without a log folder)
@@ -478,13 +483,30 @@ class JobContext:
         self._begun.add(name)
         stages = self.job.stages or [name]
         idx = stages.index(name) + 1 if name in stages else self.job.stage_index + 1
+        rnd = self.job.stage_round
+        if rnd > 0:  # a regen round re-enters synth and score: the job stays at the quality step, it does not go back
+            idx = max(idx, self.job.stage_index)
         self._stage_t0 = time.monotonic()
         self.eta.reset(self._stage_t0)  # the time before the first report (loading a model) is the stage's too
         self.runner._update(self.job, stage=name, stage_index=idx, done=0, total=0, item=None, stage_eta_s=None, force=True)
         count = self.job.stage_count or len(stages)
-        log.info("job %s stage %s begin (%d/%d)", self.job.id, name, idx, count)
-        self.runner._file_note(self.job, f"--- stage {name} begin ({idx}/{count})")
+        where = f"{idx}/{count}, regen round {rnd}/{self.job.round_total}" if rnd > 0 else f"{idx}/{count}"
+        log.info("job %s stage %s begin (%s)", self.job.id, name, where)
+        self.runner._file_note(self.job, f"--- stage {name} begin ({where})")
         self.checkpoint()
+
+    def begin_round(self, rnd: int, total: int, n_lines: int) -> None:
+        """A regen round starts (``cli._regen_loop``'s ``on_round``): ``n_lines`` lines had no candidate passing the
+        gates, synth and score run again for them. Until :meth:`end_rounds` the stages they re-enter keep the job's
+        position (``stage_index`` never moves back) and the record carries the round for the UI."""
+        self.runner._update(self.job, stage_round=rnd, round_total=total, round_lines=n_lines, force=True)
+        log.info("job %s regen round %d/%d: %d line(s) without a passing candidate are voiced again", self.job.id, rnd, total, n_lines)
+        self.runner._file_note(self.job, f"--- regen round {rnd}/{total}: {n_lines} line(s) without a passing candidate are voiced again")
+
+    def end_rounds(self) -> None:
+        """The regen rounds are over (or none was needed): what follows are plain stages again."""
+        if self.job.stage_round:
+            self.runner._update(self.job, stage_round=0, round_total=0, round_lines=0, force=True)
 
     def _finish_stage(self) -> None:
         """The current stage ended normally: remember its throughput (when it measured enough real work) and log it."""
@@ -513,18 +535,20 @@ class JobContext:
 
     def progress(self, done: int, total: int, item: str | None = None) -> None:
         stage_eta = self.eta.update(done, total)
-        if stage_eta is None and total > 0 and self.n_items_hint > 0 and self.job.stage:
+        # the lines this stage works on: in a regen round only the lines it re-does, not the whole script
+        lines = self.job.round_lines if self.job.stage_round > 0 and self.job.round_lines > 0 else self.n_items_hint
+        if stage_eta is None and total > 0 and lines > 0 and self.job.stage:
             known = self.runner.throughput.get(self.job.stage)  # not measured yet: what the last run took
             if known is not None:
-                stage_eta = known * self.n_items_hint * max(0.0, 1 - done / total)
+                stage_eta = known * lines * max(0.0, 1 - done / total)
         eta = stage_eta
         if stage_eta is not None and self.job.stages and self.job.stage in self.job.stages:
             ahead = self.job.stages[self.job.stages.index(self.job.stage) + 1 :]
             rest = self.runner.throughput.estimate(ahead, self.n_items_hint)
             eta = stage_eta + rest if rest is not None else stage_eta
         rate = self.eta.rate_per_min
-        if rate is not None and self.n_items_hint > 0 and total > self.n_items_hint:
-            rate *= self.n_items_hint / total  # the stage counts candidates / parts: the UI shows lines a minute
+        if rate is not None and lines > 0 and total > lines:
+            rate *= lines / total  # the stage counts candidates / parts: the UI shows lines a minute
         self.runner._update(self.job, done=done, total=total, item=item, stage_eta_s=stage_eta, eta_s=eta, rate_per_min=rate)
         self.checkpoint()
 

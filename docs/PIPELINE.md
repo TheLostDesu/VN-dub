@@ -414,7 +414,11 @@ and |dA| + |dV|, CER (GigaAM-v3, fallback Whisper-ru) against the stress-free ta
 duration ratio, F0 and energy correlation after DTW (100 points), pause-pattern Jaccard.
 Composite = weighted sum (`score.weights`, renormalized over available metrics). Gates:
 `score.gates.*` (spk_sim from the EER calibration). Best gate-passing candidate -> `auto`;
-otherwise `regen` (up to `regen_rounds`) then `review`. Overrides are honoured.
+otherwise `regen` (up to `regen_rounds`) then `review`. Overrides are honoured. A line whose most intelligible take
+still misreads the text by more than `score.regen_cer_max` (0.2, never below the line's CER gate) goes to `review` at
+once ("a new take would not help"): a new seed changes the delivery, not the words. A take the ASR heard no words in
+gets no CER (note `cer failed: the ASR heard no words in this take`): the gate counts as not checked, never as a CER
+of 1.0.
 Lines without original audio (route P): `emo_sim`, `adv_delta`, `prosody` and `dur_ratio` are not computed, so
 those terms are missing and the composite is renormalized over `utmos` / `pq` / `spk_sim` / `cer`; no gate needs a
 reference metric (gates of unavailable metrics are never evaluated). `spk_sim` is measured against the performer's
@@ -474,7 +478,7 @@ set_ref|keep_original, payload, ts).
 | `text_emotion` | `enabled`, `cues`, `narration_window`, `llm` (`auto` \| `on` \| `off`), `llm_context_lines`, `min_confidence`, `only_unvoiced` |
 | `voicebank` | `refs.*`, `performer.{kind,backend,n_designs,test_sentences,max_f0_delta_semitones,reference_dir,sample_lines,offer_clone}`, `rvc.*`, `route_c.*`, `calibrate_spk`, `min_minutes_for_voicebank` |
 | `synth` | `n_candidates`, `n_candidates_short`, `routes` (A, B, C, P), `backends.<name>.{enabled,...}`, `vc.{primary,fallback,rvc,seedvc}`, `keep_original_for_interjections`, `use_short_text_if_ratio_above`, `interjection_max_syllables`, `high_arousal`, `seed_base`, `voice_unvoiced` |
-| `score` | `weights`, `gates.{utmos_min,cer_max,dur_ratio,spk_sim_min,spk_sim_default}`, `mos`, `mos_fallback`, `aesthetics`, `speaker`, `speaker_extra`, `cer_asr`, `cer_asr_fallback`, `emotion`, `adv`, `regen_rounds`, `interjection_cer_max` |
+| `score` | `weights`, `gates.{utmos_min,cer_max,dur_ratio,spk_sim_min,spk_sim_default}`, `mos`, `mos_fallback`, `aesthetics`, `speaker`, `speaker_extra`, `cer_asr`, `cer_asr_fallback`, `emotion`, `adv`, `regen_rounds`, `regen_cer_max`, `interjection_cer_max` |
 | `master` | `stretch.{enabled,target_window,max_stretch,engine}`, `loudness.{target,true_peak_dbtp,default_lufs}`, `match_silence_profile`, `include_review_lines` |
 | `pack` | `kirikiri`, `renpy`, `nscripter`, `unity`, `other` |
 | `review` | `host`, `port`, `batch_accept_threshold` |

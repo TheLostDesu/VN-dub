@@ -236,6 +236,25 @@ def apply_scores(c: CandidateScore, cfg: Any, thr: float, interjection: bool) ->
     return c
 
 
+def regen_hopeless(pool: list[CandidateScore], best: CandidateScore, cer_ceiling: float | None) -> str | None:
+    """Why another synth round would not help this line, or None when it might.
+
+    A new seed changes the delivery, not the words: when the best take fails the CER gate and even the most intelligible
+    take of the line misreads the text by more than ``cer_ceiling`` (``score.regen_cer_max``, never below the line's
+    gate), the text or the voice is the problem, and the line goes to a person at once instead of after
+    ``regen_rounds`` rounds of the same.
+    """
+    if cer_ceiling is None:
+        return None
+    gates = getattr(best, "gates", None) or {}
+    if gates.get("cer", True):
+        return None
+    cers = [float(c.metrics["cer"]) for c in pool if c.metrics.get("cer") is not None]
+    if not cers or min(cers) <= cer_ceiling:
+        return None
+    return f"every take misreads the text (cer {min(cers):.2f}-{max(cers):.2f}, more than {cer_ceiling:.2f})"
+
+
 def select(
     line_id: str,
     cands: list[CandidateScore],
@@ -245,6 +264,7 @@ def select(
     unavailable: dict[str, str] | None = None,
     src_wav: str | None = None,
     n_failed: int = 0,
+    regen_cer_max: float | None = None,
 ) -> SelectionRecord:
     rejected = {str(o.payload.get("candidate") or o.payload.get("wav")) for o in overrides if o.action == "reject"}
     pool = [c for c in cands if c.wav not in rejected]
@@ -295,7 +315,10 @@ def select(
     if best.metrics.get("dur_ratio") is not None and float(best.metrics["dur_ratio"]) > 1.25:
         why += "; try text_tgt_short"
     if rnd < regen_rounds:
-        return rec(best, "regen", f"no candidate passes the gates (best fails: {why}){unavail_note}")
+        hopeless = regen_hopeless(pool, best, regen_cer_max)
+        if hopeless is None:
+            return rec(best, "regen", f"no candidate passes the gates (best fails: {why}){unavail_note}")
+        return rec(best, "review", f"no candidate passes the gates and a new take would not help: {hopeless} (best fails: {why}){unavail_note}")
     return rec(best, "review", f"no candidate passes the gates after {rnd} regen round(s) (best fails: {why}){unavail_note}")
 
 
@@ -521,9 +544,11 @@ def run(ctx: Any) -> dict[str, Any]:
         if tr_problem and not any(c.rec.route == "orig" for c in lst):
             selections.append(SelectionRecord(line_id=line.line_id, status="review", reason=tr_problem, n_candidates=len(lst)))
             continue
+        line_cer_max = cfg.score.interjection_cer_max if interj else cfg.score.gates.cer_max
+        ceiling = max(float(cfg.score.regen_cer_max), float(line_cer_max)) if cfg.score.regen_cer_max > 0 else None
         sel = select(
             line.line_id, [c.rec for c in lst], sidecars.get(line.line_id, {}), overrides.get(line.line_id, []),
-            cfg.score.regen_rounds, unavailable, line.src_wav, failed_counts.get(line.line_id, 0),
+            cfg.score.regen_rounds, unavailable, line.src_wav, failed_counts.get(line.line_id, 0), regen_cer_max=ceiling,
         )
         selections.append(sel)
 
@@ -558,6 +583,9 @@ def run(ctx: Any) -> dict[str, Any]:
     unchecked = sum(1 for x in selections if x.status == "review" and "gate not checked" in x.reason)
     if unchecked:
         summary["lines_with_unchecked_gates"] = unchecked
+    hopeless = sum(1 for x in selections if x.status == "review" and "a new take would not help" in x.reason)
+    if hopeless:
+        summary["review_without_regen"] = hopeless
     return summary
 
 
@@ -858,7 +886,12 @@ def _compute_groups(ctx: Any, cands: list[Cand], unavailable: dict[str, str], pa
                         continue
                     cont = [trs.get(x) for x in ((c.line.model_extra or {}).get("sustain_lines") or [])]
                     ref = cer_reference(c.side, c.tr, [x for x in cont if x is not None])
-                    hyp = r.get("text", "")
+                    hyp = str(r.get("text", "") or "")
+                    if not hyp.strip() and (ref or "").strip():
+                        # the model heard no words (a clip too short or too odd for it): not a CER of 1.0 for regen rounds
+                        # to chase, but a gate that could not be checked, so the line goes to a person
+                        failed(c, "cer", "the ASR heard no words in this take")
+                        continue
                     c.rec.metrics["cer"] = round(cer_fn(ref or "", hyp), 4)
                     setattr(c.rec, "asr_text", hyp)
                     partial.touch(c)
