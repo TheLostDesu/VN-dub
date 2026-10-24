@@ -18,6 +18,7 @@ import type {
   JobInfo,
   JobLog,
   ModelsReport,
+  PatchCoverage,
   PreviewItem,
   ProjectInfo,
   ProjectLite,
@@ -162,6 +163,8 @@ export const api = {
   customModels: () => http.get<CustomModel[]>("/api/models/custom"),
   deleteCustomModel: (id: string) => http.del<{ ok: boolean }>(`/api/models/custom/${encodeURIComponent(id)}`),
   installPlan: () => http.get<InstallPlan>("/api/install/plan"),
+  /** what the built patch covers; null while there is no patch (the finished full run carries the same in `result.coverage`) */
+  patchCoverage: () => http.get<{ coverage: PatchCoverage | null }>("/api/patch/coverage"),
   installApply: (backup: boolean) => http.post<JobInfo>("/api/install/apply", { backup }),
   installRollback: (backup_id: string) => http.post<JobInfo>("/api/install/rollback", { backup_id }),
   installZip: () => http.post<JobInfo>("/api/install/zip"),

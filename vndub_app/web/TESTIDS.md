@@ -101,6 +101,7 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 | `game-problems-toggle`, `game-problems` | collapsible "Проблемные файлы" |
 | `game-advanced-toggle`, `game-asr-check-advanced`, `game-reimport-advanced` | Advanced |
 | `game-empty` | import finished but nothing was found |
+| `game-import-stale`, `game-import-stale-run` | warn callout + button when the game was imported by an older version of the app (`project.stale`) |
 
 ## Step 2 Translation (`screen-translate`)
 
@@ -144,7 +145,10 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 ## Step 5 Full run (`screen-run`)
 
 `run-title`, `run-setup`, `run-shutdown` (checkbox, default off), `run-shutdown-warning`, `run-start`, `run-closable`,
-`run-progress`, `run-job` (with `job-stage-list`, `job-log`), `run-gpu` (only while `gpu` events arrive), `run-done`, `run-to-review`.
+`run-progress`, `run-job` (with `job-stage-list`, `job-log`), `run-gpu` (only while `gpu` events arrive), `run-done`, `run-to-review`,
+`run-coverage` (callout under `run-done`: what the patch holds; warn tone when something is provisional or left out; inside `run-coverage-installed`,
+`run-coverage-provisional` + `run-coverage-review` (button to the review), `run-coverage-left-out`, `run-coverage-narration`; the last three only when the number is above 0),
+`run-stale-import` + `run-stale-import-go` (warn callout when the project was imported by an older version; button to Step 1).
 
 ## Step 6 Review (`screen-review`)
 
@@ -155,7 +159,8 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 | `review-prefer-a`, `review-apply`, `review-apply-job`, `review-apply-result` | bulk "Пометить всех, как A..." and "Применить изменения" (shows the diff count) |
 | `review-counts`, `review-list`, `review-row-<id>` (`data-status`), `review-empty` | list (virtualized: only rows near the viewport exist in the DOM) |
 | `review-prev`, `review-next` | previous / next line |
-| `review-detail` (`data-line`), `review-detail-status`, `review-why`, `review-asr-badge`, `review-delivery-chip` | selected line |
+| `review-detail` (`data-line`), `review-detail-status`, `review-why`, `review-asr-badge`, `review-delivery-chip`, `review-detail-patch` | selected line (`review-detail-patch`: "в патче как предварительная" / "нет в патче", absent for a line that is in the patch normally) |
+| `review-row-patch-<id>` | chip in a list row: "предварительная" (the line is in the patch with a take that failed the checks) or "нет в патче" |
 | `review-text-src` (only for `text_from_asr` lines: editable) / `review-text-src-readonly`, `review-src-edit`, `review-save-src` | source text |
 | `review-text-tgt`, `review-save-text` | translated text |
 | `review-original`, `review-candidates`, `candidate-<label>` (`data-selected`), `candidate-label-<label>`, `candidate-player-<label>`, `candidate-verdicts-<label>`, `verdict-<voice|emotion|clarity|length|quality>` (`data-level`), `candidate-accept-<label>`, `review-no-candidates` | original and variants |
@@ -174,7 +179,7 @@ They use physical keys (`event.code`), so they also work on the Russian layout.
 `install-manual` (manual engines: never a success message), `install-actions`, `install-backup` (checkbox, default on),
 `install-apply`, `install-apply-job`, `install-done`, `install-backup-select`, `install-no-backups`, `install-rollback`,
 `install-rollback-dialog`, `install-rollback-confirm`, `install-rollback-job`, `install-open-patch`, `install-zip`, `install-zip-job`,
-`install-zip-done`, `install-zip-open`.
+`install-zip-done`, `install-zip-open`, `install-coverage` (three chips beside the file count: `install-coverage-installed`, `install-coverage-provisional`, `install-coverage-left-out`; absent for a patch built before the coverage existed).
 
 ## Models and tools (`/#/models`, `/#/tools`)
 

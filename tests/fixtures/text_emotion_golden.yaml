@@ -211,3 +211,28 @@ cases:
     lines: [{sp: hero, text: "あはは。"}]
     llm: {emotion: happy, intensity: 0.7, tempo: normal, loudness: normal, events: [breath], confidence: 0.9}
     expect: {layer: llm, emotion: happy, events: [laugh, breath]}
+
+  # ------------------------------------------------------------------ laughter in every script (vndub.text.laughter feeds the rule pass)
+  - id: english_haha_is_a_hearty_laugh
+    lines: [{sp: hero, text: "Haha, no way!"}]
+    expect: {layer: rule, emotion: happy, events: [laugh], notes: [a hearty laugh], intensity: [0.7, 0.85]}
+
+  - id: english_hehe_trailing_into_dots_is_nervous
+    lines: [{sp: hero, text: "Hehe... sorry about that."}]
+    expect: {layer: rule, emotion: embarrassed, events: [laugh], notes: [a nervous laugh]}
+
+  - id: english_stage_direction_is_weaker_evidence
+    lines: [{sp: hero, text: "*laughs*"}]
+    expect: {layer: rule, emotion: happy, events: [laugh], confidence: [0.6, 0.7], intensity: [0.3, 0.45]}
+
+  - id: evil_laugh_has_no_better_label_than_other
+    lines: [{sp: hero, text: "Mwahaha! Bow before me!"}]
+    expect: {layer: rule, emotion: other, events: [laugh], notes: [a sinister laugh]}
+
+  - id: stage_direction_in_the_translation
+    lines: [{sp: hero, text: "そうだね。", tgt: "(смеётся) Точно."}]
+    expect: {layer: rule, emotion: happy, events: [laugh]}
+
+  - id: giggle_in_hiragana_and_translation_count_once
+    lines: [{sp: hero, text: "くすくす。", tgt: "Хи-хи-хи."}]
+    expect: {layer: rule, emotion: happy, events: [laugh], notes: [giggling]}

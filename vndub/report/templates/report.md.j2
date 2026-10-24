@@ -60,13 +60,34 @@ not available
 {% if selection %}{% for k, v in selection.items() %}{{ k }}: {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}{% else %}not available{% endif %}
 
 
+## Patch coverage
+
+{% if coverage %}
+dubbed lines {{ coverage.dub_lines }} · in the patch {{ coverage.installed }} (passed the checks {{ coverage.installed - coverage.provisional }}, provisional {{ coverage.provisional }}) · left out {{ coverage.left_out }}{% if coverage.left_out %} ({{ coverage.left_out_reasons_text }}){% endif %} · narration never dubbed {{ coverage.narration }}
+
+{% if coverage.provisional %}
+Provisional lines: no take passed every quality check, the best take is installed instead of a silent line; listen to them in Review.
+{% endif %}
+{% if coverage.left_out %}
+Left out lines are silent in the game{% if coverage.include_review_lines == "skip" %} (`master.include_review_lines` is `skip`){% endif %}:
+
+| line | why | detail |
+|---|---|---|
+{% for x in coverage.left_out_lines %}
+| {{ x.line_id }} | {{ x.status }} | {{ x.reason | replace("|", "/") }} |
+{% endfor %}
+{% endif %}
+{% else %}
+not available (run `vndub master`)
+{% endif %}
+
 ## Review queue ({{ queue_total }})
 
 {% if queue %}
-| line | speaker | from | status | reason |
-|---|---|---|---|---|
+| line | speaker | from | status | in patch | reason |
+|---|---|---|---|---|---|
 {% for q in queue %}
-| {{ q.line_id }} | {{ q.speaker }} | {{ q.source }} | {{ q.status }} | {{ q.reason | replace("|", "/") }} |
+| {{ q.line_id }} | {{ q.speaker }} | {{ q.source }} | {{ q.status }} | {{ q.patch }} | {{ q.reason | replace("|", "/") }} |
 {% endfor %}
 {% else %}
 empty

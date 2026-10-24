@@ -81,10 +81,10 @@ backend whose "Commercial" column is "no" (falling back or marking lines for rev
 | [chatterbox_ml](https://github.com/resemble-ai/chatterbox) | tts | `ResembleAI/chatterbox` | chatterbox | 4.0 | MIT (Perth watermark embedded) | yes | - | default | not verified: env 'chatterbox' not created |
 | [cosyvoice3](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512) | tts | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | funasr | 3.8 | Apache-2.0 | yes | - | default | not verified: weights missing: run `vndub models pull cosyvoice3` |
 | [f5_ru](https://huggingface.co/Misha24-10/F5-TTS_RUSSIAN) | tts | `Misha24-10/F5-TTS_RUSSIAN` | f5 | 3.0 | CC-BY-NC-4.0 (Russian checkpoint) | no | - | optional | not verified: env 'f5' not created |
-| [fish_s2](https://huggingface.co/fishaudio/s2-pro) | tts | `fishaudio/s2-pro-gguf` | gguf | 7.5 | Fish Audio Research License (non-commercial) | no | - | optional | not verified: env 'gguf' not created |
+| [fish_s2](https://huggingface.co/fishaudio/s2-pro) | tts | `audio-cpp/audio.cpp-gguf` (`Fish-Audio-S2-Pro-GGUF/fish-audio-s2-pro-q8_0.gguf`) | gguf | 7.5 | Fish Audio Research License (non-commercial) | no | - | optional | not verified: env 'gguf' not created |
 | [higgs_tts3](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b) | tts | `bosonai/higgs-audio-v3-tts-4b` | higgs | 6.0 | Boson Research & Non-Commercial License | no | - | optional | not verified: env 'higgs' not created |
 | mock_tts | tts | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [moss_tts](https://github.com/OpenMOSS/MOSS-TTS) | tts | `OpenMOSS-Team/MOSS-TTS-v1.5-GGUF` | gguf | 7.0 | Apache-2.0 | yes | - | optional | not verified: env 'gguf' not created |
+| [moss_tts](https://github.com/OpenMOSS/MOSS-TTS) | tts | `christopherthompson81/MOSS-TTS-v1.5-GGUF` (`moss_tts_v15_q4_k_codec_f16.gguf`) | gguf | 9.5 | Apache-2.0 | yes | - | optional | not verified: env 'gguf' not created |
 | [qwen3_tts](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`, `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | main | 4.5 | Apache-2.0 | yes | - | default | not verified: env 'main' not created |
 | [qwen3_tts_06b](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | main | 2.5 | Apache-2.0 | yes | - | optional | not verified: env 'main' not created |
 | [qwen3_tts_voicedesign](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | main | 4.5 | Apache-2.0 | yes | - | default | not verified: env 'main' not created |
@@ -166,8 +166,31 @@ of a traceback.
   is recorded but not enforced. Training runs as a child process (Applio reads `APPLIO_LOGS_DIR` at import).
 * **Seed-VC**: archived upstream (GPL-3.0); v1 wrapper = timbre-only conversion (equivalent of v2
   `convert_style=false`). `SeedVCWrapper.convert_voice` is a generator even without streaming.
-* **Fish S2 / Zonos2 / MOSS-TTS**: command lines are UNVERIFIED; they are templates in
-  `options.args` (see `adapters/gguf/cli_impl.py`) so the flags can be fixed from `pipeline.yaml`.
+* **Fish S2 / Zonos2 / MOSS-TTS**: command lines are UNVERIFIED (not run on the build machine); they are
+  templates in `options.args` (see `adapters/gguf/cli_impl.py`) so the flags can be fixed from `pipeline.yaml`.
+  Fish S2 and MOSS-TTS carry the command lines from the audio.cpp docs (`--task clon --family fish_audio` /
+  `moss_tts_v15`); Zonos2 still uses the adapter's generic template (the real CLI is
+  `zonos2-cli <model.gguf> --tts <text> <out.wav> --dac dac.gguf [--spk <ref>]`).
+* **Where the GGUF weights come from (checked on huggingface.co, 2026-10-24).** The first versions of this table
+  named two repos that do not exist (`fishaudio/s2-pro-gguf`, `OpenMOSS-Team/MOSS-TTS-v1.5-GGUF`); the app showed
+  them as a 404. `uv run pytest tests/test_registry_repos_network.py` (with `VNDUB_NETWORK_TESTS=1`) now checks every
+  hub weight of the registry against the real hub.
+  * **Fish S2 Pro** runs on audio.cpp (`audiocpp_cli`, https://github.com/0xShug0/audio.cpp/releases). Its
+    official weight hub `audio-cpp/audio.cpp-gguf` has `Fish-Audio-S2-Pro-GGUF/` with bf16 (10.2 GB) and Q8_0 (6.3 GB,
+    the one used; self-contained, measured on an 8 GB laptop GPU) only. A Q4_K/Q6_K file does not exist anywhere in
+    this format: audio.cpp's `docs/proposals/fish_audio_quantization_recipe.md` makes it locally from the Q8_0
+    (`audiocpp_gguf`); put it next to the Q8_0 and set `options.model_glob`. The community `rodrigomt/s2-pro-gguf`
+    (Q4_K_M 3.6 GB + `tokenizer.json`) is for another engine, `s2.cpp` (no Windows binaries, build from source),
+    and is not used. Licence of the weights: Fish Audio Research License (non-commercial).
+  * **MOSS-TTS v1.5** has no official GGUF. The official `OpenMOSS-Team/MOSS-TTS-GGUF` is v1.0 (gated, needs a
+    Hugging Face login, plus `embeddings/`, `lm_heads/` and the ONNX tokenizer `MOSS-Audio-Tokenizer-ONNX`) for
+    OpenMOSS's own Python + llama.cpp pipeline, which has no CLI the adapter can drive. Used instead: the audio.cpp
+    package `christopherthompson81/MOSS-TTS-v1.5-GGUF` (Apache-2.0, ungated, the repo audio.cpp's own
+    `model_specs/moss_tts_v15.json` installs from; Q4_K 9.3 GB, Q8_0 13.2 GB, bf16 20.5 GB). Cloning peaks at about
+    9 GiB VRAM with Q4_K (RTX 3090 figure from the package card), so it does **not** fit 8 GB; audio.cpp's docs list
+    only en/zh as tested languages for this family, and the adapter passes no `--language`.
+  * **Zonos2**: `Zyphra/ZONOS2-GGUF` exists; only the `allow` patterns were wrong (`*vocoder*` and `*.json` match
+    nothing: the vocoder is `dac.gguf`, the speaker encoder `spk-encoder.gguf`).
 * **Higgs TTS 3** ships for SGLang-Omni (Linux); the adapter is a client of a server on 127.0.0.1
   (WSL2/Docker on the same machine). Non-loopback URLs are refused.
 * **VoxCPM2** (~8 GB official) stays disabled until its selftest passes on the target GPU;

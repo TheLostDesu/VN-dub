@@ -1,6 +1,7 @@
 """Step 7: put the voice patch into the game, with backup and rollback. Never claims success for manual engines.
 
-``GET  /api/install/plan``         what will be written (+ ``INSTALL.md``, ``manifest_patch.json`` summary, backups)
+``GET  /api/install/plan``         what will be written (+ ``INSTALL.md``, ``manifest_patch.json`` summary with the patch ``coverage``, backups)
+``GET  /api/patch/coverage``      ``{coverage}``: dubbed / installed / provisional / left out / narration counts of the built patch
 ``POST /api/install/apply``        ``{backup: true}`` -> Job; refuses with ``install_manual_only`` for manual engines
 ``POST /api/install/rollback``     ``{backup_id}`` -> Job (restores replaced files, removes files the patch added)
 ``POST /api/install/zip``          -> Job, result ``{path}`` (patch folder + INSTALL.md for a friend, no originals)
@@ -203,18 +204,59 @@ def _rel_target(game_dir: Path, base: Path, rel: Path) -> str:
     return PurePosixPath((base / rel).relative_to(game_dir).as_posix()).as_posix()
 
 
-def _manifest_summary(patch_dir: Path) -> dict[str, Any] | None:
-    f = patch_dir / "manifest_patch.json"
+COVERAGE_COUNTS = ("dub_lines", "installed", "provisional", "provisional_review", "provisional_regen", "left_out", "narration")
+
+
+def _count(v: Any) -> int:
+    try:
+        return max(0, int(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def public_coverage(cov: Any) -> dict[str, Any] | None:
+    """The ``coverage`` of ``manifest_patch.json`` (``vndub.stages.pack.patch_coverage``) as the UI gets it: the counts, the
+    ``left_out_reasons`` with underscores instead of spaces (``no winner`` -> ``no_winner``: i18n keys ``coverage.reason.<reason>``)
+    and no per-line list (``left_out_lines`` stays in the manifest). ``None`` for a patch built before the coverage existed."""
+    if not isinstance(cov, dict):
+        return None
+    out: dict[str, Any] = {k: _count(cov.get(k)) for k in COVERAGE_COUNTS}
+    reasons = cov.get("left_out_reasons")
+    out["left_out_reasons"] = {str(k).replace(" ", "_"): _count(v) for k, v in reasons.items() if _count(v)} if isinstance(reasons, dict) else {}
+    out["include_review_lines"] = str(cov.get("include_review_lines") or "")
+    return out
+
+
+def read_manifest(path: Path | str | None) -> dict[str, Any] | None:
+    """``manifest_patch.json`` (the file, or the patch folder that holds it), ``None`` when it is missing or unreadable."""
+    if not path:
+        return None
+    f = Path(path)
+    if f.is_dir():
+        f = f / "manifest_patch.json"
     try:
         data = json.loads(f.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def coverage_of(path: Path | str | None) -> dict[str, Any] | None:
+    """What the patch covers (:func:`public_coverage`) read from its manifest."""
+    data = read_manifest(path)
+    return public_coverage(data.get("coverage")) if data else None
+
+
+def _manifest_summary(patch_dir: Path) -> dict[str, Any] | None:
+    data = read_manifest(patch_dir)
+    if data is None:
         return None
     backends: dict[str, int] = {}
     routes: dict[str, int] = {}
     for e in data.get("files", []):
         backends[str(e.get("backend") or "-")] = backends.get(str(e.get("backend") or "-"), 0) + 1
         routes[str(e.get("route") or "-")] = routes.get(str(e.get("route") or "-"), 0) + 1
-    return {"count": len(data.get("files", [])), "engine": data.get("engine"), "backends": backends, "routes": routes}
+    return {"count": len(data.get("files", [])), "engine": data.get("engine"), "backends": backends, "routes": routes, "coverage": public_coverage(data.get("coverage"))}
 
 
 def backups_root(slug: str) -> Path:
@@ -539,6 +581,18 @@ class RollbackBody(BaseModel):
 @router.get("/api/install/plan")
 def api_plan(slug: str | None = None) -> dict[str, Any]:
     return build_plan(slug)
+
+
+@router.get("/api/patch/coverage")
+def api_coverage(slug: str | None = None) -> dict[str, Any]:
+    """``{coverage}``: what the built patch covers (:func:`public_coverage`), ``null`` while there is no patch (or one built
+    before the coverage existed). The Run screen asks for it when the app is opened on a finished run (no job to read it from)."""
+    h = _project(slug)
+    try:
+        engine = _project_info(h).engine
+    except AppError:
+        return {"coverage": None}
+    return {"coverage": coverage_of(patch_dir_of(h, engine))}
 
 
 @router.post("/api/install/apply")

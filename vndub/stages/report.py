@@ -203,10 +203,22 @@ def collect(ctx: Any) -> dict[str, Any]:
     for s in sel.values():
         if s.status in ("review", "regen"):
             queue.append({"line_id": s.line_id, "source": "score", "status": s.status, "reason": s.reason})
+    # what the patch holds: how many lines are provisional / left out, and which review lines ended up where
+    in_final = {f.line_id: f for f in finals if p.abs(f.encoded).exists()}
+    data["coverage"] = None
+    if p.final_index.exists():
+        from vndub.stages.pack import patch_coverage
+
+        data["coverage"] = patch_coverage(ctx, list(in_final.values()), sel)
+        data["coverage"]["left_out_lines"] = data["coverage"]["left_out_lines"][:100]
+        data["coverage"]["left_out_reasons_text"] = ", ".join(f"{k} {v}" for k, v in sorted(data["coverage"]["left_out_reasons"].items()))
     for q in queue:
         l = by_line.get(q["line_id"])
         q["speaker"] = l.speaker_id if l else ""
         q["text"] = (l.text_src if l else "")[:60]
+        q["patch"] = ""  # where a review line of the quality step ended up: installed as provisional, or left out of the patch
+        if q["source"] == "score" and p.final_index.exists():
+            q["patch"] = "provisional" if q["line_id"] in in_final else "left out"
     data["queue"] = queue[:300]
     data["queue_total"] = len(queue)
     tick("queue")
@@ -315,10 +327,15 @@ def run(ctx: Any) -> dict[str, Any]:
     (rd / "index.html").write_text(html, encoding="utf-8")
     if ctx.cfg.report.markdown:
         (rd / "report.md").write_text(md, encoding="utf-8")
-    return {
+    out = {
         "html": str(rd / "index.html"),
         "lines": data["overview"]["lines"],
         "finals": data["overview"]["finals"],
         "review_queue": data["queue_total"],
         "substitutions": len(data["substitutions"]),
     }
+    cov = data.get("coverage")
+    if cov:  # the patch's gaps are in the summary, not only in the document
+        out["provisional"] = cov["provisional"]
+        out["left_out"] = cov["left_out"]
+    return out

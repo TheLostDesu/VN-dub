@@ -126,6 +126,8 @@ translate:
 
 # text_emotion: delivery from text for lines without original audio (stage `text_emotion`, `vndub text-emotion`).
 # Everything below is the default; uncomment a key to change it.
+# Laughter in the source text (any script: あはは / haha / ха-ха, *laughs* / (笑)) gives the `laugh` event, an emotion, a note and the laugh kind
+# (language: project.src_lang); how the laugh is then SPOKEN is synth.laughter above.
 # text_emotion:
 #   enabled: true
 #   cues: "configs/delivery_cues.yaml"  # bilingual table: narration speech verbs / manner adverbs -> emotion, intensity, tempo, loudness, events
@@ -211,6 +213,10 @@ synth:
   high_arousal: 0.75
   seed_base: 1234
   voice_unvoiced: false          # also dub speaker lines WITHOUT original audio (route P: performer voice only; narration never); the app sets true
+  laughter:                      # written laughter ("Ха-ха-ха", "Haha", "*laughs*") is not read letter by letter
+    enabled: true                # false = the TTS gets the text exactly as translated (stage directions included)
+    table: "configs/laughter.yaml"   # per target language and laugh kind (hearty chuckle giggle evil nervous snort): the spelling the model voices as a laugh,
+                                 # backend overrides (CosyVoice [laughter] token, Fish/Higgs tags) in its `backends:` block; edit it to tune per voice
   # routes: P is not in the default dict on purpose: it is picked per line for characters without original audio / with
   # characters.yaml route: P. Tuning: characters.yaml <sid>.performer.tuning (pitch_st, speed, expressiveness, energy,
   # timbre_preset, character_note) and per-line "tuning" overrides; see docs/PIPELINE.md (synth).
@@ -248,7 +254,11 @@ master:
     default_lufs: -20.0
   match_silence_profile: true
   # voice tuning (characters.yaml performer.tuning): pitch / tempo for backends without a native knob and the energy -> loudness offset (+-3 dB) are applied here
-  include_review_lines: skip     # skip | provisional (use the best candidate of review lines)
+  # review lines (no take passed the gates after the regen rounds) and lines still in regen:
+  #   provisional = install the best take, mark the line provisional (INSTALL.md, manifest_patch.json, report say how many;
+  #                 check them in Review). A mediocre take in the game beats a line that stays silent.
+  #   skip        = leave them out of the patch; they are silent in the game (counted in the master summary / INSTALL.md)
+  include_review_lines: provisional
 
 pack:
   kirikiri: {mode: patch_xp3, patch_name: "", subdir: ""}   # patch_xp3 | unencrypted_dir

@@ -34,6 +34,6 @@ vntextpatch: ""             # VNTextPatch.exe (text + names for 22 engines)
 # models
 llama_server: ""            # llama.cpp llama-server.exe (CUDA 12 build) for translate
 applio_dir: ""              # Applio checkout if not in .venvs/rvc/src/Applio
-audiocpp: ""                # Fish S2 Pro GGUF runner
+audiocpp: ""                # audio.cpp CLI: Fish S2 Pro and MOSS-TTS v1.5 GGUF runner
 zonos2_cli: ""
 moss_tts_cli: ""

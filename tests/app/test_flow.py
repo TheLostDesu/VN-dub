@@ -124,6 +124,7 @@ def test_01_open_project_and_import(flow: Flow) -> None:
     assert any("vndub.link" in line for line in j["log_tail"]), "stage log lines are forwarded to the job log"
     proj = flow.get("/api/project")
     assert proj["engine"] == "renpy" and proj["project_yaml"]["engine"] == "renpy"
+    assert proj["stale"] == [], "a project imported by this version is not stale"
     assert {"detect", "extract", "parse", "link", "analyze"} <= set(proj["stage_status"]) and proj["active_job"] is None
     assert proj["stage_status"]["link"]["summary"].get("mode") in ("no_asr", None)
     flow.done.add("import")
@@ -629,6 +630,12 @@ def test_22_full_run(flow: Flow) -> None:
     assert j["kind"] == "full" and j["stages"] == ["voicebank", "synth", "score", "master", "pack", "report"]
     assert j["stage_index"] == 6 and j["result"]["shutdown"] is False and sum(j["result"]["score"].values()) >= 26
     assert j["stage"] == "report" and j["state"] == "done" and j["error"] is None
+    cov = j["result"]["coverage"]  # what the patch built by this run covers (the Run screen's "done" callout)
+    assert set(cov) == {"dub_lines", "installed", "provisional", "provisional_review", "provisional_regen", "left_out", "left_out_reasons", "narration", "include_review_lines"}
+    assert cov["dub_lines"] >= 26 and cov["installed"] + cov["left_out"] == cov["dub_lines"] and 0 <= cov["provisional"] <= cov["installed"]
+    assert cov["include_review_lines"] == "provisional" and sum(cov["left_out_reasons"].values()) == cov["left_out"]
+    assert cov["narration"] > 0, "the fixture has narration lines without a speaker"
+    assert flow.get("/api/patch/coverage") == {"coverage": cov}, "an app opened on the finished run reads the same numbers"
     st = flow.get("/api/project")["stage_status"]
     for stage in ("translate", "voicebank", "synth", "score", "master", "pack", "report"):
         assert st[stage]["finished"] and not st[stage]["error"], stage
@@ -656,8 +663,9 @@ def test_24_review_list_filters(flow: Flow) -> None:
     assert set(r) >= {"items", "facets", "counts", "total"} and r["total"] == len(r["items"]) >= 20
     assert r["counts"]["ok"] + r["counts"]["check"] + r["counts"]["failed"] == r["total"]
     it = r["items"][0]
-    assert set(it) == {"line_id", "speaker_id", "name", "scene", "status", "composite", "text_src", "text_tgt", "winner_label", "flags", "delivery", "touched"}
+    assert set(it) == {"line_id", "speaker_id", "name", "scene", "status", "composite", "text_src", "text_tgt", "winner_label", "flags", "delivery", "touched", "patch"}
     assert it["status"] in ("ok", "check", "failed") and it["touched"] is False and it["winner_label"] in ("A", "B", "C", "D")
+    assert {i["patch"] for i in r["items"]} <= {"ok", "provisional"}, "after the full run every listed line has a file in the patch"
     assert {s["speaker_id"] for s in r["facets"]["speakers"]} >= {"sakura", "hero"} and {s["scene"] for s in r["facets"]["scenes"]} >= {"start", "after_menu"}
     # voiced -> audio delivery; unvoiced -> the text passport's layer
     by = {i["line_id"]: i for i in r["items"]}
@@ -880,3 +888,40 @@ def test_29_patch_audio_served_from_out(flow: Flow) -> None:
     rel = voice.relative_to(out).as_posix()
     r = flow.client.get(f"/api/audio/{flow.slug}/_out/{rel}")
     assert r.status_code == 200 and r.headers["content-type"].startswith("audio/ogg")
+
+
+# ============================================================================
+# Patch coverage: provisional lines
+# ============================================================================
+
+
+def test_30_provisional_lines_in_the_coverage_the_plan_and_the_review(flow: Flow) -> None:
+    """Gates nobody can pass: every line is 'check', master installs its best take as provisional, and everything that shows the
+    patch says so -- the coverage endpoint, the install plan, the review rows; accepting a line and applying moves it out."""
+    flow.needs("full")
+    before = flow.get("/api/patch/coverage")["coverage"]
+    assert before["provisional"] == 0
+    flow.job("/api/stages/score/run", {"force": True, "sets": {"score.gates.utmos_min": 99.0}})
+    flow.job("/api/stages/master/run", {})
+    flow.job("/api/stages/pack/run", {})
+
+    cov = flow.get("/api/patch/coverage")["coverage"]
+    assert cov["provisional"] == cov["provisional_review"] + cov["provisional_regen"] > 0
+    assert cov["installed"] == before["installed"] and cov["left_out"] == 0, "provisional lines are in the patch, none is left out"
+    assert flow.get("/api/install/plan")["manifest"]["coverage"] == cov
+    rows = flow.get("/api/review/lines")["items"]
+    prov = [i for i in rows if i["patch"] == "provisional"]
+    assert len(prov) == cov["provisional"] and all(i["status"] == "check" for i in prov)
+    assert flow.get(f"/api/review/lines/{prov[0]['line_id']}")["line"]["patch"] == "provisional"
+    manifest = json.loads((flow.data / "projects" / flow.slug / "out" / "renpy" / "manifest_patch.json").read_text(encoding="utf-8"))
+    assert sum(1 for f in manifest["files"] if f["status"] == "provisional") == cov["provisional"] and all(f.get("reason") is not None for f in manifest["files"] if f["status"] == "provisional")
+
+    lid = prov[0]["line_id"]
+    flow.post(f"/api/review/lines/{lid}/action", {"action": "accept", "payload": {}})
+    assert next(i for i in flow.get("/api/review/lines")["items"] if i["line_id"] == lid)["patch"] == "provisional", "until the apply the patch still holds the provisional take"
+    flow.job("/api/review/apply")  # masters and packs again
+    row = next(i for i in flow.get("/api/review/lines")["items"] if i["line_id"] == lid)
+    assert row["patch"] == "ok" and row["status"] == "ok"
+    after = flow.get("/api/patch/coverage")["coverage"]
+    assert after["provisional"] == cov["provisional"] - 1 and after["installed"] == cov["installed"]
+    assert flow.get("/api/install/plan")["manifest"]["coverage"] == after

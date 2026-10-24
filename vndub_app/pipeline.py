@@ -317,6 +317,30 @@ def pipeline_ctx(
         session.sweep_orphans("leftover after a model job")  # a grandchild of an adapter outlives its graceful shutdown
 
 
+#: Stages whose output changed meaning when their ``VERSION`` was bumped, so that a project imported by an older version has to
+#: import again (``parse``: Ren'Py dialogue identifiers are computed as Ren'Py does; the unvoiced lines are named by them in the patch).
+STALE_WATCH = ("parse",)
+
+
+def stale_stages(status: dict[str, Any]) -> list[dict[str, str]]:
+    """``[{stage, ran, now}]`` for the watched stages whose last recorded run was made by another version of the stage
+    (``stage_status.json`` keeps the ``version`` a stage ran with). The Game and Run screens tell the user to import again; a
+    project that never ran the stage has no entry. A stage records its version when a run STARTS, so the entry disappears as
+    soon as the new import reaches the stage."""
+    from vndub.stages.common import stage_module
+
+    out: list[dict[str, str]] = []
+    for name in STALE_WATCH:
+        rec = status.get(name) if isinstance(status, dict) else None
+        ran = rec.get("version") if isinstance(rec, dict) else None
+        if ran is None:
+            continue
+        now = str(getattr(stage_module(name), "VERSION", "1"))
+        if str(ran) != now:
+            out.append({"stage": name, "ran": str(ran), "now": now})
+    return out
+
+
 def config_has(section: str, key: str) -> bool:
     """Does the pipeline config schema know ``section.key`` (other agents add keys while the app is built)."""
     try:
@@ -519,6 +543,19 @@ def _build_preview(slug: str, p: dict[str, Any]) -> FlowFn:
     return run
 
 
+def run_coverage(res: dict[str, Any]) -> dict[str, Any] | None:
+    """What the patch built by this run covers: dubbed / installed / provisional / left out (with the reasons) / narration lines.
+
+    Read from the manifest the pack stage wrote (``coverage`` of ``manifest_patch.json``, see
+    ``vndub.stages.pack.patch_coverage``), without its per-line list; ``None`` when the pack stage did not run or the
+    manifest is unreadable (the screen then shows nothing rather than a guess).
+    """
+    from vndub_app import patch_install
+
+    pack = res.get("pack")
+    return patch_install.coverage_of(pack.get("manifest") if isinstance(pack, dict) else None)
+
+
 @flow("full", heavy=True)
 def _build_full(slug: str, p: dict[str, Any]) -> FlowFn:
     def run(job: JobContext) -> dict[str, Any]:
@@ -528,6 +565,7 @@ def _build_full(slug: str, p: dict[str, Any]) -> FlowFn:
         with pipeline_ctx(h, job) as ctx:
             res = run_stages(ctx, job, names, regen=True)
         out: dict[str, Any] = {"score": (res.get("score") or {}).get("status", {}), "shutdown": False}
+        out["coverage"] = run_coverage(res)
         if p.get("shutdown_when_done"):
             from vndub_app import system
 

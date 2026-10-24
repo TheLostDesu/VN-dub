@@ -275,6 +275,15 @@ export default function ReviewScreen() {
                     </span>
                     <span className="review-row-meta">
                       {it.touched ? <Chip tone="info">{t("review.touched")}</Chip> : null}
+                      {it.patch === "provisional" ? (
+                        <Chip tone="warn" title={t("review.patch.provisional_title")} testid={`review-row-patch-${it.line_id}`}>
+                          {t("review.patch.provisional_short")}
+                        </Chip>
+                      ) : it.patch === "none" ? (
+                        <Chip tone="bad" title={t("review.patch.none_title")} testid={`review-row-patch-${it.line_id}`}>
+                          {t("review.patch.none")}
+                        </Chip>
+                      ) : null}
                       {it.flags?.includes("text_from_asr") ? <Chip tone="warn">{t("review.asr_badge_short")}</Chip> : null}
                       {it.delivery?.source === "text" ? <Chip tone="accent">{t("review.delivery.short")}</Chip> : null}
                       {it.composite !== null && it.composite !== undefined ? <span className="muted">{fmtNumber(it.composite, 2)}</span> : null}

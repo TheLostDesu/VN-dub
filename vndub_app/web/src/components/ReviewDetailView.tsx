@@ -168,6 +168,15 @@ export const ReviewDetailView = forwardRef<ReviewDetailHandle, Props>(function R
           </Chip>
           {line.composite !== null && line.composite !== undefined ? <Chip title={t("review.composite_title")}>{t("review.composite", { v: fmtNumber(line.composite, 2) })}</Chip> : null}
           {line.touched ? <Chip tone="info">{t("review.touched")}</Chip> : null}
+          {line.patch === "provisional" ? (
+            <Chip tone="warn" title={t("review.patch.provisional_title")} testid="review-detail-patch">
+              {t("review.patch.provisional")}
+            </Chip>
+          ) : line.patch === "none" ? (
+            <Chip tone="bad" title={t("review.patch.none_title")} testid="review-detail-patch">
+              {t("review.patch.none")}
+            </Chip>
+          ) : null}
           {fromAsr ? (
             <Chip tone="warn" testid="review-asr-badge" title={t("review.asr_badge_title")}>
               {t("review.asr_badge")}

@@ -84,7 +84,7 @@ class _CLI(TTSImpl):
 
 class FishS2CLI(_CLI):
     tool = "audio.cpp"
-    hint = "https://github.com/andreaabcj-cmd/fish-audio-s2-pro-realtime-local-tts"
+    hint = "https://github.com/0xShug0/audio.cpp/releases"
     default_glob = "*Q4_K*.gguf"
     default_args = ["--model", "{model}", "--text", "{text}", "--reference", "{ref}", "--reference-text", "{ref_text}", "--seed", "{seed}", "--output", "{out}"]
 

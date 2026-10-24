@@ -557,3 +557,55 @@ def test_a_living_server_that_answers_badly_keeps_the_retry_path(make_ctx, tmp_p
     assert got == {} and http.calls > 2  # the retry at T=0 and the halves ran
     timeout = _Failing(TimeoutError("timed out"), proc=SimpleNamespace(poll=lambda: None))
     assert _translator(ctx, timeout).translate(_batch(["a", "b"]), [], "") == {} and timeout.calls > 1
+
+
+# ---- laughter: flags for the score and synth stages ---------------------------------------------------------------------------
+
+EN_LAUGH = [
+    ("s01_01", "I got a perfect score on the test!"),
+    ("s01_02", "What's wrong, Sakura?"),
+    ("s01_03", "Haha!"),
+    ("s01_04", "Haha, no way!"),
+    ("s01_05", "That is so funny, really."),
+    ("s01_06", "(laughs) You know it's not like that."),
+]
+EN_LAUGH_DICT = {
+    "I got a perfect score on the test!": "Я получила сто баллов на тесте!",
+    "What's wrong, Sakura?": "Что случилось, Сакура?",
+    "Haha!": "Ха-ха!",
+    "Haha, no way!": "Ха-ха, да ну!",
+    "That is so funny, really.": "Ха-ха-ха!",  # the model answered with a laugh: the translation is laughter only
+    "(laughs) You know it's not like that.": "Ты же знаешь, всё не так.",
+}
+
+
+def test_laughter_flags_in_an_english_script(make_ctx, tmp_path):
+    d = tmp_path / "dict.yaml"
+    d.write_text(yaml.safe_dump(EN_LAUGH_DICT, allow_unicode=True), encoding="utf-8")
+    ctx = make_ctx(tmp_path, sets={"translate.mock_dictionary": str(d), "translate.glossary": str(tmp_path / "g.yaml")})
+    build_project(ctx, [dict(line_id=lid, speaker_id="sakura", speaker_raw="Sakura", text=t, seconds=0.5) for lid, t in EN_LAUGH])
+    summary = run_stage("translate", ctx)
+    recs = _records(ctx)
+    assert summary["src_lang"] == "en" and summary["failed"] == 0
+    # laughter only in the script: an interjection (softer CER gate, short candidates, the original as a candidate) with a laugh
+    assert recs["s01_03"].text_tgt == "Ха-ха!" and recs["s01_03"].text_tts and recs["s01_03"].flags == ["laughter", "interjection"]
+    # a laugh and words: only the laughter flag, the line stays a sentence
+    assert recs["s01_04"].text_tgt == "Ха-ха, да ну!" and recs["s01_04"].flags == ["laughter"]
+    assert recs["s01_06"].flags == ["laughter"]  # a stage direction is a laugh too
+    # the translation is laughter only although the script is not
+    assert recs["s01_05"].flags == ["laughter", "interjection"]
+    # an ordinary sentence gets neither
+    assert recs["s01_01"].flags == [] and recs["s01_02"].flags == []
+    assert summary["interjections"] == 2 and summary["laughter"] == 4
+    ctx.models.close()
+
+
+def test_laughter_flags_keep_the_japanese_lexicon_path(make_ctx, tmp_path):
+    ctx = make_ctx(tmp_path, sets={"translate.glossary": str(tmp_path / "g.yaml")})
+    build_project(ctx, [dict(line_id="s01_01", speaker_id="sakura", speaker_raw="さくら", text="えへへ。", seconds=0.5), dict(line_id="s01_02", speaker_id="sakura", speaker_raw="さくら", text="そうなんだ、あははは！", seconds=0.5)])
+    summary = run_stage("translate", ctx)
+    recs = _records(ctx)
+    assert recs["s01_01"].source == "interjection" and recs["s01_01"].flags == ["interjection", "laughter"]
+    assert "laughter" in recs["s01_02"].flags and "interjection" not in recs["s01_02"].flags
+    assert summary["laughter"] == 2
+    ctx.models.close()

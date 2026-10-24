@@ -122,10 +122,23 @@ def test_fish_and_higgs_tags_follow_energy_and_calm():
     amplified = apply_tuning(HAPPY, {"expressiveness": 1.0})
     assert to_fish_tags(amplified).startswith("[very happy]")
     whisper = StyleSpec(emotion="sad", intensity=0.5, events=["whisper"])
-    assert "<|style:whisper|>" in to_higgs_tags(whisper)
-    assert "<|style:whisper|>" not in render(apply_tuning(whisper, {"expressiveness": 0.0}), caps("higgs_tts3"))["text_prefix"]
+    # Higgs Audio v3 card: style values are singing | shouting | whispering
+    assert "<|style:whispering|>" in to_higgs_tags(whisper)
+    assert "<|style:whispering|>" not in render(apply_tuning(whisper, {"expressiveness": 0.0}), caps("higgs_tts3"))["text_prefix"]
     # words cannot reach tag-only backends: the note is not in their prefix
     assert "ехидная" not in render(apply_tuning(HAPPY, {"character_note": "ехидная"}), caps("fish_s2"))["text_prefix"]
+
+
+def test_laughter_kind_follows_the_tuning():
+    giggle = StyleSpec(emotion="happy", intensity=0.5, events=["laughter"], laughter={"kind": "giggle", "units": 2, "only": False})
+    assert "giggling" in render(giggle, caps("qwen3_tts"))["instruct"]
+    assert render(giggle, caps("fish_s2"))["text_prefix"] == "[happy] [giggling]"
+    assert render(giggle, caps("voxcpm2"))["text_prefix"] == "(happy, giggling)"
+    # intensity scales the strength of the phrase; "always calm" drops the laugh, its kind and the laughter-only instruction
+    soft = apply_tuning(giggle, {"expressiveness": 0.2})
+    assert soft.laughter == giggle.laughter and "giggling softly" in render(soft, caps("qwen3_tts"))["instruct"]
+    calm = apply_tuning(giggle, {"expressiveness": 0.0})
+    assert calm.events == [] and calm.laughter is None and "giggl" not in render(calm, caps("qwen3_tts"))["instruct"]
 
 
 def test_chatterbox_exaggeration_scaled_by_expressiveness():

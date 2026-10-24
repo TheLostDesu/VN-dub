@@ -5,16 +5,23 @@ Status mapping (see ``viewdata.status_of``): selection ``auto`` / ``override`` -
 have a selection record are listed (nothing to review before ``score`` ran for them).
 Candidate labels A, B, C ... follow the composite order (best first); the review shows the
 top three plus the current winner.
+
+``check`` does not mean the line is missing from the game: with ``master.include_review_lines: provisional`` (the default) the best
+take of such a line is installed and marked ``provisional``. A row's ``patch`` says where the line stands in the built patch
+(:func:`patch_state`, from ``final_index.jsonl``): ``provisional`` | ``ok`` | ``none`` | ``null`` (no patch yet).
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 from typing import Any
 
-from vndub_app import appdirs, casting, session, verdicts, viewdata
+from vndub_app import appdirs, casting, session, translation, verdicts, viewdata
 from vndub_app.errors import AppError
+
+log = logging.getLogger("vndub_app.reviewdata")
 
 MAX_CANDIDATES = 3
 ACTIONS = ("accept", "reject", "regen", "set_text", "set_ref", "keep_original", "set_src_text", "tuning")
@@ -23,6 +30,7 @@ STATUS_ORDER = {"check": 0, "failed": 1, "ok": 2}
 _LOCK = threading.RLock()
 _LABELS: dict[str, tuple[tuple[Any, ...], dict[str, str]]] = {}
 _DELIVERY: dict[str, tuple[tuple[Any, ...], dict[str, dict[str, Any]]]] = {}
+_PATCH: dict[str, tuple[int, dict[str, str]]] = {}
 
 
 def label_for(i: int) -> str:
@@ -95,6 +103,24 @@ def delivery_map(h: appdirs.ProjectHandle, ctx: Any, snap: Any) -> dict[str, dic
     return out
 
 
+def patch_map(h: appdirs.ProjectHandle, ctx: Any) -> dict[str, str] | None:
+    """line_id -> ``provisional`` | ``ok`` for the lines the patch holds a file of (``final_index.jsonl``, written by master; a
+    ``provisional`` record is a line whose takes all failed the gates and whose best one was installed). ``None`` while nothing was
+    mastered, so the rows carry no patch state at all. Cached by the file's time stamp: ``review_apply`` masters and packs again."""
+    p = ctx.paths.final_index
+    if not p.exists():
+        return None
+    key = viewdata._mt(p)
+    with _LOCK:
+        hit = _PATCH.get(h.slug)
+        if hit and hit[0] == key:
+            return hit[1]
+    out = {lid: ("provisional" if r.status == "provisional" else "ok") for lid, r in viewdata.final_index(ctx).items()}
+    with _LOCK:
+        _PATCH[h.slug] = (key, out)
+    return out
+
+
 def touched_ids(h: appdirs.ProjectHandle) -> list[str]:
     return list(appdirs.read_app_state(h).get("review", {}).get("touched", []))
 
@@ -116,12 +142,20 @@ def add_touched(h: appdirs.ProjectHandle, ids: list[str]) -> list[str]:
 # ----------------------------------------------------------------------------
 
 
-def make_row(l: Any, s: Any, tr: Any, chars: dict[str, Any], winner_label: str | None, delivery: dict[str, Any] | None, touched: bool) -> dict[str, Any]:
+def patch_state(patch: dict[str, str] | None, line_id: str) -> str | None:
+    """The row's ``patch``: ``provisional`` (in the patch with a take that failed the gates), ``ok`` (in the patch), ``none`` (a
+    dubbed line without a file in the patch, silent in the game); ``None`` while the patch does not exist yet."""
+    return None if patch is None else patch.get(line_id, "none")
+
+
+def make_row(
+    l: Any, s: Any, tr: Any, chars: dict[str, Any], winner_label: str | None, delivery: dict[str, Any] | None, touched: bool, patch: str | None = None,
+) -> dict[str, Any]:
     return {
         "line_id": l.line_id, "speaker_id": l.speaker_id, "name": viewdata.display_name(l.speaker_id, chars), "scene": l.scene,
         "status": viewdata.status_of(s), "composite": (s.scores or {}).get("composite"), "text_src": l.text_src,
         "text_tgt": tr.text_tgt if tr else "", "winner_label": winner_label, "flags": list(l.flags or []),
-        "delivery": delivery, "touched": touched, "_order": l.order,
+        "delivery": delivery, "touched": touched, "patch": patch, "_order": l.order,
     }
 
 
@@ -139,6 +173,7 @@ def lines_view(
     ovs = viewdata.overrides_by_line(ctx)
     labels = label_map(h, ctx, sel, ovs)
     delivery = delivery_map(h, ctx, snap)
+    patch = patch_map(h, ctx)
     touched = set(touched_ids(h))
     needle = (q or "").strip().lower()
 
@@ -168,7 +203,7 @@ def lines_view(
         tr = trs.get(l.line_id)
         if needle and needle not in (l.text_src or "").lower() and needle not in ((tr.text_tgt if tr else "") or "").lower() and needle not in l.line_id.lower():
             continue
-        rows.append(make_row(l, s, tr, chars, labels.get(l.line_id), delivery.get(l.line_id) or ({"source": "audio", "layer": None} if snap.is_voiced(l.line_id) else None), l.line_id in touched))
+        rows.append(make_row(l, s, tr, chars, labels.get(l.line_id), delivery.get(l.line_id) or ({"source": "audio", "layer": None} if snap.is_voiced(l.line_id) else None), l.line_id in touched, patch_state(patch, l.line_id)))
     rows.sort(key=lambda r: (STATUS_ORDER[r["status"]], r["composite"] if r["composite"] is not None else -1.0 if r["status"] != "ok" else 0.0, r["_order"]))
     total = len(rows)
     if limit is not None:
@@ -275,7 +310,7 @@ def line_detail(h: appdirs.ProjectHandle, line_id: str) -> dict[str, Any]:
     else:
         delivery = {"source": "audio", "layer": None} if snap.is_voiced(line_id) else None
     winner_label = next((label_for(i) for i, c in enumerate(cands) if c.wav == sel.winner), None)
-    row = make_row(line, sel, tr, chars, winner_label, delivery, line_id in touched_ids(h))
+    row = make_row(line, sel, tr, chars, winner_label, delivery, line_id in touched_ids(h), patch_state(patch_map(h, ctx), line_id))
     row.pop("_order", None)
     return {
         "line": row,
@@ -348,6 +383,12 @@ def apply_action(h: appdirs.ProjectHandle, line_id: str, action: str, payload: d
         writes.append(("tuning", casting.validate_tuning(payload)))
     for act, pl in writes:
         write_override(ctx.paths, line_id, act, pl)
+    new_text = next((str(pl["text"]) for act, pl in reversed(writes) if act == "set_text" and pl.get("text")), "")
+    if new_text:  # the text the line is spoken with changed: laughter / interjection flags follow it
+        try:
+            translation.sync_text_flags(h, line_id, new_text)
+        except Exception as e:  # the override is saved; stale flags only cost a stricter or looser gate
+            log.warning("cannot update the flags of %s after its text changed: %s", line_id, e)
     viewdata.clear_cache(h.slug)
     touched = add_touched(h, [line_id])
     return {"ok": True, "touched": touched, "touched_count": len(touched)}

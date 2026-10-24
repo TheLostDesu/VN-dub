@@ -12,6 +12,13 @@ original silence profile: no stretch toward a source duration, trim to a default
 character's stats, else the game's median character loudness, else ``default_lufs``. They are written as
 ``unvoiced/<dialogue id or line id>.<ext>`` (``FinalIndexRecord.unvoiced = true``; ``pack`` places them).
 
+A line whose selection is ``review`` (no take passed the gates, regen rounds used up or pointless) or ``regen`` (new
+takes were asked for and never made: the rounds failed or ``score`` ran without them) is mastered from its best take
+and marked ``provisional`` (``master.include_review_lines: provisional``, the default): a mediocre take in the game
+beats a line that stays silent, and the Review screen is where a person replaces it. ``skip`` leaves such lines out of
+the patch; either way the summary, the log and (through ``pack`` / ``report``) the patch's INSTALL.md and manifest
+state how many lines are provisional or left out and why. A line without any winner has nothing to install.
+
 The voice tuning's leftovers (recorded in the winner's sidecar by synth) are applied here: a pitch and / or
 tempo pass (Rubber Band, ffmpeg fallback) for what the backend could not do natively, and the energy ->
 loudness offset. The requested speed always applies (it is not limited by ``stretch.max_stretch``; it is
@@ -85,7 +92,9 @@ _UNVOICED_EXT = {"vorbis": "ogg", "opus": "opus", "mp3": "mp3", "flac": "flac", 
 def unvoiced_name(line: LineRecord, codec: str | None) -> str:
     """Encoded file name of a line without original audio: ``unvoiced/<dialogue id | line id>.<ext>``."""
     stem = str((line.model_extra or {}).get("dialogue_id") or line.line_id)
-    stem = re.sub(r"[^0-9A-Za-z_.-]+", "_", stem)
+    # \w is Unicode-aware on purpose: a Ren'Py label (the id's prefix) may be non-ASCII, and the file must keep
+    # the exact id for config.auto_voice to find it
+    stem = re.sub(r"[^\w.-]+", "_", stem)
     return "unvoiced/" + stem + "." + _UNVOICED_EXT.get(codec or "vorbis", "ogg")
 
 
@@ -118,6 +127,7 @@ def run(ctx: Any) -> dict[str, Any]:
     summary: dict[str, Any] = {"lines": 0, "encoded": 0, "cached": 0, "stretched": 0, "skipped": {}, "errors": {}}
     medians = [float(c.stats.lufs_median) for c in chars.values() if c.stats.lufs_median is not None]
     game_median = statistics.median(medians) if medians else None
+    provisional_of: dict[str, tuple[str, str]] = {}  # line_id -> (selection status, selection reason) of the provisional ones
     for n_done, (lid, line) in enumerate(lines.items(), 1):
         ctx.progress(n_done - 1, len(lines), lid)
         s: SelectionRecord | None = sel.get(lid)
@@ -125,14 +135,14 @@ def run(ctx: Any) -> dict[str, Any]:
             summary["skipped"]["no winner"] = summary["skipped"].get("no winner", 0) + 1
             continue
         status = s.status
-        if status == "review":
+        if status in ("review", "regen"):
             if cfg.include_review_lines != "provisional":
-                summary["skipped"]["review"] = summary["skipped"].get("review", 0) + 1
+                summary["skipped"][status] = summary["skipped"].get(status, 0) + 1
                 continue
+            # "regen" can still be here after the rounds (a round's takes failed, or score ran alone): the line is
+            # treated like a review one, never dropped without a word
+            provisional_of[lid] = (status, s.reason)
             status = "provisional"
-        elif status == "regen":
-            summary["skipped"]["regen"] = summary["skipped"].get("regen", 0) + 1
-            continue
         summary["lines"] += 1
         a = audio.get(line.audio_id or "")
         try:
@@ -141,6 +151,8 @@ def run(ctx: Any) -> dict[str, Any]:
             ctx.log.error("master %s failed: %s", lid, e)
             summary["errors"][lid] = f"{type(e).__name__}: {e}"[:200]
             continue
+        if lid in provisional_of:  # pack / report say why the line is provisional without reading the selection again
+            rec.selection_status, rec.reason = provisional_of[lid][0], provisional_of[lid][1][:300]  # type: ignore[attr-defined]
         records.append(rec)
         summary["encoded"] += 1
         summary["cached"] += int(cached)
@@ -161,6 +173,20 @@ def run(ctx: Any) -> dict[str, Any]:
     provisional = sum(1 for r in records if r.status == "provisional")
     if provisional:
         summary["provisional"] = provisional
+        n_regen = sum(1 for st, _ in provisional_of.values() if st == "regen")
+        if n_regen:
+            summary["provisional_regen"] = n_regen  # of them: new takes were asked for and are missing
+        ctx.log.warning(
+            "master: %d line(s) have no take that passed the quality gates; their best take is installed as provisional "
+            "(listen to them in Review)%s", provisional, f"; {n_regen} of them still await new takes" if n_regen else "",
+        )
+    for why, n in summary.get("skipped", {}).items():
+        if why in ("review", "regen"):
+            ctx.log.warning(
+                "master: %d line(s) with status %s are LEFT OUT of the patch (master.include_review_lines is skip): they stay silent in the game", n, why,
+            )
+        elif why == "no winner":
+            ctx.log.warning("master: %d line(s) have no take to install (nothing could be synthesized for them)", n)
     return summary
 
 

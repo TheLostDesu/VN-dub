@@ -863,3 +863,164 @@ def test_cli_text_emotion_command_runs_the_stage(make_ctx, tmp_path):
     assert read_json(tmp_path / "work" / "analysis" / "s01_03.json")["source"] == "text"
     status = read_json(tmp_path / "work" / "stage_status.json")
     assert status["text_emotion"]["finished"] and not status["text_emotion"]["error"]
+
+
+# ----------------------------------------------------------------------------
+# laughter: every source language, kinds, stage directions, laughter-only lines (vndub.text.laughter feeds the rule pass)
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,kind,emotion,note",
+    [
+        ("Haha, no way!", "hearty", "happy", "a hearty laugh"),
+        ("Hehe, you wish.", "chuckle", "happy", "chuckling"),
+        ("Hihi!", "giggle", "happy", "giggling"),
+        ("Mwahaha! Bow before me!", "evil", "other", "a sinister laugh"),
+        ("Ehehe... sorry about that.", "nervous", "embarrassed", "a nervous laugh"),
+        ("Pfft, seriously?", "snort", "other", "a snort"),
+    ],
+)
+def test_english_laughter_gives_event_kind_emotion_and_note(text, kind, emotion, note):
+    r = dl.rule_pass(text, src_lang="en")
+    assert r.events == ["laugh"] and r.emotion == emotion and note in r.notes
+    assert r.laughter["kind"] == kind and r.laughter["stage"] is False
+    d = dl.merge_layers([r])
+    assert d.layer == "rule" and d.laughter["kind"] == kind and note in d.notes
+    spec = dl.to_style(d)
+    assert spec.events == ["laughter"] and spec.laughter["kind"] == kind
+    assert StyleSpec.from_dict(spec.to_dict()) == spec
+
+
+@pytest.mark.parametrize(
+    "text,tgt,lang,kind",
+    [
+        ("あはは、おかしい！", "", "ja", "hearty"),
+        ("えへへ……", "", "ja", "nervous"),
+        ("くすくす。", "", "ja", "giggle"),
+        ("そうだね。", "Хи-хи-хи.", "ja", "giggle"),
+        ("Ну ты даёшь, ха-ха-ха!", "", "ru", "hearty"),
+        ("Муа-ха-ха-ха!", "", "ru", "evil"),
+        ("Mwa-ha-ha-ha!", "", "en", "evil"),
+    ],
+)
+def test_laughter_kind_in_every_script(text, tgt, lang, kind):
+    r = dl.rule_pass(text, tgt, src_lang=lang)
+    assert "laugh" in r.events and r.laughter["kind"] == kind, (text, r)
+
+
+def test_source_language_limits_what_counts_as_the_source_laugh():
+    assert dl.rule_pass("Haha!", src_lang="ja").events == []  # a Japanese script has no Latin laughter
+    assert dl.rule_pass("あはは", src_lang="en").events == []
+    assert "laugh" in dl.rule_pass("Haha!", src_lang="auto").events and "laugh" in dl.rule_pass("Haha!").events
+    # the translation is read in every script whatever the source language
+    assert "laugh" in dl.rule_pass("Haha!", "Ха-ха!", src_lang="ja").events
+
+
+def test_a_long_laugh_raises_the_intensity_more():
+    short, long_ = dl.rule_pass("Haha.", src_lang="en"), dl.rule_pass("Hahahaha.", src_lang="en")
+    assert short.laughter["units"] == 2 and long_.laughter["units"] == 4
+    assert long_.intensity > short.intensity > 0.3
+    assert dl.rule_pass("Heh heh heh.", src_lang="en").intensity > dl.rule_pass("Heh heh.", src_lang="en").intensity
+
+
+@pytest.mark.parametrize("text,lang", [("*laughs*", "en"), ("(giggles)", "en"), ("(смеётся)", "ru"), ("（笑）", "ja")])
+def test_stage_direction_is_weaker_evidence_than_a_spoken_laugh(text, lang):
+    r = dl.rule_pass(text, src_lang=lang)
+    assert r.events == ["laugh"] and r.laughter["stage"] is True and r.laughter["only"] is True
+    spoken = dl.rule_pass({"en": "Haha.", "ru": "Ха-ха.", "ja": "あはは。"}[lang], src_lang=lang)
+    assert spoken.laughter["stage"] is False
+    assert 0.6 <= r.confidence < spoken.confidence  # still accepted at min_confidence 0.6, but weaker
+    assert r.intensity < spoken.intensity
+    assert dl.merge_layers([r]).layer == "rule"
+
+
+def test_laughter_only_flag_looks_at_what_the_dub_speaks():
+    assert dl.rule_pass("Hahaha!", src_lang="en").laughter["only"] is True
+    assert dl.rule_pass("Haha, no way!", src_lang="en").laughter["only"] is False
+    assert dl.rule_pass("あはは", "Ну ты даёшь!", src_lang="ja").laughter["only"] is False  # the translation has words
+    assert dl.rule_pass("あはは、ひどい", "Ха-ха-ха!", src_lang="ja").laughter["only"] is True
+    d = dl.merge_layers([dl.rule_pass("*laughs* Hi.", src_lang="en")])
+    assert d.laughter["only"] is False and d.laughter["stage"] is True
+
+
+def test_evil_laugh_does_not_outvote_a_named_emotion():
+    # "other" names no direction: an angry lead-in wins over a sinister laugh, the laugh alone gives "other"
+    r = dl.rule_pass("ちくしょう、くくく", src_lang="ja")
+    assert r.laughter["kind"] == "evil" and r.emotion == "angry"
+    assert dl.rule_pass("Mwahaha!", src_lang="en").emotion == "other"
+
+
+def test_delivery_laughter_round_trips_and_old_passports_load():
+    d = dl.merge_layers([dl.rule_pass("Hihi!", src_lang="en")])
+    assert dl.Delivery.from_dict(d.to_dict()) == d and d.to_dict()["laughter"]["kind"] == "giggle"
+    plain = dl.merge_layers([dl.rule_pass("待って！")])
+    assert "laughter" not in plain.to_dict()  # absent without a laugh: stored passports of earlier versions read the same
+    old = {k: v for k, v in d.to_dict().items() if k != "laughter"}
+    assert dl.Delivery.from_dict(old).laughter == {} and dl.to_style(dl.Delivery.from_dict(old)).laughter is None
+    # a laugh whose layer was rejected leaves nothing behind
+    weak = dl.Layer("rule", 0.4, emotion="happy", events=["laugh"], laughter={"kind": "hearty"})
+    assert dl.merge_layers([weak]).laughter == {}
+
+
+def test_llm_laugh_kind_is_validated_and_only_fills_a_gap():
+    ok = {"emotion": "happy", "intensity": 0.6, "tempo": "normal", "loudness": "normal", "confidence": 0.8}
+    v = dl.validate_delivery({**ok, "events": ["giggling"]})
+    assert v["events"] == ["laugh"] and v["laugh_kind"] == "giggle"
+    v = dl.validate_delivery({**ok, "events": [], "laugh_kind": "Evil laugh"})
+    assert v["laugh_kind"] == "evil" and v["events"] == ["laugh"]  # a kind implies the event
+    assert dl.validate_delivery({**ok, "laughter": "chuckling"})["laugh_kind"] == "chuckle"
+    v = dl.validate_delivery({**ok, "events": ["laughter"], "laugh_kind": "wibble"})
+    assert v is not None and "laugh_kind" not in v and v["events"] == ["laugh"]  # an unknown word is ignored, it does not invalidate
+    assert "laugh_kind" not in dl.validate_delivery({**ok, "events": ["cry"]})
+    llm = dl.llm_layer({**ok, "events": ["laugh"], "laugh_kind": "giggle"})
+    assert llm.laughter == {"kind": "giggle"}
+    # the rule pass read the actual text: the LLM kind only fills a gap
+    rule = dl.rule_pass("Haha!", src_lang="en")
+    assert dl.merge_layers([rule, llm]).laughter["kind"] == "hearty"
+    bare = dl.Layer("rule", 0.7, emotion="other", intensity=0.5, events=["laugh"])
+    assert dl.merge_layers([bare, llm]).laughter == {"kind": "giggle"}
+
+
+def test_mock_delivery_reports_laughter():
+    d = dl.mock_delivery("Hihi!", src_lang="en")
+    assert "laugh" in d["events"] and d["laugh_kind"] == "giggle" and dl.validate_delivery(d) is not None
+    j = dl.mock_delivery("あはは！")
+    assert "laugh" in j["events"] and j["laugh_kind"] == "hearty"
+    assert "laugh_kind" not in dl.mock_delivery("そうですか。")
+
+
+EN_ROWS = [
+    dict(line_id="e01_01", speaker_id="hero", speaker_raw="Hero", text="Haha, no way!", voiced=False),
+    dict(line_id="e01_02", speaker_id="hero", speaker_raw="Hero", text="Hehe...", voiced=False),
+    dict(line_id="e01_03", speaker_id="hero", speaker_raw="Hero", text="*laughs*", voiced=False),
+    dict(line_id="e01_04", speaker_id="hero", speaker_raw="Hero", text="Fine.", voiced=False),
+]
+
+
+def test_stage_reads_english_laughter_from_the_project_language(make_ctx, tmp_path):
+    ctx = _project(make_ctx, tmp_path, rows=EN_ROWS, **{"project.src_lang": "en"})
+    assert ctx.src_lang == "en"
+    summary = run_stage("text_emotion", ctx)
+    assert summary["lines"] == 4 and summary["written"] == 4
+    d1 = read_json(ctx.paths.passport("e01_01"))["delivery"]
+    assert d1["events"] == ["laugh"] and d1["laughter"] == {"kind": "hearty", "units": 2, "stage": False, "only": False}
+    assert "a hearty laugh" in d1["notes"] and d1["emotion"] == "happy"
+    p1 = Passport.model_validate(read_json(ctx.paths.passport("e01_01")))
+    spec = StyleSpec.from_dict(p1.style)
+    assert spec.events == ["laughter"] and spec.laughter["kind"] == "hearty"
+    d2 = read_json(ctx.paths.passport("e01_02"))["delivery"]
+    assert d2["laughter"]["kind"] == "nervous" and d2["laughter"]["only"] is True and d2["emotion"] == "embarrassed"
+    d3 = read_json(ctx.paths.passport("e01_03"))["delivery"]
+    assert d3["laughter"]["stage"] is True and d3["laughter"]["only"] is True and d3["layer"] == "rule"
+    d4 = read_json(ctx.paths.passport("e01_04"))["delivery"]
+    assert d4["layer"] == "neutral" and "laughter" not in d4
+    again = run_stage("text_emotion", ctx)
+    assert again["written"] == 0 and again["cached"] == 4
+    ctx.models.close()
+    # the same text read as a Japanese script has no laughter: the project language is part of the cache key and of the reading
+    (tmp_path / "ja").mkdir()
+    ctx2 = _project(make_ctx, tmp_path / "ja", rows=EN_ROWS, **{"project.src_lang": "ja"})
+    run_stage("text_emotion", ctx2)
+    assert read_json(ctx2.paths.passport("e01_01"))["delivery"]["events"] == []
+    ctx2.models.close()

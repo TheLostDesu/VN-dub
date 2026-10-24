@@ -99,8 +99,18 @@ is read from `init python` / `define config.auto_voice`).
   translatable and belongs to the block of the following say), first 8 hex
   digits, prefixed with the current translation label (dots -> `_`; hidden
   labels and `_`-labels do not change it); collisions get `_1`, `_2`.
+  Checked against Ren'Py master (`translation/__init__.py`, `parser.py`, `lexer.py`, `00voice.rpy`):
+  every script file is restructured on its own (label and `_n` suffixes start over per file);
+  `label`, `menu name:` and `call x from name` each make a Label node, so a name without a leading `_` moves
+  the translation label for the says after it (`menu name:` also declares the global label that `.local` labels hang on;
+  `call ... from _x` only sets an alternate label and leaves the identifier alone); a menu's own say
+  (`e "Which way?"` before the choices) is a `nointeract` say, a bare string in a menu is a caption (no id);
+  a triple-quoted string is cut at blank lines and each paragraph is its own say (own click, own id, own line number);
+  `with` clauses are part of the code. At run time Ren'Py asks for
+  `config.auto_voice.format(id=<id>)` at every interaction (`voice_interact`, skipped when `config.has_voice` is
+  False: the generated `vndub_auto_voice.rpy` sets it True at `init 1000`).
   `Say.get_code()` = `who [attributes] [@ temporary] "encoded what" [nointeract]
-  [id x] [arguments]`, where the string is re-encoded by `encode_say_string`
+  [id x] [arguments] [with expr]`, where the string is re-encoded by `encode_say_string`
   (escapes `\`, newline, `"`, and a space after a space) after Ren'Py's lexer
   processing (whitespace runs collapsed, escapes resolved).
   **Verified:** the Ren'Py documentation example under `label start`,

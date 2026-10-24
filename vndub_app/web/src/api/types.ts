@@ -160,6 +160,13 @@ export interface ResumeInfo {
   candidates?: JobInfo[];
 }
 
+/** A stage whose last recorded run was made by another version of its code (`ran` -> `now`): the import has to run again. */
+export interface StaleStage {
+  stage: string;
+  ran: string;
+  now: string;
+}
+
 export interface ProjectInfo {
   slug: string;
   name: string;
@@ -168,6 +175,8 @@ export interface ProjectInfo {
   project_yaml: Record<string, unknown> | null;
   state: AppState;
   stage_status: Record<string, StageRecord>;
+  /** stages that ran with an older version (absent on an older server: read it as `?? []`) */
+  stale?: StaleStage[];
   active_job: JobInfo | null;
   resume: ResumeInfo;
 }
@@ -413,6 +422,12 @@ export interface PreviewItem {
 
 export type ReviewStatus = "ok" | "check" | "failed";
 
+/**
+ * Where a review line stands in the built patch: `provisional` (its best take failed the quality checks and is installed
+ * anyway), `ok`, `none` (a dubbed line without a file: silent in the game); null while there is no patch.
+ */
+export type ReviewPatchState = "provisional" | "ok" | "none";
+
 export interface ReviewLine {
   line_id: string;
   speaker_id: string;
@@ -426,6 +441,8 @@ export interface ReviewLine {
   flags: string[];
   delivery: { source: "audio" | "text"; layer?: string } | null;
   touched: boolean;
+  /** absent on an older server */
+  patch?: ReviewPatchState | null;
 }
 
 export interface Verdict {
@@ -595,6 +612,24 @@ export interface ModelsReport {
   disk: { free_gb: number; data_dir: string };
 }
 
+/**
+ * What the built patch covers (`coverage` of manifest_patch.json, API.md section 3 "patch coverage"): `dub_lines` lines are
+ * dubbed, `installed` of them have a file in the patch (`provisional` of those from a take that failed the checks), `left_out`
+ * have none and stay silent in the game (`left_out_reasons`: review | regen | no_winner | not_mastered | not_scored -> count),
+ * `narration` lines are never dubbed.
+ */
+export interface PatchCoverage {
+  dub_lines: number;
+  installed: number;
+  provisional: number;
+  provisional_review: number;
+  provisional_regen: number;
+  left_out: number;
+  left_out_reasons: Record<string, number>;
+  narration: number;
+  include_review_lines: string;
+}
+
 export interface InstallPlan {
   engine: string;
   auto_possible: boolean;
@@ -603,6 +638,8 @@ export interface InstallPlan {
   files: { target: string; source: string; exists: boolean }[];
   patch_dir: string;
   backups: { id: string; created: string; files: number | unknown[] }[];
+  /** summary of manifest_patch.json; `coverage` is null for a patch built by an older version */
+  manifest?: { count: number; engine: string | null; backends: Record<string, number>; routes: Record<string, number>; coverage: PatchCoverage | null } | null;
 }
 
 export interface HelpDoc {

@@ -326,6 +326,12 @@ def _regen_loop(ctx: StageContext, on_round: Callable[[int, int, int], None] | N
         run_stage("synth", ctx)
         run_stage("score", ctx)
     ctx.extra["regen"] = False
+    if total > 0 and ctx.paths.selection.exists():
+        # score turns "regen" into "review" once a line has a take of the last round; a line whose round produced no take
+        # (every generation failed) is still "regen" here. master installs its best take like a review line's.
+        left = sum(1 for s in read_jsonl(ctx.paths.selection, SelectionRecord) if s.status == "regen")
+        if left:
+            ctx.log.warning("%d line(s) still have status regen after %d round(s): new takes could not be made for them; their best take is installed as provisional", left, total)
 
 
 @app.command("review", help="Gradio review UI: original vs candidates, overrides.jsonl.")

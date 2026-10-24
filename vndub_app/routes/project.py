@@ -59,9 +59,10 @@ def project_info(h: appdirs.ProjectHandle) -> dict[str, Any]:
     job, others = pipeline.resume_candidates(h.slug)  # the job POST /api/project/resume would continue, and what stays interrupted
     st = appdirs.read_app_state(h)
     py = _project_yaml(h)
+    status = _stage_status(h)
     return {
         "slug": h.slug, "name": h.name, "game_dir": str(h.game_dir), "engine": (py or {}).get("engine"),
-        "project_yaml": py, "state": st, "stage_status": _stage_status(h),
+        "project_yaml": py, "state": st, "stage_status": status, "stale": pipeline.stale_stages(status),
         "active_job": active.info() if active else None,
         "resume": {
             "available": job is not None, "job": job.info() if job else None,

@@ -321,6 +321,14 @@ class VcOpts(_Section):
     seedvc: dict[str, Any] = Field(default_factory=lambda: {"convert_style": False, "diffusion_steps": 30})
 
 
+class LaughterOpts(_Section):
+    """How synth spells laughter for the TTS (``vndub.text.laughter``): written laughs ("Ха-ха-ха", "Haha", "*laughs*")
+    become the spelling / inline token the backend voices as a laugh instead of reading letters."""
+
+    enabled: bool = True
+    table: str = "configs/laughter.yaml"  # spelling per language and laugh kind, backend overrides
+
+
 class SynthSection(_Section):
     n_candidates: int = 4
     n_candidates_short: int = 6
@@ -335,6 +343,7 @@ class SynthSection(_Section):
     # Dub speaker lines that have no original audio too (route P: performer voice only, no VC;
     # narration is never dubbed). CLI default off; the desktop app turns it on.
     voice_unvoiced: bool = False
+    laughter: LaughterOpts = Field(default_factory=LaughterOpts)
 
 
 class Gates(_Section):
@@ -387,8 +396,10 @@ class MasterSection(_Section):
     stretch: StretchOpts = Field(default_factory=StretchOpts)
     loudness: LoudnessOpts = Field(default_factory=LoudnessOpts)
     match_silence_profile: bool = True
-    # what to do with lines whose selection status is "review"
-    include_review_lines: Literal["skip", "provisional"] = "skip"
+    # what to do with lines whose selection status is "review" (or still "regen" after the rounds): "provisional"
+    # masters the best take and marks the line provisional (a mediocre take beats a line silent in the game);
+    # "skip" leaves the line out of the patch (reported by master / pack / report)
+    include_review_lines: Literal["skip", "provisional"] = "provisional"
 
 
 class PackSection(_Section):

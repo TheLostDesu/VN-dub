@@ -23,6 +23,18 @@ digits, prefixed by the current translation label (dots -> underscores);
 duplicates get ``_1``, ``_2`` ... Verified: the docs example
 ``e "Thank you for taking a look at the Ren'Py translation framework."``
 under ``label start`` -> ``start_636ae3f5``.
+
+Where a mistake silently silences a line (the file is named by an identifier Ren'Py never asks for), the details follow
+``renpy/translation/__init__.py`` (``Restructurer``), ``renpy/parser.py`` and ``renpy/lexer.py`` of Ren'Py master:
+
+* every file is restructured on its own: the translation label and the ``_1`` / ``_2`` suffixes start over per file;
+* a ``Label`` node moves the translation label unless it is ``hide`` or its name starts with ``_`` (those only set
+  an *alternate* label, the primary identifier is unchanged): ``label``, ``menu name:`` and ``call x from name`` all
+  make one;
+* a menu's own say (the line before the choices, ``e "Which?"``) is a ``nointeract`` say: its code ends in
+  ``nointeract``; a bare string in a menu is a caption, not a say statement;
+* a triple-quoted string is cut at blank lines and every paragraph is its own say (own click, own identifier);
+* ``get_code`` ends with ``nointeract``, ``id x``, the argument list and the ``with`` clause.
 """
 
 from __future__ import annotations
@@ -65,10 +77,15 @@ KEYWORDS = {
 SKIP_BLOCKS = re.compile(r"^(init\b.*python|python\b|screen\b|transform\b|style\b|translate\b|image\b.*:$|layeredimage\b|testcase\b|init\s+-?\d*\s*:$|init\s*:$)")
 
 _STR = r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\''
+# triple-quoted dialogue ("monologue mode"): one say statement per paragraph, see triple_paragraphs
+_TSTR = r'"""(?:[^\\"]|\\.|"(?!""))*"""|\'\'\'(?:[^\\\']|\\.|\'(?!\'\'))*\'\'\''
 SAY_RE = re.compile(
-    rf"^(?P<who>(?:{_STR})|[A-Za-z_][\w\.]*)?(?P<attrs>(?:\s+(?!nointeract\b)(?!id\b)[A-Za-z_][\w\-]*)*)"
-    rf"(?P<tmp>\s+@(?:\s+[A-Za-z_][\w\-]*)+)?\s*(?P<what>{_STR})(?P<rest>.*)$"
+    # a string speaker must be followed by white space, or ``"""text"""`` would read as the empty speaker ``""`` + ``"text"``
+    rf"^(?P<who>(?:{_STR})(?=\s)|[A-Za-z_][\w\.]*)?(?P<attrs>(?:\s+(?!nointeract\b)(?!id\b)(?!with\b)-?[A-Za-z_][\w\-]*)*)"
+    rf"(?P<tmp>\s+@(?:\s+-?[A-Za-z_][\w\-]*)+)?\s*(?P<what>{_TSTR}|{_STR})(?P<rest>.*)$",
+    re.S,
 )
+CALL_FROM_RE = re.compile(r"^call\b.*?\sfrom\s+(?P<name>\.?[A-Za-z_][\w\.]*)\s*$")
 CHAR_DEF = re.compile(r"^define\s+(?P<var>[A-Za-z_][\w\.]*)\s*=\s*(?P<expr>(?:Dynamic)?Character\s*\(.*\))\s*$")
 AUTO_VOICE = re.compile(r"(?:define\s+)?config\.auto_voice\s*=\s*(?P<val>.+?)\s*$")
 VOICE_RE = re.compile(rf"^voice\s+(?P<arg>sustain\b|{_STR}|.+)$")
@@ -82,6 +99,22 @@ CHOICE_RE = re.compile(rf"^(?P<cap>{_STR})(?:\s*\([^)]*\))?(?:\s+if\s+.+)?\s*:\s
 # ----------------------------------------------------------------------------
 
 
+def _unescape(m: re.Match[str]) -> str:
+    """The lexer's ``dequote`` for one backslash escape."""
+    c = m.group(1)
+    if c == "{":
+        return "{{"
+    if c == "[":
+        return "[["
+    if c == "%":
+        return "%%"
+    if c == "n":
+        return "\n"
+    if c[0] == "u":
+        return chr(int(m.group(2), 16))
+    return c
+
+
 def dequote(raw: str) -> str:
     """Ren'Py string literal (with quotes) -> runtime string."""
     s = raw
@@ -90,22 +123,26 @@ def dequote(raw: str) -> str:
     else:
         s = s[1:-1]
     s = re.sub(r"[ \n]+", " ", s)
+    return re.sub(r"\\(u([0-9a-fA-F]{1,4})|.)", _unescape, s)
 
-    def _dq(m: re.Match[str]) -> str:
-        c = m.group(1)
-        if c == "{":
-            return "{{"
-        if c == "[":
-            return "[["
-        if c == "%":
-            return "%%"
-        if c == "n":
-            return "\n"
-        if c[0] == "u":
-            return chr(int(m.group(2), 16))
-        return c
 
-    return re.sub(r"\\(u([0-9a-fA-F]{1,4})|.)", _dq, s)
+def triple_paragraphs(raw: str) -> list[tuple[int, str]]:
+    """``Lexer.triple_string`` (monologue mode): a triple-quoted dialogue string is cut at blank lines
+    (``config.monologue_delimiter``, ``"\\n\\n"``) and every paragraph is its own say statement, with its own click and
+    its own dialogue identifier. Returns ``[(line offset inside the string, text)]``, empty paragraphs dropped."""
+    s = re.sub(r" *\n *", "\n", raw[3:-3])
+    delim = "\n\n"
+    out: list[tuple[int, str]] = []
+    pos = 0
+    for part in s.split(delim):
+        lead = len(part) - len(part.lstrip())
+        offset = s.count("\n", 0, pos) + part.count("\n", 0, lead)
+        pos += len(part) + len(delim)
+        part = part.strip()
+        if not part:
+            continue
+        out.append((offset, re.sub(r"\\(u([0-9a-fA-F]{1,4})|.)", _unescape, re.sub(r"[ \n]+", " ", part))))
+    return out
 
 
 def encode_say_string(s: str) -> str:
@@ -117,8 +154,10 @@ def encode_say_string(s: str) -> str:
 
 
 def say_code(who: str | None, what: str, attributes: list[str] | None = None, temporary: list[str] | None = None,
-             interact: bool = True, explicit_id: str | None = None, arguments: str = "") -> str:
-    """``renpy.ast.Say.get_code()``."""
+             interact: bool = True, explicit_id: str | None = None, arguments: str = "", with_: str | None = None) -> str:
+    """``renpy.ast.Say.get_code()``: speaker, attributes, ``@ temporary``, the escaped text, ``nointeract``, ``id x``,
+    the argument list and the ``with`` clause last. (A menu's own say, the line before the choices, is a
+    ``nointeract`` one: the menu provides the interaction.)"""
     rv: list[str] = []
     if who:
         rv.append(who)
@@ -135,6 +174,9 @@ def say_code(who: str | None, what: str, attributes: list[str] | None = None, te
         rv.append(explicit_id)
     if arguments:
         rv.append(arguments)
+    if with_:
+        rv.append("with")
+        rv.append(with_)
     return " ".join(rv)
 
 
@@ -230,74 +272,180 @@ class RpyParse:
     says: list[dict[str, Any]] = field(default_factory=list)  # in script order
 
 
-def _strip_comment(line: str) -> str:
-    out, q = [], None
-    i = 0
-    while i < len(line):
+def _scan(line: str, q: str | None, depth: int) -> tuple[str, str | None, int]:
+    """One physical line from the lexer state (``q``: the delimiter of the string still open, ``depth``: open brackets).
+    Returns the line without its trailing comment and the state at its end. A ``#`` inside a string is text."""
+    out: list[str] = []
+    i, n = 0, len(line)
+    while i < n:
         c = line[i]
         if q:
-            out.append(c)
-            if c == "\\" and i + 1 < len(line):
-                out.append(line[i + 1])
+            if c == "\\" and i + 1 < n:
+                out.append(line[i : i + 2])
                 i += 2
-                continue
-            if c == q:
+            elif line.startswith(q, i):
+                out.append(q)
+                i += len(q)
                 q = None
-        else:
-            if c in "\"'":
-                q = c
-            elif c == "#":
-                break
-            out.append(c)
+            else:
+                out.append(c)
+                i += 1
+            continue
+        if c in "\"'":
+            q = c * 3 if line.startswith(c * 3, i) else c
+            out.append(q)
+            i += len(q)
+            continue
+        if c == "#":
+            break
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        out.append(c)
         i += 1
-    return "".join(out).rstrip()
+    return "".join(out), q, depth
 
 
 def _logical_lines(text: str) -> list[tuple[int, int, str]]:
-    """(line_no, indent, content) with comments removed and bracket/quote continuations joined."""
+    """(line_no, indent, content) with comments removed and bracket / string continuations joined (a string may run over
+    several lines: triple-quoted dialogue keeps its blank lines, they separate its paragraphs)."""
     out = []
     raw = text.splitlines()
     i = 0
     while i < len(raw):
-        line = raw[i]
         no = i + 1
-        content = _strip_comment(line)
+        content, q, depth = _scan(raw[i], None, 0)
+        content = content.rstrip()
         stripped = content.strip()
         if not stripped:
             i += 1
             continue
         indent = len(content) - len(content.lstrip(" \t"))
         # join continuation lines while brackets are open or a string is unterminated
-        while (stripped.count("(") > stripped.count(")") or stripped.count("[") > stripped.count("]") or _open_quote(stripped)) and i + 1 < len(raw):
+        while (q or depth > 0) and i + 1 < len(raw):
             i += 1
-            stripped += "\n" + _strip_comment(raw[i]).strip() if _open_quote(stripped) else " " + _strip_comment(raw[i]).strip()
+            more, q_next, depth = _scan(raw[i], q, depth)
+            stripped += ("\n" if q else " ") + more.strip()
+            q = q_next
         out.append((no, indent, stripped))
         i += 1
     return out
 
 
-def _open_quote(s: str) -> bool:
-    q = None
-    i = 0
+def _split_top(s: str) -> list[str]:
+    """Split on commas outside brackets and strings."""
+    parts: list[str] = []
+    cur: list[str] = []
+    depth, q, i = 0, None, 0
     while i < len(s):
         c = s[i]
         if q:
-            if c == "\\":
-                i += 2
-                continue
-            if c == q:
+            cur.append(c)
+            if c == "\\" and i + 1 < len(s):
+                cur.append(s[i + 1])
+                i += 1
+            elif c == q:
                 q = None
         elif c in "\"'":
             q = c
+            cur.append(c)
+        else:
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            if c == "," and depth == 0:
+                parts.append("".join(cur))
+                cur = []
+            else:
+                cur.append(c)
         i += 1
-    return q is not None
+    parts.append("".join(cur))
+    return parts
+
+
+def normalize_arguments(text: str) -> str:
+    """``ArgumentInfo.get_code()``: ``( a , key = b )`` -> ``(a, key=b)`` (the source text of each expression is kept)."""
+    inner = text.strip()[1:-1]
+    items = []
+    for part in _split_top(inner):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^([A-Za-z_]\w*)\s*=(?!=)\s*(.*)$", part, re.S)
+        items.append(f"{m.group(1)}={m.group(2).strip()}" if m else part)
+    return "(" + ", ".join(items) + ")"
+
+
+_WITH_EXPR = r"[A-Za-z_][\w\.]*(?:\([^()]*\))?"
+
+
+def parse_say_tail(rest: str) -> tuple[bool, str | None, str, str | None]:
+    """The clauses after a say statement's text, in any order (``renpy.parser.finish_say``): ``nointeract``,
+    ``id name``, ``with expr``, one ``(arguments)``. Returns ``(interact, explicit id, normalized arguments, with)``.
+    Something else (a ``with`` expression too complex for the pattern) ends the scan: the line stays a say statement,
+    only the clauses after that point are not part of its code."""
+    interact, ident, args, with_ = True, None, "", None
+    r = rest.strip()
+    while r:
+        m = re.match(r"nointeract\b\s*", r)
+        if m:
+            interact, r = False, r[m.end():]
+            continue
+        m = re.match(r"id\s+([^\W\d]\w*)\s*", r)
+        if m:
+            ident, r = m.group(1), r[m.end():]
+            continue
+        m = re.match(r"with\s+(" + _WITH_EXPR + r")\s*", r)
+        if m:
+            with_, r = m.group(1), r[m.end():]
+            continue
+        if r.startswith("("):
+            depth, q, end = 0, None, -1
+            for k, c in enumerate(r):
+                if q:
+                    if c == q:
+                        q = None
+                elif c in "\"'":
+                    q = c
+                elif c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = k
+                        break
+            if end < 0:
+                break
+            args, r = normalize_arguments(r[: end + 1]), r[end + 1:].lstrip()
+            continue
+        break
+    return interact, ident, args, with_
+
+
+def enter_label(name: str, hide: bool, ctx_label: list[str | None], declare: bool = True) -> str:
+    """A ``Label`` node is met: returns the full label name and moves the translation label that prefixes the dialogue
+    identifiers from here (``Restructurer.callback``: a hidden label, or one whose name starts with ``_``, does not).
+    ``declare`` is for ``label`` / ``menu name`` (``Lexer.set_global_label``: the part before the first dot becomes the
+    global label local ``.names`` hang on); the label a ``call ... from name`` makes leaves the global label alone."""
+    if name.startswith("."):
+        name = f"{ctx_label[1]}{name}" if ctx_label[1] else name
+    elif declare:
+        ctx_label[1] = name.split(".")[0]
+    if not hide and not name.startswith("_"):
+        ctx_label[0] = name
+    return name
 
 
 def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator, ctx_label: list[str | None], only_say: bool = False) -> None:
-    """Parse one .rpy file into ``state`` (characters, auto_voice, says)."""
+    """Parse one .rpy file into ``state`` (characters, auto_voice, says).
+
+    ``alloc`` and ``ctx_label`` are one file's: Ren'Py restructures every script file on its own, so the identifiers it
+    has handed out and the translation label both start empty in each (:func:`parse_rpy_files` does that)."""
     lines = _logical_lines(text)
     skip_indent: int | None = None
-    menu_stack: list[tuple[int, dict[str, Any]]] = []
+    menu_stack: list[list[Any]] = []  # [indent of the menu, its record, indent of its direct children (None until one is seen)]
     pending = _Pending()
     for no, indent, s in lines:
         if skip_indent is not None:
@@ -327,23 +475,27 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
             continue
         m = LABEL_RE.match(s)
         if m:
-            name = m.group("name")
-            if name.startswith(".") and ctx_label[1]:
-                name = f"{ctx_label[1]}{name}"
-            elif "." not in name:
-                ctx_label[1] = name
-            if not (m.group("hide") or name.split(".")[-1].startswith("_")):
-                ctx_label[0] = name
+            name = enter_label(m.group("name"), bool(m.group("hide")), ctx_label)
             state.says.append({"kind": "label", "label": name, "file": filename, "line": no})
             continue
         m = MENU_RE.match(s)
         if m:
+            if m.group("name"):  # ``menu name:`` makes a Label node too
+                enter_label(m.group("name"), False, ctx_label)
             rec = {"kind": "menu", "choices": [], "file": filename, "line": no, "label": ctx_label[0]}
             state.says.append(rec)
-            menu_stack.append((indent, rec))
+            menu_stack.append([indent, rec, None])
             continue
+        m = CALL_FROM_RE.match(s)
+        if m:  # ``call x from name`` makes a Label node too
+            enter_label(m.group("name"), False, ctx_label, declare=False)
+            continue
+        direct_menu_child = False
         if menu_stack and indent > menu_stack[-1][0]:
-            m = CHOICE_RE.match(s)
+            if menu_stack[-1][2] is None:
+                menu_stack[-1][2] = indent
+            direct_menu_child = indent == menu_stack[-1][2]
+            m = CHOICE_RE.match(s) if direct_menu_child else None
             if m:
                 menu_stack[-1][1]["choices"].append(strip_text_tags(dequote(m.group("cap"))))
                 state.says.append({"kind": "choice", "caption": strip_text_tags(dequote(m.group("cap"))), "file": filename, "line": no})
@@ -371,45 +523,49 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
         rest = m.group("rest").strip()
         if rest.endswith(":"):
             continue  # menu choice outside a recognised menu, or say with a block
+        interact, explicit_id, args, with_ = parse_say_tail(rest)
         attrs = (m.group("attrs") or "").split()
         tmp = (m.group("tmp") or "").replace("@", " ").split()
-        interact = True
-        explicit_id = None
-        args = ""
-        toks = rest
-        if toks.startswith("nointeract"):
-            interact = False
-            toks = toks[len("nointeract"):].strip()
-        mid = re.match(r"^id\s+([\w\.]+)\s*(.*)$", toks)
-        if mid:
-            explicit_id = mid.group(1)
-            toks = mid.group(2).strip()
-        if toks.startswith("("):
-            args = toks
-        what = dequote(m.group("what"))
-        codes = []
-        if not only_say:
-            if pending.voice_code:
-                codes.append(pending.voice_code)
-            if pending.sustain_code:
-                codes.append(pending.sustain_code)
-        codes.append(say_code(who, what, attrs, tmp, interact, explicit_id, args))
-        ident = explicit_id or alloc.allocate(ctx_label[0], block_digest(codes))
-        state.says.append(
-            {
-                "kind": "say",
-                "who": who,
-                "what": what,
-                "voice": pending.voice,
-                "voice_expr": bool(pending.voice_code) and pending.voice is None,
-                "sustain": pending.sustain,
-                "id": ident,
-                "label": ctx_label[0],
-                "file": filename,
-                "line": no,
-                "raw": s,
-            }
-        )
+        what_tok = m.group("what")
+        if direct_menu_child:
+            if who is None:
+                # a bare string in a menu is a caption (a menu item without a block), not a say statement: no identifier
+                state.says.append(
+                    {"kind": "say", "who": None, "what": dequote(what_tok), "voice": None, "voice_expr": False, "sustain": False, "id": "",
+                     "label": ctx_label[0], "file": filename, "line": no, "raw": s, "caption": True}
+                )
+                continue
+            interact = False  # the say menuitem: ``finish_say(..., interact=False)``, the menu itself waits for the click
+        if what_tok[:3] in ('"""', "'''"):  # monologue mode: one say statement per paragraph
+            paragraphs = triple_paragraphs(what_tok)
+        else:
+            paragraphs = [(0, dequote(what_tok))]
+        for n_para, (offset, what) in enumerate(paragraphs):
+            first_para = n_para == 0
+            codes = []
+            if not only_say and first_para:
+                if pending.voice_code:
+                    codes.append(pending.voice_code)
+                if pending.sustain_code:
+                    codes.append(pending.sustain_code)
+            codes.append(say_code(who, what, attrs, tmp, interact, explicit_id if first_para else None, args, with_))
+            computed = alloc.allocate(ctx_label[0], block_digest(codes))  # an explicit id replaces it, the computed one stays taken
+            ident = (explicit_id if first_para else None) or computed
+            state.says.append(
+                {
+                    "kind": "say",
+                    "who": who,
+                    "what": what,
+                    "voice": pending.voice if first_para else None,
+                    "voice_expr": first_para and bool(pending.voice_code) and pending.voice is None,
+                    "sustain": pending.sustain if first_para else False,
+                    "id": ident,
+                    "label": ctx_label[0],
+                    "file": filename,
+                    "line": no + offset,
+                    "raw": s,
+                }
+            )
         pending = _Pending()
 
 
@@ -422,14 +578,16 @@ def _literal(expr: str) -> str | None:
 
 
 def parse_rpy_files(files: list[Path], only_say: bool = False) -> RpyParse:
-    """Parse files in Ren'Py load order (sorted by path, as the launcher does)."""
+    """Parse files in Ren'Py load order (sorted by path, as the launcher does).
+
+    Every file gets its own :class:`IdAllocator` and translation label: ``Script.static_transforms`` calls
+    ``renpy.translation.restructure`` once per file, so the ``_1`` / ``_2`` collision suffixes are per file."""
     state = RpyParse()
-    alloc = IdAllocator()
     for f in sorted(files, key=lambda p: p.as_posix().lower()):
         from vndub.engines.base import read_text_any
 
         ctx_label: list[str | None] = [None, None]  # [translation label, last global label]
-        parse_rpy_text(read_text_any(f), f.name, state, alloc, ctx_label, only_say)
+        parse_rpy_text(read_text_any(f), f.name, state, IdAllocator(), ctx_label, only_say)
     return state
 
 
@@ -571,8 +729,11 @@ class RenpyEngine(BaseEngine):
             flags = []
             if who == "extend":
                 flags.append("extend")
+            if st.get("caption"):
+                flags.append("menu_caption")  # a bare string in a menu: shown, never spoken, no dialogue identifier
             rec = lb.add(scene, text, speaker_raw=speaker_raw, speaker_id=sid, raw=st["raw"], source_file=st["file"], source_line=st["line"], flags=flags)
-            rec.dialogue_id = st["id"]  # type: ignore[attr-defined]
+            if st["id"]:  # a menu caption is not a say statement and has no identifier
+                rec.dialogue_id = st["id"]  # type: ignore[attr-defined]
             ref = st["voice"]
             if st["sustain"] and last_voiced is not None and not ref:
                 rec.flags.append("voice_sustain")
@@ -594,7 +755,7 @@ class RenpyEngine(BaseEngine):
                     rec.flags.append("dialogue_tab_id")  # launcher export overrides our computed id
                 st["id"] = tab_id
                 rec.dialogue_id = tab_id  # type: ignore[attr-defined]
-            if not ref and auto_voice:
+            if not ref and auto_voice and st["id"]:
                 cand = auto_voice.replace("{id}", st["id"])
                 if resolver.resolve(cand) is not None:
                     ref = cand
@@ -651,13 +812,14 @@ class RenpyEngine(BaseEngine):
     def pack(self, ctx: "StageContext", finals: list[FinalIndexRecord]) -> dict[str, Any]:
         out = ctx.paths.out_engine("renpy") / "game"
         n = copy_loose(ctx, finals, out)
-        write_install(
-            ctx.paths.out_engine("renpy"),
-            "renpy",
-            [
-                f"Copy the `game` folder from here over the game's `game` folder ({ctx.game_dir / 'game'}).",
-                "Ren'Py loads loose files before .rpa archives, so the new voices override the originals.",
-                "If the game sets `config.force_archives = True`, loose files are ignored: repack the voices into an .rpa (rpatool -c) named so it sorts after the original archives.",
-            ],
-        )
+        write_install(ctx.paths.out_engine("renpy"), "renpy", install_steps(ctx))
         return {"mode": "loose", "files": n, "out": str(out)}
+
+
+def install_steps(ctx: "StageContext") -> list[str]:
+    """INSTALL.md steps of a Ren'Py patch (also used by ``pack`` when the patch holds only lines without original voice)."""
+    return [
+        f"Copy the `game` folder from here over the game's `game` folder ({ctx.game_dir / 'game'}).",
+        "Ren'Py loads loose files before .rpa archives, so the new voices override the originals.",
+        "If the game sets `config.force_archives = True`, loose files are ignored: repack the voices into an .rpa (rpatool -c) named so it sorts after the original archives.",
+    ]

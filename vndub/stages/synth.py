@@ -33,6 +33,17 @@ says the GPU ran out of memory is treated the same way (``Job.keep``), whether i
 
 Resume: a route-B candidate stores ``<cid>:tts`` in the stage cache when its pre-VC wav is complete; a rerun whose TTS
 request is unchanged skips the TTS and converts the kept ``.prevc.wav``.
+
+Laughter (``synth.laughter``, ``configs/laughter.yaml``, ``vndub/text/laughter.py``): a written laugh in the text a backend
+gets ("Ха-ха-ха", "Haha", "あはは", a stage direction like ``*laughs*``) is read letter by letter by an LLM-based TTS, so
+after the text variant is picked every laugh is written the way that backend voices as a laugh: the table spelling for the
+target language (``respell``, the default, and the only lever of a cloner such as Qwen3-TTS Base, which ignores ``instruct``),
+the backend own sound-event token (``inline``, CosyVoice ``[laughter]``) or a tag in front of the spelled laugh (``tag``, Fish
+``[laughing]``, Higgs ``<|sfx:laughter|>``). Stage directions never reach the TTS as words. The laugh kind and strength also
+reach the style (``StyleSpec.laughter``: specific instruct phrase, a laughter-only line is an instruction about the laugh) and
+the sidecar records ``laughter: {kind, n, mode, only, stage}``. ``text_used`` is the text that was sent; ``text_plain`` (the CER
+reference) is never respelled. A ``set_text`` override is sent as the user wrote it. The setting is not part of the cache hash
+(the spelled text is part of every candidate key), so adding it re-generates only lines that contain a laugh.
 """
 
 from __future__ import annotations
@@ -41,6 +52,7 @@ import re
 import shutil
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -51,7 +63,22 @@ from vndub.backends.base import BackendSpec, BackendUnavailable
 from vndub.manifest.io import LineRecord, load_overrides, write_json
 from vndub.stages import genutil as gu
 from vndub.stages.common import StageError
-from vndub.text.style_prompt import StyleSpec, apply_tuning, build_style, normalize_tuning, render, to_emotion_ref, tuning_key, tuning_knobs, tuning_plan
+from vndub.text import laughter as lg
+from vndub.text.style_prompt import (
+    CALM_BELOW,
+    StyleSpec,
+    apply_tuning,
+    build_style,
+    laughter_decision,
+    laughter_tokens,
+    normalize_tuning,
+    render,
+    to_emotion_ref,
+    tuning_key,
+    tuning_knobs,
+    tuning_plan,
+)
+from vndub.util import hash_obj
 
 NAME = "synth"
 VERSION = "1"
@@ -78,6 +105,7 @@ class Job:
     tuning: dict[str, Any] | None = None  # normalized tuning, None when default
     plan: dict[str, Any] | None = None  # tuning_plan(): what master / score still need to know
     options: dict[str, Any] = field(default_factory=dict)
+    laughter: dict[str, Any] | None = None  # {kind, n, mode, only, stage}: how the laughs of the text were written for this backend
     error: str = ""
     keep: bool = False  # the failure is about the machine (backend unavailable, out of memory): leave wav and sidecar alone
     elapsed: float = 0.0
@@ -205,6 +233,12 @@ def run(ctx: Any) -> dict[str, Any]:
 
     enabled_routes = [r for r, on in sc.routes.items() if on]
     cache = gu.stage_cache(ctx, NAME, VERSION, "synth", "project")  # the project folders are not part of a candidate's key
+    # nor is synth.laughter: its effect (the spelled text, the laugh phrase of the style) is part of every candidate's key already,
+    # and a key that moved with the section would regenerate every candidate of a project that has no laughter at all
+    cache.rekey(_synth_hash(cfg))
+    laughter_table = _laughter_table(ctx) if sc.laughter.enabled else None
+    laughter_lines: set[str] = set()
+    laughter_modes: Counter[str] = Counter()
     jobs: list[Job] = []
     orig_jobs: list[tuple[LineRecord, int]] = []
     interjection_lex = _interjections(ctx)
@@ -249,8 +283,10 @@ def run(ctx: Any) -> dict[str, Any]:
         if len(cont) < len(cont_ids):
             ctx.log.warning("%s: %d sustain continuation line(s) without a usable translation", line.line_id, len(cont_ids) - len(cont))
 
+        user_text = set_text is not None and bool(set_text.payload.get("text"))
+
         def texts(plus: bool) -> tuple[str, str]:
-            if set_text is not None and set_text.payload.get("text"):
+            if user_text:
                 t = str(set_text.payload["text"])
                 return t, gu.strip_stress(t)
             return join_texts([tr, *cont], use_short, plus)
@@ -294,7 +330,14 @@ def run(ctx: Any) -> dict[str, Any]:
                 caps = bspec.caps or {}
                 plus = caps.get("stress_format") == "plus"
                 text, plain = texts(plus)
-                rendered = render(spec, caps, bopts, cross_lingual=(route == "A"))
+                spec_b, laugh = spec, None
+                if laughter_table is not None and not user_text:
+                    text, spec_b, laugh = _laughter_for(text, tgt, bname, caps, laughter_table, spec, tuning)
+                rendered = render(spec_b, caps, bopts, cross_lingual=(route == "A"), laughter_inline=bool(laugh) and laugh["mode"].startswith(("inline", "tag")))
+                if laugh:
+                    rendered["laughter"] = laugh["mode"]
+                    laughter_lines.add(line.line_id)
+                    laughter_modes[laugh["mode"]] += 1
                 plan = tuning_plan(tuning, caps, route) if tkey else None
                 if style_override:
                     rendered["instruct"] = style_override if caps.get("instruct", "none") not in ("none",) else rendered["instruct"]
@@ -359,11 +402,11 @@ def run(ctx: Any) -> dict[str, Any]:
                     job = Job(
                         line_id=line.line_id, speaker_id=sid, backend=bname, route=route, k=k, round=rnd, seed=seed,
                         text=text_used, text_plain=plain, text_variant=variant if set_text is None else "override",
-                        style=spec, rendered=rendered, item=item, out=out, vc=vc, options=options, tuning=tkey, plan=plan,
+                        style=spec_b, rendered=rendered, item=item, out=out, vc=vc, options=options, tuning=tkey, plan=plan, laughter=laugh,
                     )
                     parts: list[Any] = [
-                        text_used, spec.to_dict(), rendered, [Path(p).name for p in ref_paths], options, seed, tgt,
-                        item["target_duration"], vc,
+                        text_used, spec_b.to_dict(), {k2: v2 for k2, v2 in rendered.items() if k2 != "laughter"},
+                        [Path(p).name for p in ref_paths], options, seed, tgt, item["target_duration"], vc,
                     ]
                     if tkey:  # default tuning keeps the pre-tuning key
                         parts.append({"tuning": tkey, "plan": plan})
@@ -549,6 +592,8 @@ def run(ctx: Any) -> dict[str, Any]:
     progress.finish()
     summary["backends"] = [b for b, _, _ in backends]
     summary["round"] = max(rounds, default=0)
+    if laughter_lines:
+        summary["laughter"] = {"lines": len(laughter_lines), "modes": dict(laughter_modes.most_common())}
     if unavailable:
         summary["unavailable"] = unavailable
     if skipped_routes:
@@ -579,6 +624,52 @@ class _Progress:
         if self.total and self.done < self.total:
             self.done = self.total
             self.ctx.progress(self.done, self.total, None)
+
+
+def _synth_hash(cfg: Any) -> str:
+    """``gu.stable_section_hash(cfg, "synth", "project")`` without ``synth.laughter`` (see the module docstring)."""
+    dump = cfg.model_dump(mode="json", by_alias=True)
+    synth_d = dump.get("synth")
+    if isinstance(synth_d, dict):
+        synth_d = {k: v for k, v in synth_d.items() if k != "laughter"}
+    project_d = dump.get("project")
+    if isinstance(project_d, dict):
+        project_d = {k: v for k, v in project_d.items() if k not in gu.PROJECT_PATH_KEYS}
+    return hash_obj({"synth": synth_d, "project": project_d})
+
+
+def _laughter_table(ctx: Any) -> dict[str, Any] | None:
+    """``configs/laughter.yaml`` (``synth.laughter.table``); ``None`` (laughs are left as written) when the file is missing."""
+    path = ctx.cfg.resolve(ctx.cfg.synth.laughter.table)
+    try:
+        return lg.load_table(path)
+    except FileNotFoundError:
+        ctx.log.warning("laughter table %s not found: laughs are sent to the TTS as written", path)
+        return None
+    except ValueError as e:
+        raise StageError(f"laughter table is invalid: {e}") from e
+
+
+def _laughter_for(
+    text: str, tgt: str, backend: str, caps: dict[str, Any], table: dict[str, Any], spec: StyleSpec, tuning: dict[str, Any] | None,
+) -> tuple[str, StyleSpec, dict[str, Any] | None]:
+    """The TTS text with its laughs written for ``backend`` and the StyleSpec that knows the laugh.
+
+    Returns ``(text, spec, record)``; ``record`` = ``{kind, n, mode, only, stage}`` for the sidecar (``None``: no laugh in the
+    text, ``text`` and ``spec`` are returned as they came). The laugh kind and length of the text set ``spec.laughter`` (the
+    kind-specific instruct phrase, a laughter-only line) and add the ``laughter`` event when the passport had none, unless the
+    tuning is "always calm".
+    """
+    new_text, rec = lg.apply_laughter(text, tgt, laughter_decision(caps), table, backend, laughter_tokens(caps))
+    if rec is None:
+        return text, spec, None
+    info = lg.summarize(text) or {}
+    spec_b = StyleSpec.from_dict(spec.to_dict())
+    if normalize_tuning(tuning)["expressiveness"] > CALM_BELOW:
+        spec_b.laughter = {"kind": info.get("kind"), "units": info.get("units", 0), "stage": bool(info.get("stage")), "only": bool(info.get("only"))}
+        if "laughter" not in spec_b.events:
+            spec_b.events = [*spec_b.events, "laughter"]
+    return new_text, spec_b, rec
 
 
 def _base_style(passport: dict[str, Any], stats: dict[str, Any], notes: str, cfg: Any) -> StyleSpec:
@@ -712,6 +803,8 @@ def _finish(ctx: Any, cache: Any, j: Job) -> None:
     }
     if j.route == "B" and j.prevc.exists():
         data["pre_vc_wav"] = ctx.paths.rel(j.prevc)
+    if j.laughter:
+        data["laughter"] = j.laughter
     if j.error:
         # this run tried to generate this very item and it failed on its own: a wav of an earlier request would be stale
         data["error"] = j.error

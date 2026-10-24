@@ -356,3 +356,196 @@ def test_synth_progress_class_units():
     seen.clear()
     synth._Progress(C(), 0, 0)
     assert seen == []
+
+
+# ---- laughter: the text a backend gets (spelling / inline token / tag), the style, the sidecar ---------------------------
+
+
+def _say(ctx, line_id: str, text: str, plain: str | None = None) -> None:
+    """Replace the translation of one line (text_tgt = text_tts; ``plain`` = the CER reference, default the same)."""
+    trs = gu.load_translations(ctx)
+    r = trs[line_id]
+    r.text_tgt = r.text_tgt_short = r.text_tts = text
+    r.text_plain = text if plain is None else plain
+    write_jsonl(ctx.paths.translation(ctx.cfg.project.tgt_lang), list(trs.values()))
+
+
+def _sides(ctx, line_id: str) -> list[dict]:
+    return [read_json(p.with_suffix(".json")) for p in _cands(ctx, line_id) if not p.name.startswith("orig")]
+
+
+def _with_caps(monkeypatch, **caps):
+    """The mock TTS with the capabilities of another backend (tag syntax, instruct kind)."""
+    from vndub.backends import registry
+
+    for k, v in caps.items():
+        monkeypatch.setitem(registry.get("mock_tts").caps, k, v)
+
+
+def test_laughter_is_respelled_for_a_plain_backend(proj):
+    ctx = proj
+    line = ctx.voiced_lines()[0]
+    _say(ctx, line.line_id, "Ха-ха-ха, ну ты даёшь!")
+    s = synth.run(ctx)
+    assert s["failed"] == 0 and s["laughter"]["lines"] >= 1 and s["laughter"]["modes"]["respell"] >= 1
+    sides = _sides(ctx, line.line_id)
+    assert sides
+    for side in sides:
+        assert side["text_used"] == "Ахахаха, ну ты даёшь!"  # 3 syllables: the long spelling of configs/laughter.yaml
+        assert side["text_plain"] == "Ха-ха-ха, ну ты даёшь!"  # the CER reference is never respelled
+        assert side["laughter"] == {"kind": "hearty", "n": 1, "mode": "respell", "only": False, "stage": False}
+        assert side["style"]["laughter"]["kind"] == "hearty" and "laughter" in side["style"]["events"]
+        assert any(p in side["style_prompt"] for p in ("warm, easy laugh", "laughing heartily", "bursting into hearty laughter"))
+        assert "light laugh" not in side["style_prompt"]
+    # a line without laughter is untouched: no laughter field, no laughter key in the stored style
+    other = ctx.voiced_lines()[1]
+    for side in _sides(ctx, other.line_id):
+        assert "laughter" not in side and "laughter" not in side["style"] and "laugh" not in side["style_prompt"]
+
+
+def test_stage_direction_is_removed_from_the_spoken_text(proj):
+    ctx = proj
+    line = ctx.voiced_lines()[0]
+    _say(ctx, line.line_id, "*laughs* Нет уж, не выйдет.")
+    synth.run(ctx)
+    for side in _sides(ctx, line.line_id):
+        assert side["text_used"] == "Нет уж, не выйдет."
+        assert side["text_plain"] == "*laughs* Нет уж, не выйдет."
+        assert side["laughter"]["stage"] is True and side["laughter"]["kind"] == "hearty"
+    # a line that is only a stage direction is spoken as a laugh, never sent empty
+    _say(ctx, line.line_id, "(смеётся)")
+    synth.run(ctx)
+    for side in _sides(ctx, line.line_id):
+        assert side["text_used"] == "Ахаха!" and side["laughter"]["only"] is True  # the short hearty spelling of configs/laughter.yaml
+
+
+def test_laughter_only_line_gets_an_instruction_about_the_laugh(proj):
+    ctx = proj
+    interj = [l for l in ctx.voiced_lines() if l.text_src == "えへへ。"][0]  # translated "Хе-хе."
+    synth.run(ctx)
+    sides = _sides(ctx, interj.line_id)
+    assert sides
+    for side in sides:
+        assert side["text_used"] == "Хехе." and side["laughter"]["kind"] == "chuckle" and side["laughter"]["only"] is True  # the short chuckle spelling of configs/laughter.yaml
+        assert side["style_prompt"].startswith("Only laugh, no words: make a low, quiet chuckle")
+        assert side["style"]["laughter"]["only"] is True
+
+
+def test_inline_token_for_a_cosy_inline_backend(proj, monkeypatch):
+    ctx = proj
+    line = ctx.voiced_lines()[0]
+    _say(ctx, line.line_id, "Ха-ха-ха, ну ты даёшь!")
+    _with_caps(monkeypatch, instruct="cosy", tags="cosy_inline")
+    synth.run(ctx)
+    for side in _sides(ctx, line.line_id):
+        assert side["text_used"] == "[laughter] ну ты даёшь!"  # the CosyVoice sound event replaces the written laugh
+        assert side["laughter"]["mode"] == "inline:[laughter]"
+        assert side["text_plain"] == "Ха-ха-ха, ну ты даёшь!"
+    # a line that is only a laugh keeps a spelling next to the token (configs/laughter.yaml cosyvoice3 `only: tag` is for that backend name;
+    # here the mock backend has no section, so the token alone replaces the laugh)
+    interj = [l for l in ctx.voiced_lines() if l.text_src == "えへへ。"][0]
+    for side in _sides(ctx, interj.line_id):
+        assert side["text_used"] == "[laughter]." and side["laughter"]["mode"] == "inline:[laughter]"
+
+
+def test_tag_in_front_of_the_spelling_for_fish_and_higgs(proj, monkeypatch):
+    ctx = proj
+    line = ctx.voiced_lines()[0]
+    _say(ctx, line.line_id, "Хе-хе, посмотрим.")
+    _with_caps(monkeypatch, instruct="none", tags="fish")
+    synth.run(ctx)
+    for side in _sides(ctx, line.line_id):
+        assert side["text_used"].endswith("[chuckling] Хехе, посмотрим.")
+        assert side["text_used"].count("[chuckling]") == 1 and "[laughing]" not in side["text_used"]  # the prefix leaves its own laugh tag out
+        assert side["laughter"]["mode"] == "tag:[laughing]"
+    _with_caps(monkeypatch, instruct="none", tags="higgs")
+    ctx.cfg.synth.seed_base += 1
+    synth.run(ctx)
+    for side in _sides(ctx, line.line_id):
+        # the tag is written right against the onomatopoeia (Higgs model card); the mock backend has no `higgs_tts3` section in
+        # configs/laughter.yaml, so the spelling is the Russian one (that section spells it in English, see test_text_laughter)
+        assert "<|sfx:laughter|>Хехе, посмотрим." in side["text_used"]
+        assert side["text_used"].count("<|sfx:laughter|>") == 1
+
+
+def test_laughter_can_be_switched_off_and_a_user_text_is_left_alone(proj):
+    from vndub.review.app import write_override
+
+    ctx = proj
+    line = ctx.voiced_lines()[0]
+    _say(ctx, line.line_id, "Ха-ха-ха, ну ты даёшь! *laughs*")
+    ctx.cfg.synth.laughter.enabled = False
+    s = synth.run(ctx)
+    assert "laughter" not in s
+    for side in _sides(ctx, line.line_id):
+        assert side["text_used"] == "Ха-ха-ха, ну ты даёшь! *laughs*" and "laughter" not in side
+    ctx.cfg.synth.laughter.enabled = True
+    write_override(ctx.paths, line.line_id, "set_text", {"text": "Ха-ха-ха, вот так."})  # what the user typed is what is spoken
+    synth.run(ctx)
+    over = [s for s in _sides(ctx, line.line_id) if s["text_variant"] == "override"]
+    assert over and all(s["text_used"] == "Ха-ха-ха, вот так." and "laughter" not in s for s in over)
+
+
+def test_missing_and_broken_laughter_table(proj, tmp_path):
+    ctx = proj
+    line = ctx.voiced_lines()[0]
+    _say(ctx, line.line_id, "Ха-ха-ха, ну ты даёшь!")
+    ctx.cfg.synth.laughter.table = str(tmp_path / "nowhere.yaml")
+    synth.run(ctx)  # a missing table is a warning: the text goes out as translated
+    assert all(s["text_used"] == "Ха-ха-ха, ну ты даёшь!" for s in _sides(ctx, line.line_id))
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("ru:\n  cackle: Ха\n", encoding="utf-8")
+    ctx.cfg.synth.laughter.table = str(bad)
+    with pytest.raises(StageError, match="laughter table is invalid"):
+        synth.run(ctx)
+
+
+def test_table_edit_changes_the_spelling_and_only_regenerates_laughing_lines(proj, tmp_path):
+    import yaml
+
+    from vndub.text import laughter as lg
+
+    ctx = proj
+    line = ctx.voiced_lines()[0]
+    _say(ctx, line.line_id, "Ха-ха-ха, ну ты даёшь!")
+    s1 = synth.run(ctx)
+    ctx.save_caches()
+    table = yaml.safe_load(lg.default_table_path().read_text(encoding="utf-8"))
+    table["ru"]["hearty"] = {"short": "Хаха!", "long": "Хахахаха!"}
+    mine = tmp_path / "my_laughter.yaml"
+    mine.write_text(yaml.safe_dump(table, allow_unicode=True), encoding="utf-8")
+    ctx.cfg.synth.laughter.table = str(mine)
+    s2 = synth.run(ctx)
+    assert all(s["text_used"] == "Хахахаха, ну ты даёшь!" for s in _sides(ctx, line.line_id))
+    n_laugh = len(_sides(ctx, line.line_id))
+    assert s2["generated"] == n_laugh and s2["cached"] == s1["candidates"] - n_laugh  # the other lines keep their candidates
+
+
+def test_synth_laughter_setting_is_not_part_of_the_cache_hash(proj):
+    ctx = proj
+    s1 = synth.run(ctx)
+    ctx.save_caches()
+    base = synth._synth_hash(ctx.cfg)
+    ctx.cfg.synth.laughter.table = str(ctx.cfg.resolve("configs/laughter.yaml"))  # another path to the same table
+    ctx.cfg.synth.laughter.enabled = False
+    assert synth._synth_hash(ctx.cfg) == base  # adding / editing the key must not regenerate a project without laughter
+    assert gu.stable_section_hash(ctx.cfg, "synth", "project") != base  # (the generic hash would)
+    s2 = synth.run(ctx)
+    laugh = [l for l in ctx.voiced_lines() if l.text_src == "えへへ。"][0]  # the only line with a laugh in the test project
+    n = len(_sides(ctx, laugh.line_id))
+    assert s2["generated"] == n and s2["cached"] == s1["candidates"] - n
+    ctx.cfg.synth.seed_base += 1
+    assert synth._synth_hash(ctx.cfg) != base
+
+
+def test_haha_no_way_for_the_qwen_clone(proj, monkeypatch):
+    """End to end for the user's setup: Qwen3-TTS Base clones the performer (caps instruct=qwen, no tags)."""
+    ctx = proj
+    line = ctx.voiced_lines()[0]
+    _with_caps(monkeypatch, instruct="qwen", tags="none", knobs="none")
+    _say(ctx, line.line_id, "Ха-ха-ха, ни за что!")  # "Haha, no way!" as the translator writes it
+    synth.run(ctx)
+    for side in _sides(ctx, line.line_id):
+        assert side["text_used"] == "Ахахаха, ни за что!"
+        assert side["params"]["instruct"] == side["style_prompt"] and "laugh" in side["style_prompt"]
+        assert side["laughter"] == {"kind": "hearty", "n": 1, "mode": "respell", "only": False, "stage": False}

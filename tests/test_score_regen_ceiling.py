@@ -143,3 +143,50 @@ def test_with_the_ceiling_off_the_same_line_asks_for_a_regen_round(make_ctx, tmp
     summary = score.run(ctx)  # regen_rounds is 1 in the test profile: the line asks for its round
     sel = {s.line_id: s for s in read_jsonl(ctx.paths.selection, SelectionRecord)}
     assert sel[lid].status == "regen" and "review_without_regen" not in summary
+
+
+# ---- laughter: no words, no CER, nothing to misread ----------------------------------------------------------------------------
+
+
+def test_a_laughter_only_line_is_never_hopeless_by_cer():
+    quiet = _c("a.wav", utmos=2.0, spk_sim=0.5)  # fails the MOS gate; a laugh has no CER
+    quiet.notes = [score.LAUGHTER_NOTE]
+    quiet.model_extra["na"] = ["cer"]
+    assert regen_hopeless([quiet], quiet, 0.2) is None
+    # even next to a stale CER of 1.0 on the same record (what an older run left): the line is not "misread"
+    stale = _c("b.wav", utmos=2.0, cer=1.0, spk_sim=0.5)
+    stale.notes = [score.LAUGHTER_NOTE]
+    assert regen_hopeless([stale], stale, 0.2) is None
+    s = select("l1", [quiet], _sides("a.wav"), [], 2, regen_cer_max=0.2)
+    assert s.status == "regen" and "misread" not in s.reason and "would not help" not in s.reason
+    assert "utmos 2.00<" in s.reason and "laughter only, no words to check" in s.reason
+    # the same numbers on a line with words keep the old verdict
+    words = _c("c.wav", utmos=4.5, cer=0.4, spk_sim=0.5)
+    assert regen_hopeless([words], words, 0.2) is not None
+
+
+def test_a_garbled_transcript_of_a_laugh_does_not_send_the_line_to_review(make_ctx, tmp_path, monkeypatch):
+    from vndub.manifest.io import write_jsonl
+
+    ctx = make_ctx(tmp_path / "game", sets={"score.gates.cer_max": 0.1})
+    data = build(ctx, n_per=2)
+    trs = data["translations"]
+    only = trs[2]
+    assert only.text_tgt == "Хе-хе."
+    only.flags = ["interjection", "laughter"]
+    write_jsonl(ctx.paths.translation("ru"), trs)
+    synth.run(ctx)
+    lid = only.line_id
+    orig = mockb.MockASR.op_transcribe
+
+    def garbled(self, item, lang="ja", **kw):
+        res = orig(self, item, lang=lang, **kw)
+        return {**res, "text": "абракадабра бубликов " * 3} if lid in Path(item["wav"]).parts else res
+
+    monkeypatch.setattr(mockb.MockASR, "op_transcribe", garbled)
+    summary = score.run(ctx)
+    rows = [r for r in read_jsonl(ctx.paths.scores(lid), CandidateScore) if r.route != "orig"]
+    assert rows and all(r.metrics.get("cer") is None and "cer" not in r.gates for r in rows)
+    sel = {s.line_id: s for s in read_jsonl(ctx.paths.selection, SelectionRecord)}[lid]
+    assert sel.status != "regen" and "misread" not in sel.reason and "would not help" not in sel.reason and "cer" not in sel.reason
+    assert "review_without_regen" not in summary

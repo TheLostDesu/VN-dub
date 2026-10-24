@@ -228,6 +228,16 @@ export default function GameScreen() {
         </Card>
       ) : null}
 
+      {/* ---- imported by an older version: the Ren'Py dialogue identifiers have to be computed again ---- */}
+      {project && imported && !importing && (project.stale ?? []).some((s) => s.stage === "parse") ? (
+        <Callout tone="warn" title={t("stale_import.title")} testid="game-import-stale">
+          <p>{t("stale_import.game_text")}</p>
+          <Button onClick={startImport} data-testid="game-import-stale-run">
+            {t("stale_import.run")}
+          </Button>
+        </Callout>
+      ) : null}
+
       {/* ---- tools that are missing ---------------------------------------------------------- */}
       {project && missing.length > 0 ? (
         <Card testid="game-tools-missing">

@@ -49,7 +49,7 @@ TOOL_INFO: dict[str, ToolInfo] = {
     "vntextpatch": ToolInfo("VNTextPatch", "text+names for 22 engines (extractlocal)", "https://github.com/arcusmaximus/VNTranslationTools/releases"),
     "llama_server": ToolInfo("llama-server", "local LLM server for translate", "https://github.com/ggml-org/llama.cpp/releases (Windows CUDA 12 build)"),
     "applio_dir": ToolInfo("", "Applio checkout used by the rvc env (if not in .venvs/rvc/src/Applio)", "https://github.com/IAHispano/Applio"),
-    "audiocpp": ToolInfo("audiocpp", "audio.cpp CLI for Fish S2 Pro GGUF", "https://github.com/andreaabcj-cmd/fish-audio-s2-pro-realtime-local-tts"),
+    "audiocpp": ToolInfo("audiocpp", "audio.cpp CLI (Fish S2 Pro and MOSS-TTS v1.5 GGUF)", "https://github.com/0xShug0/audio.cpp/releases"),
     "zonos2_cli": ToolInfo("zonos2", "zonos2.cpp CLI", "https://github.com/Zyphra/zonos2.cpp/releases"),
     "moss_tts_cli": ToolInfo("moss-tts", "MOSS-TTS llama.cpp CLI", "https://github.com/OpenMOSS/MOSS-TTS"),
 }

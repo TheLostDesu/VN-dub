@@ -57,7 +57,7 @@ from vndub.manifest.io import Character, LineRecord, TranslationRecord, read_jso
 from vndub.stages import text_emotion as te_stage
 from vndub.stages._opcache import OpCache
 from vndub.stages.common import StageContext, StageError
-from vndub.text import ja, ru
+from vndub.text import ja, laughter, ru
 from vndub.text.delivery import EMOTIONS, EVENTS, LOUDNESSES, TEMPOS, validate_delivery
 from vndub.text.lang import LANG_NAMES, language_name
 from vndub.util import hash_obj, now_iso
@@ -776,6 +776,18 @@ def make_stresser(ctx: StageContext, texts: list[str]) -> tuple[Any, str, str]:
     return (lambda t: memo.get(t, t)), spec.name, ""
 
 
+def laughter_flags(text: str | None) -> list[str]:
+    """Flags a piece of dialogue text earns for its laughter: ``laughter`` when it contains any laugh ("Haha, no way!"),
+    plus ``interjection`` when it is nothing but laughter ("Haha!", "Хе-хе.", "(laughs)"). The interjection flag lowers the
+    CER gate (``score.interjection_cer_max``), gives the line the short candidate count and keeps the original audio as a
+    candidate, exactly like a Japanese kana interjection; the CER of a laughter-only line is not checked at all."""
+    t = text or ""
+    laughs = laughter.find_laughs(t)
+    if not laughs:
+        return []
+    return ["laughter", "interjection"] if laughter.is_laughter_only(t, "auto") else ["laughter"]
+
+
 def finalize(rec: TranslationRecord, tgt: str, stresser: Any, fmt: str, plus: bool, yo: bool) -> None:
     if "translate_failed" in rec.flags or not rec.text_tgt:
         rec.text_tts = rec.text_tts_short = rec.text_plain = ""
@@ -902,10 +914,11 @@ def run(ctx: StageContext) -> dict[str, Any]:
     flags: dict[str, list[str]] = {l.line_id: [] for l in lines}
     backend_name = ""
 
-    # 1. interjections (kana-only short lines are Japanese by definition)
+    # 1. interjections (kana-only short lines are Japanese by definition) and laughter (any language)
     for l in lines:
         if src == "ja" and ja.is_interjection(l.text_src, lexicon, max_morae):
             flags[l.line_id].append("interjection")
+        flags[l.line_id] += laughter_flags(l.text_src)
         mapped = ja.match_interjection(l.text_src, lexicon, max_morae) if lexicon else None
         if mapped:
             entries[l.line_id] = {"text_tgt": mapped, "text_tgt_short": mapped, "notes": "", "source": "interjection"}
@@ -953,6 +966,8 @@ def run(ctx: StageContext) -> dict[str, Any]:
                 e = {"text_tgt": l.text_src, "text_tgt_short": l.text_src, "notes": "", "source": f"llm:{backend_name}"}
                 fl.append("translate_failed")
                 ctx.log.error("translation failed for %s: source text kept", l.line_id)
+        if "translate_failed" not in fl and "translate_missing" not in fl:
+            fl += laughter_flags(e["text_tgt"])  # the model may turn "Haha!" into "Ха-ха!" (or a laugh into words)
         recs.append(
             TranslationRecord(
                 line_id=l.line_id,
@@ -989,6 +1004,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
         "backend": backend_name or "-",
         "models_used": models_used(recs),
         "interjections": sum(1 for r in recs if "interjection" in r.flags),
+        "laughter": sum(1 for r in recs if "laughter" in r.flags),
         "failed": sum(1 for r in recs if "translate_failed" in r.flags),
         "missing": sum(1 for r in recs if "translate_missing" in r.flags),
         "deliveries": sum(1 for r in recs if (r.model_extra or {}).get("delivery")),

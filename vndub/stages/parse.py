@@ -31,7 +31,7 @@ from vndub.stages.common import StageContext, StageError, resolve_src_lang
 from vndub.text.lang import detect_language, language_name
 
 NAME = "parse"
-VERSION = "2"
+VERSION = "3"  # 3: Ren'Py dialogue identifiers are computed as Ren'Py does; the app tells a project imported with an older version to import again
 CONFIG_SECTIONS = ("parse",)
 
 USER_FIELDS = ("gender", "age_hint", "route", "notes", "performer", "rvc", "lora", "refs", "description")

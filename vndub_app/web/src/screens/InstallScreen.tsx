@@ -5,6 +5,7 @@ import type { ErrorInfo, InstallPlan } from "../api/types";
 import { ErrorPanel } from "../components/ErrorPanel";
 import { JobProgress } from "../components/JobProgress";
 import { Markdown } from "../components/Markdown";
+import { CoverageCounts } from "../components/PatchCoverage";
 import { StepFooter } from "../components/StepFooter";
 import { Button, Callout, Card, Checkbox, Chip, Collapsible, Dialog, PageTitle, SelectField, Spinner, useToast } from "../components/ui";
 import { useI18n } from "../i18n";
@@ -84,6 +85,7 @@ export default function InstallScreen() {
             ) : (
               <p className="hint">{t("install.no_md")}</p>
             )}
+            {plan.manifest?.coverage ? <CoverageCounts coverage={plan.manifest.coverage} /> : null}
             {plan.files.length > 0 ? (
               <Collapsible title={t("install.files.title", { n: plan.files.length })} testid="install-files-toggle">
                 <ul className="file-list" data-testid="install-files">

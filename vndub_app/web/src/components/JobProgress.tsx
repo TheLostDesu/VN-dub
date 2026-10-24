@@ -138,36 +138,101 @@ export function JobWarnings({ job }: { job: JobInfo }) {
 }
 
 const FILE_STATES = ["pending", "downloading", "verifying", "extracting", "installing", "done", "failed"];
+const ACTIVE_FILE_STATES = ["downloading", "installing", "extracting", "verifying"];
 
-/** Per-file rows of a download / install job (bytes from `result.files[]`, environments have only a state). */
+/** Scroll `box` (not the page) the least that brings `el` into view, with one more row of context below it. */
+function revealInside(box: HTMLElement, el: HTMLElement) {
+  const b = box.getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  if (r.top < b.top) box.scrollTop -= b.top - r.top;
+  else if (r.bottom + r.height > b.bottom) box.scrollTop += Math.min(r.bottom + r.height - b.bottom, r.top - b.top);
+}
+
+function isShown(box: HTMLElement, el: HTMLElement): boolean {
+  const b = box.getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  return r.bottom > b.top && r.top < b.bottom;
+}
+
+/**
+ * Per-file rows of a download / install job (bytes from `result.files[]`, environments have only a state).
+ * A panel of its own: a summary line, then the rows in a box of a fixed height with its own scrollbar, so a snapshot of
+ * dozens of files does not stretch the card and the page. The row that is working is kept in view inside the box.
+ */
 export function FilesProgress({ files }: { files: unknown }) {
   const { t, tOr, has } = useI18n();
   const rows = normalizeFiles(files);
+  const listRef = useRef<HTMLUListElement>(null);
+  const lastFocus = useRef<{ id: string; key: string } | null>(null);
+  const isActive = (state: string) => ACTIVE_FILE_STATES.includes(state);
+  const isFailed = (state: string) => state === "failed" || state === "error";
+  // the row to keep in view: the one that is working, else the first one that failed (it grows by its error line)
+  const focus = rows.find((f) => isActive(f.state)) ?? rows.find((f) => isFailed(f.state));
+  const focusId = focus?.id ?? null;
+  const focusKey = focus ? `${focus.id}|${isFailed(focus.state) ? "failed" : "active"}` : null;
+
+  useEffect(() => {
+    const list = listRef.current;
+    const last = lastFocus.current;
+    if (!list || focusId === null || focusKey === null || focusKey === last?.key) return;
+    lastFocus.current = { id: focusId, key: focusKey };
+    const items = Array.from(list.children) as HTMLElement[];
+    const next = items.find((el) => el.dataset.fileId === focusId);
+    if (!next) return;
+    // follow the work only while the previous row was still in view: a reader who scrolled away is left alone
+    const prev = last ? items.find((el) => el.dataset.fileId === last.id) : undefined;
+    if (prev && !isShown(list, prev)) return;
+    revealInside(list, next);
+  }, [focusKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
   if (rows.length === 0) return null;
+
+  const nDone = rows.filter((f) => f.state === "done").length;
+  const nFailed = rows.filter((f) => isFailed(f.state)).length;
+  const allEnvs = rows.every((f) => f.isEnv);
+  const sized = rows.filter((f) => f.total !== null && !f.isEnv);
+  const bytesTotal = sized.reduce((a, f) => a + (f.total ?? 0), 0);
+  const bytesDone = sized.reduce((a, f) => a + (f.state === "done" ? (f.total ?? 0) : Math.min(f.done ?? 0, f.total ?? 0)), 0);
+  const summary = allEnvs
+    ? t("job.counter_envs", { done: nDone, total: rows.length })
+    : bytesTotal > 0
+      ? t("job.files_summary", { done: nDone, total: rows.length, size_done: fmtBytes(bytesDone), size_total: fmtBytes(bytesTotal) })
+      : t("job.files_summary_nosize", { done: nDone, total: rows.length });
+
   return (
-    <ul className="files-progress" data-testid="files-progress">
-      {rows.map((f) => {
-        const failed = f.state === "failed" || f.state === "error";
-        const name = f.isEnv ? tOr(`envs.${f.name}.name`, f.name) : f.name;
-        const active = f.state === "downloading" || f.state === "installing" || f.state === "extracting" || f.state === "verifying";
-        const value = f.state === "done" ? 1 : f.fraction !== null ? f.fraction : active ? null : 0;
-        const stateKey = FILE_STATES.includes(f.state) ? `job.file.${f.state}` : "";
-        return (
-          <li key={f.id} data-state={f.state} data-testid={`file-row-${f.id}`}>
-            <span className="file-name">{name}</span>
-            <ProgressBar value={value} label={name} size="sm" tone={failed ? "bad" : f.state === "done" ? "good" : "accent"} />
-            <span className="file-state">
-              {f.skipped && f.state === "done" ? t("job.file.skipped") : stateKey ? t(stateKey) : f.state}
-              {f.total !== null && f.state !== "pending" && !f.isEnv && !(f.skipped && f.state === "done") ? ` (${f.state === "done" ? fmtBytes(f.total) : `${fmtBytes(f.done ?? 0)} / ${fmtBytes(f.total)}`})` : ""}
-              {f.state === "done" && f.verified === true ? `, ${t("job.file.verified")}` : ""}
-            </span>
-            {failed && f.error ? (
-              <span className="file-error">{has(`errors.${f.error}.title`) ? t(`errors.${f.error}.title`) : f.error}</span>
-            ) : null}
-          </li>
-        );
-      })}
-    </ul>
+    <div className="files-panel" data-testid="files-panel">
+      <p className="files-summary" data-testid="files-summary">
+        <span>{summary}</span>
+        {nFailed > 0 ? (
+          <span className="files-summary-bad" data-testid="files-summary-failed">
+            {t("job.files_failed", { n: nFailed })}
+          </span>
+        ) : null}
+      </p>
+      <ul className="files-progress" data-testid="files-progress" ref={listRef} tabIndex={0} aria-label={t("job.files_list")}>
+        {rows.map((f) => {
+          const failed = isFailed(f.state);
+          const name = f.isEnv ? tOr(`envs.${f.name}.name`, f.name) : f.name;
+          const active = isActive(f.state);
+          const value = f.state === "done" ? 1 : f.fraction !== null ? f.fraction : active ? null : 0;
+          const stateKey = FILE_STATES.includes(f.state) ? `job.file.${f.state}` : "";
+          return (
+            <li key={f.id} data-state={f.state} data-file-id={f.id} data-testid={`file-row-${f.id}`}>
+              <span className="file-name">{name}</span>
+              <ProgressBar value={value} label={name} size="sm" tone={failed ? "bad" : f.state === "done" ? "good" : "accent"} />
+              <span className="file-state">
+                {f.skipped && f.state === "done" ? t("job.file.skipped") : stateKey ? t(stateKey) : f.state}
+                {f.total !== null && f.state !== "pending" && !f.isEnv && !(f.skipped && f.state === "done") ? ` (${f.state === "done" ? fmtBytes(f.total) : `${fmtBytes(f.done ?? 0)} / ${fmtBytes(f.total)}`})` : ""}
+                {f.state === "done" && f.verified === true ? `, ${t("job.file.verified")}` : ""}
+              </span>
+              {failed && f.error ? (
+                <span className="file-error">{has(`errors.${f.error}.title`) ? t(`errors.${f.error}.title`) : f.error}</span>
+              ) : null}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }
 

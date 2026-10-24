@@ -96,11 +96,31 @@ code { font-size: 12px; }
 <div class="grid">{% for k, v in selection.items() %}<div class="tile"><div class="v st-{{ k }}">{{ v }}</div><div class="k">{{ k }}</div></div>{% endfor %}</div>
 {% else %}<p class="na">not available (run <code>vndub score</code>)</p>{% endif %}
 
+<h2>Patch coverage</h2>
+{% if coverage %}
+<div class="grid">
+  <div class="tile"><div class="v">{{ coverage.dub_lines }}</div><div class="k">dubbed lines</div></div>
+  <div class="tile"><div class="v st-auto">{{ coverage.installed - coverage.provisional }}</div><div class="k">in the patch, passed the checks</div></div>
+  <div class="tile"><div class="v st-provisional">{{ coverage.provisional }}</div><div class="k">in the patch, provisional</div></div>
+  <div class="tile"><div class="v {% if coverage.left_out %}st-review{% endif %}">{{ coverage.left_out }}</div><div class="k">left out (silent in the game)</div></div>
+  <div class="tile"><div class="v">{{ coverage.narration }}</div><div class="k">narration, never dubbed</div></div>
+</div>
+{% if coverage.provisional %}<p class="sub">Provisional: no take passed every quality check, so the best take is installed instead of a silent line. Listen to them in Review.</p>{% endif %}
+{% if coverage.left_out %}
+<p class="sub">Left out: {{ coverage.left_out_reasons_text }}{% if coverage.include_review_lines == "skip" %} (<code>master.include_review_lines</code> is <code>skip</code>){% endif %}.</p>
+<div class="scroll"><table>
+<tr><th>line</th><th>why</th><th>detail</th></tr>
+{% for x in coverage.left_out_lines %}<tr><td><code>{{ x.line_id }}</code></td><td class="st-{{ x.status }}">{{ x.status }}</td><td>{{ x.reason }}</td></tr>{% endfor %}
+</table></div>
+{% if coverage.left_out > coverage.left_out_lines|length %}<p class="sub">showing {{ coverage.left_out_lines|length }} of {{ coverage.left_out }}</p>{% endif %}
+{% endif %}
+{% else %}<p class="na">not available (run <code>vndub master</code>)</p>{% endif %}
+
 <h2>Review queue ({{ queue_total }})</h2>
 {% if queue %}
 <div class="scroll"><table>
-<tr><th>line</th><th>speaker</th><th>from</th><th>status</th><th>text</th><th>reason</th></tr>
-{% for q in queue %}<tr><td><code>{{ q.line_id }}</code></td><td>{{ q.speaker }}</td><td>{{ q.source }}</td><td class="st-{{ q.status }}">{{ q.status }}</td><td>{{ q.text }}</td><td>{{ q.reason }}</td></tr>{% endfor %}
+<tr><th>line</th><th>speaker</th><th>from</th><th>status</th><th>in patch</th><th>text</th><th>reason</th></tr>
+{% for q in queue %}<tr><td><code>{{ q.line_id }}</code></td><td>{{ q.speaker }}</td><td>{{ q.source }}</td><td class="st-{{ q.status }}">{{ q.status }}</td><td class="st-{{ 'provisional' if q.patch == 'provisional' else 'review' if q.patch else '' }}">{{ q.patch }}</td><td>{{ q.text }}</td><td>{{ q.reason }}</td></tr>{% endfor %}
 </table></div>
 {% if queue_total > queue|length %}<p class="sub">showing {{ queue|length }} of {{ queue_total }}</p>{% endif %}
 {% else %}<p class="na">empty</p>{% endif %}

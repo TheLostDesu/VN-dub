@@ -69,9 +69,56 @@ def test_plan_describes_what_will_be_written(renpy: tuple[Any, Path, Path]) -> N
     assert by["game/voice/sak_0001.ogg"]["source"] == "game/voice/sak_0001.ogg"
     assert plan["file_count"] == 4 and plan["replace_count"] == 2 and plan["add_count"] == 2 and plan["files_truncated"] is False
     assert plan["files"][0]["exists"] is True  # replaced files first
-    assert plan["manifest"] == {"count": 4, "engine": "renpy", "backends": {"mock_tts": 4}, "routes": {"A": 4}}
+    assert plan["manifest"] == {"count": 4, "engine": "renpy", "backends": {"mock_tts": 4}, "routes": {"A": 4}, "coverage": None}  # a manifest from before the coverage existed
     assert plan["backups"] == [] and plan["notes"] == []
     assert tree_snapshot(game) == {k: v for k, v in GAME.items()}  # planning never touches the game
+
+
+# what pack.patch_coverage() writes into manifest_patch.json (per-line list included)
+COVERAGE = {
+    "dub_lines": 10, "installed": 7, "provisional": 3, "provisional_review": 2, "provisional_regen": 1, "left_out": 3,
+    "left_out_reasons": {"no winner": 2, "not scored": 1}, "left_out_lines": [{"line_id": "a_1", "status": "no winner", "reason": "no candidates"}],
+    "narration": 5, "include_review_lines": "provisional",
+}
+PUBLIC_COVERAGE = {
+    "dub_lines": 10, "installed": 7, "provisional": 3, "provisional_review": 2, "provisional_regen": 1, "left_out": 3,
+    "left_out_reasons": {"no_winner": 2, "not_scored": 1}, "narration": 5, "include_review_lines": "provisional",
+}
+
+
+def write_coverage(patch: Path, coverage: Any) -> None:
+    f = patch / "manifest_patch.json"
+    data = json.loads(f.read_text(encoding="utf-8"))
+    data["coverage"] = coverage
+    f.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_plan_carries_the_patch_coverage(renpy: tuple[Any, Path, Path]) -> None:
+    """The three numbers next to the file count: the manifest's ``coverage`` passes through, reasons as i18n keys, no per-line list."""
+    h, _, patch = renpy
+    write_coverage(patch, COVERAGE)
+    c = client_for(patch_install)
+    plan = c.get(f"/api/install/plan?slug={h.slug}").json()
+    assert plan["manifest"]["coverage"] == PUBLIC_COVERAGE
+    assert plan["manifest"]["count"] == 4 and plan["file_count"] == 4
+    assert "left_out_lines" not in plan["manifest"]["coverage"]
+
+
+def test_coverage_endpoint(renpy: tuple[Any, Path, Path], tmp_path: Path) -> None:
+    h, game, patch = renpy
+    c = client_for(patch_install)
+    assert c.get(f"/api/patch/coverage?slug={h.slug}").json() == {"coverage": None}  # a patch built before the coverage existed
+    write_coverage(patch, COVERAGE)
+    assert c.get(f"/api/patch/coverage?slug={h.slug}").json() == {"coverage": PUBLIC_COVERAGE}
+    write_coverage(patch, {"installed": "x", "left_out_reasons": ["junk"]})  # a damaged block never breaks the screen
+    bad = c.get(f"/api/patch/coverage?slug={h.slug}").json()["coverage"]
+    assert bad["installed"] == 0 and bad["left_out_reasons"] == {} and bad["provisional"] == 0
+    (patch / "manifest_patch.json").write_text("{not json", encoding="utf-8")
+    assert c.get(f"/api/patch/coverage?slug={h.slug}").json() == {"coverage": None}
+    # a project that was never detected has no patch: null, not an error
+    (tmp_path / "other_game").mkdir()
+    other = appdirs.create_project(tmp_path / "other_game", name="Other")
+    assert c.get(f"/api/patch/coverage?slug={other.slug}").json() == {"coverage": None}
 
 
 def test_plan_uses_the_current_project(renpy: tuple[Any, Path, Path]) -> None:

@@ -242,6 +242,11 @@ source import|llm:<model>|mock, glossary_hits, flags).
   batching on the GPU); the default 1 fits an 8 GB card with the 12B model.
 - Interjections (`configs/interjections.yaml`, Japanese -> Russian) map to natural equivalents;
   the lexicon and the kana-only interjection flag apply to Japanese scripts only.
+- Laughter flags (any language, `vndub.text.laughter`): a line whose script text or translation contains a laugh
+  ("Haha, no way!", "Хе-хе", `*laughs*`) gets the flag `laughter`; a line that is nothing but laughter ("Haha!",
+  "Ха-ха!", `(laughs)`) gets `interjection` as well, so it takes the interjection path of synth (`n_candidates_short`,
+  the original audio as a candidate, `interjection` text variant) and score (laughter-only lines have no CER gate, see
+  score). The summary counts them (`laughter`, `interjections`).
 - Post-processing: ruaccent stress (+ yo), numbers -> words, abbreviations expanded.
 - `--seed-glossary` writes/extends `configs/glossary.yaml` from `characters.yaml`.
 - **Unvoiced speaker lines** (mode B): `translate.include_unvoiced` (default `auto` = on only when
@@ -300,13 +305,27 @@ Layers, merged rule -> cue -> llm (`vndub/text/delivery.py`):
 1. **rule pass** (no model), on the Japanese text and on the translation when there is one (the same mark in
    both counts once): `！` raises intensity (one 0.55, `！！` 0.7 and loud), `？` rising arc, `！？` surprise, `……` / `…`
    slower tempo + "pauses" (a single `…` is too weak), elongation (`ー`, `〜`, repeated vowels / small kana /
-   `っっ`), ALL-CAPS, `♪` / `♡` / `☆`, laughter (`ははは` `あはは` `えへへ` `ふふ` `くすくす`, `(笑)`, "ха-ха" "хи-хи"),
-   sobbing (`うう…` `ぐすっ` `ひっく` `しくしく`, "хнык"), whisper markers (`（小声）` `(ひそひそ)`), a line in
+   `っっ`), ALL-CAPS, `♪` / `♡` / `☆`, laughter (see below), sobbing (`うう…` `ぐすっ` `ひっく` `しくしく`, "хнык"), whisper markers (`（小声）` `(ひそひそ)`), a line in
    parentheses = inner voice (soft), leading interjections (`えっ` `ひっ` `ちっ` `やった` `はあ` `しーっ` ...), stammering
    (`わ、わたし`, "п-п-подожди"), the interjection lexicon `configs/interjections.yaml` (its Russian equivalent adds
-   its onomatopoeia when there is no translation yet). Each piece of evidence has a weight; confidence = noisy-OR,
+   its onomatopoeia when there is no translation yet). `rule_pass(text_src, text_tgt, lexicon, src_lang)`: `src_lang`
+   (`ctx.src_lang`) says which laughter scripts the source text can contain. Each piece of evidence has a weight; confidence = noisy-OR,
    reduced when named emotions disagree. A plain `。` is no evidence: neutral, confidence 0.2. `！` alone without a named emotion gives
    `other` ("expressive") at intensity >= 0.5.
+   **Laughter** (`vndub/text/laughter.py`, shared with synth): written laughter in the source text (any script: kana
+   `あはは` `えへへ` `ふふ` `くすくす` `くくく` `ぷっ`; Cyrillic `ха-ха` `хе-хе` `хи-хи` `муа-ха-ха` `пф-ф`; Latin `haha` `hehe` `hihi` `mwahaha`
+   `ehehe...` `pfft`, also hyphenated / spaced `ha-ha`, `heh heh heh`) and in the translation gives the `laugh` event and a
+   kind: `hearty`, `chuckle`, `giggle`, `evil`, `nervous` (a hearty laugh or chuckle trailing into `...`), `snort`. Per kind: emotion
+   (hearty / chuckle / giggle `happy`, nervous `embarrassed`, evil and snort `other`; `other` names no direction, so it only wins
+   when nothing more specific is named), an intensity bump (short laugh 0.10-0.25, long laugh of 3+ syllables 0.15-0.35) and a
+   note ("a hearty laugh", "chuckling", "giggling", "a nervous laugh", "a sinister laugh", "a snort"). A bracketed stage direction
+   (`*laughs*`, `(giggles)`, `(смеётся)`, `(笑)`) is evidence too, at weight 0.65 instead of 0.75 and half the intensity bump (a line
+   that is only `(笑)` is a stage direction, not an inner voice). The longest spoken laugh sets the kind. `delivery.laughter` =
+   `{kind, units, stage, only}` (`only`: what the dub speaks is nothing but laughter; `StyleSpec.laughter` is the same dict);
+   `Delivery.to_dict` has the key only when a laugh was found. The LLM layer may answer `events: ["laugh"]` plus an optional
+   `laugh_kind` (also `events: ["giggling"]`; an unknown word is ignored, the object stays valid); a kind from the rule pass
+   (it read the actual text) wins over the LLM's. `text_emotion` stage `VERSION` is 2: passports of version 1 have no
+   `delivery.laughter` and are rewritten (no model, cheap). How the laugh is then spoken is decided in synth.
 2. **narration cues**: the narrator lines around the line (`narration_window`, +-3 lines, same scene) are scanned
    with the table `configs/delivery_cues.yaml` (`ja` entries: substrings, kana-insensitive; other languages: word
    stems matched as prefixes, so gender/tense forms match, reflexive `-ся/-сь` ignored; scanned in the source
@@ -377,6 +396,41 @@ elapsed_s, peak_vram_gb, pre_vc_wav, round).
   events) and renders it per backend capability: natural-language `instruct` (Qwen3-TTS
   CustomVoice), CosyVoice3 instruct before `<|endofprompt|>`, VoxCPM2 parenthesized style,
   Fish S2 / Higgs inline tags, Chatterbox `exaggeration`/`cfg_weight`, Zonos2 sliders.
+  Tag syntaxes follow the model cards: Fish S2 free-form `[laughing]` `[chuckling]` `[inhale]` `[clearing throat]` (the
+  parenthesis form `(laughing)` is the deprecated S1); Higgs v3 `<|emotion:amusement|>` `<|style:whispering|>` (no
+  `happiness` / `neutral`), `<|sfx:laughter|>` paired with its onomatopoeia right after it.
+- **Laughter** (`synth.laughter`, `configs/laughter.yaml`, `text/laughter.py`). An LLM-based TTS reads a written "Ха-ха-ха"
+  letter by letter unless it is spelled the way the model met laughter, or replaced by its own laugh token; Qwen3-TTS Base (the
+  zero-shot cloner: it ignores `instruct`) has nothing but the text to work with. After the text variant (`text_tts`,
+  `text_tts_short`, plus variants) is picked, every laugh in it (kana, Cyrillic, Latin, whatever script the translator wrote)
+  is rewritten for the backend, per laugh and per backend:
+  * `respell` (default; every backend without a laugh token): the table spelling for the target language, per kind, `short`
+    (1-2 syllables) or `long` (3+): hearty ru `Ахаха!` / `Ахахаха!`, chuckle `Хехе`, giggle `Хихи`, evil `Муахаха!`, nervous
+    `Ахаха...`, snort `Пфф` (vowel-run forms on purpose: the hyphenated dictionary spelling "Ха-ха" is what a TTS reads syllable by
+    syllable); the sentence mark of the spelling yields to the punctuation of the line ("Ха-ха-ха, ну" ->
+    "Ахахаха, ну"); the capital of a sentence-initial laugh is kept;
+  * `inline` (caps `tags: cosy_inline`): CosyVoice `[laughter]` replaces the laugh (a tokenizer special token; the CosyVoice2 example
+    writes it inline, the CosyVoice3 example only shows `[breath]`); a comma after the token is dropped; a line that is only a
+    laugh keeps a spelling next to it (`backends.cosyvoice3.only: tag`);
+  * `tag` (caps `tags: fish` / `higgs`): the token goes in front of the spelled laugh, at the laugh: `[chuckling] Хе-хе`,
+    `<|sfx:laughter|>Haha` (Higgs: spelled in English, `backends.higgs_tts3.spelling`); the Fish / Higgs prefix then leaves its
+    own laughter tag out;
+  * `keep`: spoken laughs are left (`backends.<name>.mode: keep`; `synth.laughter.enabled: false` switches the whole thing off,
+    stage directions included).
+  Stage directions (`*laughs*`, `(смеётся)`, `(笑)`) never reach the TTS as words: removed (`stage: remove`, default), spoken as a
+  laugh of their kind (`stage: respell`), or the backend token (`inline` / `tag`); a stage direction next to a spoken laugh is
+  dropped; a line that is only a stage direction is spoken as a laugh, never sent empty. A `set_text` override is sent exactly as
+  typed. `text_plain` (the CER reference) is never respelled. The laugh kind and length also reach the style: `render()` gets a
+  `StyleSpec.laughter` made from the TTS text (event `laughter` added when the passport had none, unless the tuning is "always
+  calm"), so the instruct says "laughing heartily" / "giggling softly" / "a short, nervous laugh" / "cackling maniacally"
+  (kind x strength) instead of "with a light laugh", a laughter-only line gets an instruction about the laugh alone ("Only
+  laugh, no words: make a short, nervous laugh ..."), VoxCPM2 gets "(happy, giggling)", Fish `[giggling]` / `[laughing nervously]`.
+  `render()` also returns `laughter` = the decision for the text (`respell` | `inline:<token>` | `tag:<token>`). The sidecar has
+  `laughter: {kind, n, mode, only, stage}` (absent for a line without laughs); the stage summary `laughter: {lines, modes}`.
+  `configs/laughter.yaml` is meant to be edited per voice: `<lang>: {<kind>: {short, long}}`, `default`, `stage`, and a `backends:`
+  block per backend name (`mode`, `token` / `tokens`, `only`, `spelling`, `stage`, per-language overrides). The setting is left out
+  of the synth cache hash (the spelled text and the laugh phrase are part of every candidate key), so enabling it, or editing the
+  table, regenerates only the candidates of lines with a laugh.
 - Route A: the character's own (Japanese) emotion-matched reference, `x_vector_only_mode`
   on Qwen3-TTS, `cfg_weight=0` on Chatterbox, explicit target language.
 - Route B: the native performer voice + emotion instruction, then VC into the character
@@ -419,6 +473,17 @@ still misreads the text by more than `score.regen_cer_max` (0.2, never below the
 once ("a new take would not help"): a new seed changes the delivery, not the words. A take the ASR heard no words in
 gets no CER (note `cer failed: the ASR heard no words in this take`): the gate counts as not checked, never as a CER
 of 1.0.
+**Laughter** (`vndub.text.laughter`) is not text an ASR can spell, so the CER is computed over the words only: laughs
+are taken out of both the reference and the transcript (`"Haha, no way!"` is checked as `"no way!"`; a stage direction
+like `(laughs)` counts as a laugh). The plain reading of the same texts is a floor, so a laugh the ASR heard as a stray
+syllable ("ха да ну" for "Ха-ха, да ну!") is never held against the line. A line that is nothing but laughter ("Haha!",
+"Хе-хе.") has no words to check: its candidates get `cer` in `na` (like the `orig` route) and the note
+`laughter: no words to check`, the ASR is not asked for them, no CER gate exists for them, and they are accepted or sent
+to regen/review on the other gates (utmos, spk_sim, dur) alone; such a line is never "every take misreads the text", and
+its failure text names the failing gate and says `laughter only, no words to check`. A take whose transcript holds only
+a laugh while the line has words is "the ASR heard no words" (unchecked gate), as before. The compared texts are stored
+on the candidate (`cer_ref`, `asr_text`, `cer_hyp` when a laugh was taken out of the transcript, `cer_rule`); a CER
+stored by an older run (no `cer_rule`) for a line that has laughter is recomputed on the next `score`.
 Lines without original audio (route P): `emo_sim`, `adv_delta`, `prosody` and `dur_ratio` are not computed, so
 those terms are missing and the composite is renormalized over `utmos` / `pq` / `spk_sim` / `cer`; no gate needs a
 reference metric (gates of unavailable metrics are never evaluated). `spk_sim` is measured against the performer's
@@ -432,7 +497,14 @@ Trim to the original's silence profile, stretch (Rubber Band, ffmpeg `atempo` fa
 only outside `master.stretch.target_window` and within `max_stretch`, loudness-normalize to
 the character's median LUFS with a true-peak limiter at `true_peak_dbtp`, resample to the
 source sr/channels, encode to the source codec/bitrate, same file name.
-`master.include_review_lines: provisional` also masters review lines (marked provisional).
+Lines whose selection is `review` (no take passed the gates, the regen rounds used up or pointless) or still `regen`
+(the rounds' new takes were never made) are mastered from their best take and marked `provisional`
+(`master.include_review_lines`, default `provisional`): a mediocre take in the game beats a line that stays silent
+(on a route-P project most lines can end in review, and `skip` used to give a patch of the third that passed).
+`skip` leaves them out; the summary then counts them under `skipped.review` / `skipped.regen`. A line without any winner
+(`skipped."no winner"`) has nothing to install. The summary carries `provisional` (and `provisional_regen`), the stage
+log says it in a warning, and the final index records of provisional lines carry `selection_status` and `reason`.
+`pack` and `report` turn this into the patch's own statement of what it covers (below).
 Lines without original audio: no source duration to stretch to, default silence profile, loudness of the
 character, else the median of the characters' loudness, else `default_lufs`; file `unvoiced/<dialogue id | line
 id>.<ext>` (`FinalIndexRecord.unvoiced`). The tuning's leftovers from the sidecar are applied before the
@@ -442,7 +514,12 @@ duration step: pitch / tempo pass for backends without a native knob (the reques
 
 ### pack
 Out: `out/<engine>/...` + `INSTALL.md` + `manifest_patch.json` (file, sha256, line_id,
-backend, route). Ren'Py: loose `game/<voice>`; NScripter: loose files beside the exe;
+backend, route, status; `reason` for provisional lines). Both state what the patch covers: how many of the dubbed
+lines have a file, how many of those are provisional ("best take installed, check it in Review"), how many are LEFT
+OUT and why (`review` / `regen` with `include_review_lines: skip`, `no winner`, `not mastered`; each listed in
+`manifest_patch.json` under `coverage.left_out_lines`), and how many narration lines are never dubbed. INSTALL.md is
+rebuilt on every pack (its sections never pile up). The pack summary carries `provisional` / `left_out` / `unnamed`.
+Ren'Py: loose `game/<voice>`; NScripter: loose files beside the exe;
 KiriKiri: `patchN.xp3` (Xp3Pack or the built-in unencrypted writer) or `unencrypted/`;
 Unity: UnityPy replacement script + checklist (experimental); others: directory layout +
 tool command lines. See ENGINES.md.
@@ -456,7 +533,9 @@ that folder (`pack.renpy.unvoiced_dir`, default `voice_dub`), or, when the game 
 ### report
 Out: `work/report/index.html`, `work/report/report.md`: mapping coverage, per-character
 stats and emotion histograms, score distributions per backend/route, A/B/C comparison,
-review queue with reasons, backend substitutions, stage timings, peak VRAM per model.
+patch coverage (dubbed / in the patch / provisional / left out with reasons / narration), review queue with
+reasons and where each review line ended up (`provisional` or `left out`), backend substitutions, stage timings,
+peak VRAM per model.
 
 ### review (UI)
 `vndub review --project <dir>`: Gradio app on `review.host:review.port`; writes
@@ -475,9 +554,9 @@ set_ref|keep_original, payload, ts).
 | `link` | `asr`, `asr_fallback`, `asr_compute`, `accept_score`, `review_score`, `neighbour_window`, `global_topk`, `auto_repair`, `speaker_embedder`, `cluster_distance`, `outlier_consistency`, `mode` (`asr` \| `no_asr`), `recover_text`, `recover_asr`, `rate_min`, `rate_max`, `silence_tolerance_s`, `suggest_asr_share` |
 | `analyze` | `e2v`, `anime_ser`, `adv`, `events`, `aligner`, `aligner_fallback`, `f0`, `vad`, `caption`, `caption_backend`, `ref_candidates_per_emotion`, `e2v_weight`, `anime_weight` |
 | `translate` | `import`, `llm.{backend,fallbacks,ctx,n_gpu_layers,temperature,port,max_retries,parallel,real_backend}`, `batch_lines`, `context_window_lines`, `glossary`, `short_variant_min_words`, `stress.{tool,model,yo,format}`, `interjections`, `mock_dictionary`, `include_unvoiced` (`on` default \| `off` \| `auto`) |
-| `text_emotion` | `enabled`, `cues`, `narration_window`, `llm` (`auto` \| `on` \| `off`), `llm_context_lines`, `min_confidence`, `only_unvoiced` |
+| `text_emotion` | `enabled`, `cues`, `narration_window`, `llm` (`auto` \| `on` \| `off`), `llm_context_lines`, `min_confidence`, `only_unvoiced` (the laughter language is `project.src_lang`) |
 | `voicebank` | `refs.*`, `performer.{kind,backend,n_designs,test_sentences,max_f0_delta_semitones,reference_dir,sample_lines,offer_clone}`, `rvc.*`, `route_c.*`, `calibrate_spk`, `min_minutes_for_voicebank` |
-| `synth` | `n_candidates`, `n_candidates_short`, `routes` (A, B, C, P), `backends.<name>.{enabled,...}`, `vc.{primary,fallback,rvc,seedvc}`, `keep_original_for_interjections`, `use_short_text_if_ratio_above`, `interjection_max_syllables`, `high_arousal`, `seed_base`, `voice_unvoiced` |
+| `synth` | `n_candidates`, `n_candidates_short`, `routes` (A, B, C, P), `backends.<name>.{enabled,...}`, `vc.{primary,fallback,rvc,seedvc}`, `keep_original_for_interjections`, `use_short_text_if_ratio_above`, `interjection_max_syllables`, `high_arousal`, `seed_base`, `voice_unvoiced`, `laughter.{enabled,table}` |
 | `score` | `weights`, `gates.{utmos_min,cer_max,dur_ratio,spk_sim_min,spk_sim_default}`, `mos`, `mos_fallback`, `aesthetics`, `speaker`, `speaker_extra`, `cer_asr`, `cer_asr_fallback`, `emotion`, `adv`, `regen_rounds`, `regen_cer_max`, `interjection_cer_max` |
 | `master` | `stretch.{enabled,target_window,max_stretch,engine}`, `loudness.{target,true_peak_dbtp,default_lufs}`, `match_silence_profile`, `include_review_lines` |
 | `pack` | `kirikiri`, `renpy`, `nscripter`, `unity`, `other` |

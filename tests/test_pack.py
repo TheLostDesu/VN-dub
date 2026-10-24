@@ -9,7 +9,7 @@ import pytest
 
 from vndub.config import ProjectYaml, save_project_yaml
 from vndub.engines import xp3
-from vndub.manifest.io import FinalIndexRecord, SelectionRecord, write_jsonl
+from vndub.manifest.io import FinalIndexRecord, SelectionRecord, read_jsonl, write_jsonl
 from vndub.stages.common import StageError, run_stage
 
 
@@ -110,3 +110,22 @@ def test_pack_without_master(make_ctx, tmp_path: Path) -> None:
     save_project_yaml(ctx.paths.project_yaml, ProjectYaml(game_dir=str(game), engine="renpy"))
     with pytest.raises(StageError, match="master"):
         run_stage("pack", ctx)
+
+
+def test_pack_states_what_it_covers_without_a_lines_manifest(make_ctx, tmp_path: Path) -> None:
+    ctx, _ = _setup(make_ctx, tmp_path, "renpy", ["voice/sak_0001.ogg", "voice/har_0001.ogg"])
+    finals = read_jsonl(ctx.paths.final_index, FinalIndexRecord)
+    finals[1].status = "provisional"  # master marks a line mastered from a take that failed the gates
+    finals[1].reason = "no candidate passes the gates after 2 regen round(s)"  # type: ignore[attr-defined]
+    write_jsonl(ctx.paths.final_index, finals)
+    s = run_stage("pack", ctx)
+    out = ctx.paths.out_engine("renpy")
+    cov = _manifest(out)["coverage"]
+    assert (cov["dub_lines"], cov["installed"], cov["provisional"], cov["left_out"]) == (2, 2, 1, 0)
+    assert s["provisional"] == 1 and "left_out" not in s
+    m = _manifest(out)["files"]
+    assert "reason" not in m[0] and m[1]["status"] == "provisional" and "regen round" in m[1]["reason"]
+    text = (out / "INSTALL.md").read_text(encoding="utf-8")
+    assert "What this patch covers" in text and "1 line(s) are PROVISIONAL" in text and "LEFT OUT" not in text
+    run_stage("pack", ctx)
+    assert (out / "INSTALL.md").read_text(encoding="utf-8").count("What this patch covers") == 1

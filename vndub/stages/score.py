@@ -11,6 +11,7 @@ spk_sim     speaker embedder: max cosine to the character's timbre refs clip(0..
 emo_sim     emotion2vec+ embedding cosine to the original line          0.75*emo_sim + 0.25*(1-min(1,adv_delta))
 adv_delta   |dA| + |dV| (A/D/V model) original vs candidate             (inside emo term)
 cer         ASR of the candidate vs the stress-free target text         1-cer
+            (words only: laughter is taken out of both sides)
 dur_ratio   candidate / source duration                                 1-min(1,|ln r|/ln 2)
 prosody     mean of (f0_corr+1)/2, (energy_corr+1)/2, pause_match       as is
 ==========  ==========================================================  ===============
@@ -25,6 +26,15 @@ through ``ctx.models.record_unavailable("score", group, reason)`` and noted on e
 GATE group (``mos`` -> utmos, ``speaker`` -> spk_sim, ``cer`` -> cer) the gate cannot be evaluated, and a candidate that
 passed only because that gate was skipped must not be accepted on its own: the line's selection becomes ``review`` with
 the reason (see :func:`unchecked_gates`; it also works from the stored notes, so ``--reweight`` keeps the verdict).
+
+Laughter: an ASR model transcribes a laugh as nothing or as random syllables, so the CER is computed over the words
+only: :func:`cer_words` takes the laughs (``vndub.text.laughter``) out of the reference and of the transcript
+(:func:`cer_over_words` also keeps the plain reading as a floor, for a laugh the ASR heard as a stray syllable). A
+line that is nothing but laughter ("Haha!", "Хе-хе.") has no words to check: its candidates get ``cer`` in ``na`` (like the
+original recording) and the note :data:`LAUGHTER_NOTE`, the ASR is not asked, no CER gate exists for them and they can pass
+on the other gates (``regen_hopeless`` never fires on them: there is no CER). A line with words whose transcript holds no
+words (only a laugh, or nothing) keeps the "the ASR heard no words" verdict, an unchecked gate. CER values stored before
+this rule (no ``cer_rule`` on the record) of a line that has laughter are recomputed on the next run.
 
 Resume: the metrics of a candidate whose scoring has not finished are kept in ``scores/_partial.json`` (see
 :class:`_Partial`: keyed by candidate id, valid for its file fingerprint and the metric key), written after every metric
@@ -58,6 +68,7 @@ from vndub.backends.score.speaker_sim import cosine
 from vndub.manifest.io import CandidateScore, LineRecord, SelectionRecord, SynthSidecar, load_overrides, read_json, write_json, write_jsonl
 from vndub.stages import genutil as gu
 from vndub.stages.common import StageError
+from vndub.text import laughter
 from vndub.util import file_fingerprint, hash_obj
 
 NAME = "score"
@@ -77,6 +88,10 @@ METRIC_GROUPS = {
 # metric groups that feed a GATE (the others only feed the composite): group -> the metric the gate reads
 GATE_GROUPS = {"mos": "utmos", "speaker": "spk_sim", "cer": "cer"}
 GATE_LABELS = {"mos": "naturalness (utmos)", "speaker": "speaker similarity (spk_sim)", "cer": "speech intelligibility (cer)"}
+# the note of a candidate whose line is nothing but laughter: its CER gate is not applicable (``na``), not unchecked
+LAUGHTER_NOTE = "laughter: no words to check"
+# the rule a stored CER was computed under; absent = the old one (laughter counted as text)
+CER_RULE = "2"
 PARTIAL_FILE = "_partial.json"
 PARTIAL_EVERY_S = 15.0  # at most this often while a metric group runs (it is also written when a group ends)
 
@@ -214,6 +229,30 @@ def cer_reference(side: SynthSidecar | None, tr: Any, cont: list[Any]) -> str:
     return " ".join(p for p in parts if p)
 
 
+def cer_words(ref: str, hyp: str) -> tuple[str, str]:
+    """(reference, transcript) with the laughter taken out: the CER is about the words, a laugh is not text an ASR can spell
+    (``"Haha, no way!"`` -> ``"no way!"``). Both sides are stripped in every script (``lang="auto"``)."""
+    return laughter.strip_laughter(ref or "", "auto"), laughter.strip_laughter(hyp or "", "auto")
+
+
+def cer_over_words(ref: str, hyp: str, words: tuple[str, str] | None = None) -> float:
+    """CER over the words of the line, never worse than the plain CER of the same texts.
+
+    The laughs are taken out of both sides (:func:`cer_words`); an ASR that heard a laugh as a stray syllable ("ха да ну" for
+    "Ха-ха, да ну!") leaves a fragment no pattern recognizes, which then counts against the words. When a laugh was taken out
+    the reading that keeps it is computed too and the better of the two wins, so a laugh is never held against the line."""
+    ref_w, hyp_w = words or cer_words(ref, hyp)
+    value = cer_fn(ref_w, hyp_w)
+    if value > 0 and (ref_w != ref or hyp_w != hyp):
+        value = min(value, cer_fn(ref, hyp))
+    return value
+
+
+def is_laughter_line(c: CandidateScore) -> bool:
+    """Is this candidate's line nothing but laughter (its CER gate is not applicable, see :data:`LAUGHTER_NOTE`)?"""
+    return LAUGHTER_NOTE in c.notes
+
+
 def spk_threshold(cfg: Any, calibration: dict[str, Any] | None) -> tuple[float, str]:
     g = cfg.score.gates
     if isinstance(g.spk_sim_min, (int, float)):
@@ -242,9 +281,10 @@ def regen_hopeless(pool: list[CandidateScore], best: CandidateScore, cer_ceiling
     A new seed changes the delivery, not the words: when the best take fails the CER gate and even the most intelligible
     take of the line misreads the text by more than ``cer_ceiling`` (``score.regen_cer_max``, never below the line's
     gate), the text or the voice is the problem, and the line goes to a person at once instead of after
-    ``regen_rounds`` rounds of the same.
+    ``regen_rounds`` rounds of the same. A laughter-only line has no CER gate (its candidates have no ``cer``), so it is
+    never hopeless on that account.
     """
-    if cer_ceiling is None:
+    if cer_ceiling is None or is_laughter_line(best):
         return None
     gates = getattr(best, "gates", None) or {}
     if gates.get("cer", True):
@@ -312,6 +352,8 @@ def select(
         return rec(best, "auto", f"best of {len(passing)} passing{unavail_note}")
     best = max(pool, key=lambda c: c.composite if c.composite is not None else -1.0)
     why = (best.model_extra or {}).get("failures") or "no gate could be evaluated"
+    if is_laughter_line(best):
+        why += " (laughter only, no words to check)"
     if best.metrics.get("dur_ratio") is not None and float(best.metrics["dur_ratio"]) > 1.25:
         why += "; try text_tgt_short"
     if rnd < regen_rounds:
@@ -619,6 +661,45 @@ def _emb_fresh(out: Path, wav: Path) -> bool:
         return False
 
 
+def line_cer_reference(c: Cand, trs: dict[str, Any]) -> str:
+    """The CER reference of a candidate: what synth said, or the translation of the line and of its sustain continuations."""
+    cont = [trs.get(x) for x in ((c.line.model_extra or {}).get("sustain_lines") or [])]
+    return cer_reference(c.side, c.tr, [x for x in cont if x is not None])
+
+
+def _laughter_lines(cands: list[Cand], trs: dict[str, Any], partial: _Partial) -> None:
+    """Decide the CER of every candidate whose text has laughter, before any model runs.
+
+    * the text is nothing but laughter: no words for an ASR to check, so ``cer`` is not applicable (``na``, like the original
+      recording), the ASR is never asked, and a CER stored by an older run is dropped;
+    * the line had been marked that way and has words now: the mark goes;
+    * the text has words and laughter and its CER was computed before laughter was taken out (no ``cer_rule``): recomputed.
+    """
+    for c in cands:
+        if c.rec.route == "orig":
+            continue
+        ref = line_cer_reference(c, trs)
+        changed = False
+        if laughter.is_laughter_only(ref):
+            if "cer" not in c.na:
+                c.rec.na = [*c.na, "cer"]  # type: ignore[attr-defined]
+                changed = True
+            stale = [c.rec.metrics.pop("cer", None), (c.rec.model_extra or {}).pop("asr_text", None)]
+            changed = changed or any(x is not None for x in stale)
+            if LAUGHTER_NOTE not in c.rec.notes:
+                c.rec.notes = [*c.rec.notes, LAUGHTER_NOTE]
+                changed = True
+        elif is_laughter_line(c.rec):
+            c.rec.na = [x for x in c.na if x != "cer"]  # type: ignore[attr-defined]
+            c.rec.notes = [n for n in c.rec.notes if n != LAUGHTER_NOTE]
+            changed = True
+        elif c.rec.metrics.get("cer") is not None and (c.rec.model_extra or {}).get("cer_rule") != CER_RULE and laughter.has_laughter(ref):
+            c.rec.metrics.pop("cer")
+            changed = True
+        if changed:
+            partial.touch(c)
+
+
 def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str], partial: _Partial | None = None) -> None:
     """Fill the missing metrics of ``cands`` group by group (one model at a time, all candidates under it).
 
@@ -627,6 +708,7 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str], partial: 
     partial = partial or _Partial.open(ctx)
     for c in cands:  # reasons from an earlier run are rewritten below when they still hold
         c.rec.notes = [n for n in c.rec.notes if not _STALE_NOTE.match(n)]
+    _laughter_lines(cands, gu.load_translations(ctx), partial)
     off: set[str] = set()
     if not ctx.cfg.score.aesthetics:
         off.add("pq")
@@ -884,16 +966,20 @@ def _compute_groups(ctx: Any, cands: list[Cand], unavailable: dict[str, str], pa
                     if r.get("error"):
                         failed(c, "cer", r["error"])
                         continue
-                    cont = [trs.get(x) for x in ((c.line.model_extra or {}).get("sustain_lines") or [])]
-                    ref = cer_reference(c.side, c.tr, [x for x in cont if x is not None])
+                    ref = line_cer_reference(c, trs)
                     hyp = str(r.get("text", "") or "")
-                    if not hyp.strip() and (ref or "").strip():
-                        # the model heard no words (a clip too short or too odd for it): not a CER of 1.0 for regen rounds
-                        # to chase, but a gate that could not be checked, so the line goes to a person
+                    ref_w, hyp_w = cer_words(ref, hyp)  # the words only: an ASR cannot spell a laugh
+                    if not hyp_w.strip() and ref_w.strip():
+                        # the model heard no words (a clip too short or too odd for it, or only a laugh): not a CER of 1.0 for
+                        # regen rounds to chase, but a gate that could not be checked, so the line goes to a person
                         failed(c, "cer", "the ASR heard no words in this take")
                         continue
-                    c.rec.metrics["cer"] = round(cer_fn(ref or "", hyp), 4)
+                    c.rec.metrics["cer"] = round(cer_over_words(ref, hyp, (ref_w, hyp_w)), 4)
                     setattr(c.rec, "asr_text", hyp)
+                    setattr(c.rec, "cer_ref", ref_w)
+                    if hyp_w != " ".join(hyp.split()):
+                        setattr(c.rec, "cer_hyp", hyp_w)  # the transcript as compared, when a laugh was taken out of it
+                    setattr(c.rec, "cer_rule", CER_RULE)
                     partial.touch(c)
                 prog.chunk(part)
                 partial.checkpoint()

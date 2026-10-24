@@ -134,7 +134,7 @@ the job's `result` when `state == "done"`. Audio URLs are always produced by the
 |---|---|---|
 | GET | `/api/projects` | `[ProjectInfo-lite {slug, name, game_dir, engine, step, updated}]` |
 | POST | `/api/project/open` | `{game_dir}` or `{slug}` → `ProjectInfo` (creates if new, becomes current) |
-| GET | `/api/project` | `ProjectInfo {slug, name, game_dir, engine, project_yaml|null, state (app_state), stage_status, active_job: JobInfo|null, resume: {available, job: JobInfo|null, next_stage|null, candidates: [JobInfo]}}` (404 `no_project`). `resume.job` is the interrupted job `POST /api/project/resume` would continue: the newest among the heavy kinds (`import recover_text asr_check translate stage preview full review_apply`), else the newest of the rest; `candidates` are the other interrupted jobs of a different kind (they stay interrupted and are offered next time). Interrupted records older than 14 days are forgotten when the app starts |
+| GET | `/api/project` | `ProjectInfo {slug, name, game_dir, engine, project_yaml|null, state (app_state), stage_status, stale: [{stage, ran, now}], active_job: JobInfo|null, resume: {available, job: JobInfo|null, next_stage|null, candidates: [JobInfo]}}` (404 `no_project`). `resume.job` is the interrupted job `POST /api/project/resume` would continue: the newest among the heavy kinds (`import recover_text asr_check translate stage preview full review_apply`), else the newest of the rest; `candidates` are the other interrupted jobs of a different kind (they stay interrupted and are offered next time). Interrupted records older than 14 days are forgotten when the app starts. `stale` lists the watched stages (`pipeline.STALE_WATCH`: `parse`) whose last recorded run was made by another version of the stage's code (`stage_status.json` keeps the `version`; `ran` is the recorded one, `now` the current `VERSION`): the project has to import again (Ren'Py dialogue identifiers are computed differently since `parse` 3). It is `[]` for a project imported by this version and drops the moment the new import reaches the stage; the Game screen offers the import, the Run screen points to it |
 | PUT | `/api/project/state` | partial app_state (deep-merged) → app_state; regenerates pipeline.yaml |
 | POST | `/api/project/resume` | `{keep_shutdown?: bool}` → Job: re-submits `resume.job` (same kind + params) and forgets the interrupted jobs of that kind only. `shutdown_when_done` is dropped from the params unless `keep_shutdown` is `true`. The new job runs with the settings of now; when the old record's `settings` differ, the new job's `result.warnings` carries a `settings_changed` item. No interrupted job → 404 `nothing_to_resume` |
 | POST | `/api/project/import` | Step 1 → Job (detect, extract, parse, link no_asr, analyze, text_emotion) |
@@ -169,11 +169,11 @@ the job's `result` when `state == "done"`. Audio URLs are always produced by the
 ### Preview — Step 4, full run — Step 5 (S)
 | POST | `/api/preview/run` | `{mode: first_scene|first_n, n: 40}` → Job (voicebank, synth, score, master — only those lines; translation is not repeated) |
 | GET | `/api/preview/items` | `{line_ids, items: [{line_id, speaker_id, name, text_src, text_tgt, original_url|null, dub_url|null, status}]}` |
-| POST | `/api/run/full` | `{shutdown_when_done: bool}` → Job (voicebank … report, regen loop; translation is not repeated) |
+| POST | `/api/run/full` | `{shutdown_when_done: bool}` → Job (voicebank … report, regen loop; translation is not repeated). `result` = `{score: {status: count}, shutdown: bool, coverage: PatchCoverage|null}`, see "Patch coverage" below |
 | GET | `/api/gpu` | `{name, total_gb, used_gb}` or `{available: false}` |
 
 ### Review — Step 6 (S)
-| GET | `/api/review/lines` | query `speaker, scene, status (ok|check|failed), q, min, max` → `{items: [{line_id, speaker_id, name, scene, status: ok|check|failed, composite, text_src, text_tgt, winner_label, flags[], delivery: {source: audio|text, layer}|null, touched: bool}], facets: {speakers, scenes}}` — `check` first |
+| GET | `/api/review/lines` | query `speaker, scene, status (ok|check|failed), q, min, max` → `{items: [{line_id, speaker_id, name, scene, status: ok|check|failed, composite, text_src, text_tgt, winner_label, flags[], delivery: {source: audio|text, layer}|null, touched: bool, patch: provisional|ok|none|null}], facets: {speakers, scenes}}` — `check` first. `patch` is where the line stands in the built patch (`final_index.jsonl`): `provisional` (all takes failed the gates, the best one is installed: `master.include_review_lines`), `ok`, `none` (a dubbed line without a file: silent in the game), `null` while nothing was mastered. A `check` line is therefore not missing from the game; the rows and the detail (`line.patch`) refresh after `review/apply` has packed again |
 | GET | `/api/review/lines/{id}` | `{line, original_url|null, candidates: [{id, label: A|B|C…, url, backend, route, composite, passed, is_winner, verdicts: [Verdict]}], why: [{gate, key, params}], style_prompt, text_tts, refs: [{path, url, emotion}], tuning_override|null}` |
 | POST | `/api/review/lines/{id}/action` | `{action: accept|reject|regen|set_text|set_ref|keep_original|set_src_text|tuning, payload}` → `{ok, touched}` |
 | POST | `/api/review/prefer-route` | `{route: "A", speaker_id?}` → `{updated: n}` (accept that route's candidate where it passed its gates) |
@@ -199,10 +199,21 @@ Mapping lives in `vndub_app/verdicts.py` (unit-tested) and uses the same thresho
 | GET | `/api/models/custom` | `[entry + {present, disk_gb, usable|null, in_use}]` (`usable` is the registry's verdict for `gguf_llm`) |
 | DELETE | `/api/models/custom/{id}` | `{ok}`; removes the files and the entry (and clears `Settings.translation_llm` when it was that model); 404 `bad_request` for an unknown id; 409 `bad_request` with `params.reason: "in_use"` while a download of it or a pipeline job that translates with it is active |
 | GET | `/api/models/hf/recommended` | `{items: [{repo, url, kind, file, size_gb, license, title: {ru, en}, note: {ru, en}}], checked}`, served from `app/recommended_models.json` (edit it without rebuilding the SPA) |
-| GET | `/api/install/plan` | `{engine, auto_possible, manual_reason_key|null, install_md, files: [{target, source, exists}], patch_dir, backups: [{id, created, files}]}` |
+| GET | `/api/install/plan` | `{engine, auto_possible, manual_reason_key|null, install_md, files: [{target, source, exists}], patch_dir, backups: [{id, created, files}], manifest: {count, engine, backends, routes, coverage: PatchCoverage|null}|null}` |
+| GET | `/api/patch/coverage` | `{coverage: PatchCoverage|null}` (`?slug=`): the same block, read from the built patch's `manifest_patch.json`; `null` without a patch or for one built before the coverage existed. The Run screen asks for it when the app is opened on a finished run |
 | POST | `/api/install/apply` | `{backup: true}` → Job (`install_manual_only` error when not automatic — never claims success) |
 | POST | `/api/install/rollback` | `{backup_id}` → Job |
 | POST | `/api/install/zip` | → Job, result `{path}` |
+
+**Patch coverage.** `PatchCoverage = {dub_lines, installed, provisional, provisional_review, provisional_regen, left_out, left_out_reasons: {reason: n}, narration, include_review_lines}`
+is the `coverage` block `vndub.stages.pack.patch_coverage` writes into `manifest_patch.json` (without its `left_out_lines`, which stay in the file;
+`patch_install.public_coverage`): `dub_lines` lines are dubbed, `installed` of them have a file in the patch, `provisional` of those from a take that failed the
+quality gates (`provisional_review` / `provisional_regen` by the selection status they had), `left_out` have no file and stay silent in the game, `narration` lines
+(no speaker) are never dubbed. `left_out_reasons` keys are `review | regen | no_winner | not_mastered | not_scored` (the manifest's `no winner` etc. with underscores;
+i18n `coverage.reason.<reason>`). The full run's `result.coverage`, `GET /api/patch/coverage` and `install/plan`'s `manifest.coverage` carry the same block (`null`
+when the manifest is missing or from before the coverage existed); the Run screen shows it under "Озвучка готова" (warn tone when `provisional` or `left_out` is
+above 0), the Install screen as three numbers beside the file count. A review `set_text` / `regen` with a text rewrites `laughter` / `interjection` in the line's
+translation record to follow that text (`translation.sync_text_flags`; other flags stay), because the gates and the number of takes read the record, not the override.
 
 ## 4. Jobs and progress
 

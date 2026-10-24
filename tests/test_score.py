@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -286,7 +287,7 @@ def test_partial_metrics_survive_a_kill_between_groups(synthed):
     assert summary["resumed_candidates"] == len(items) and not partial.exists()
     for s in read_jsonl(ctx.paths.selection, SelectionRecord):
         rows = read_jsonl(ctx.paths.scores(s.line_id), CandidateScore)
-        assert all(r.metrics.get(k) is not None for r in rows for k in ("utmos", "spk_sim", "emo_sim", "cer", "dur_ratio") if not (r.route == "orig" and k == "cer")), s.line_id
+        assert all(r.metrics.get(k) is not None for r in rows for k in ("utmos", "spk_sim", "emo_sim", "cer", "dur_ratio") if not (k == "cer" and "cer" in (r.model_extra.get("na") or []))), s.line_id
 
 
 def test_partial_metrics_are_written_per_chunk_inside_a_group(make_ctx, tmp_path, monkeypatch):
@@ -312,7 +313,7 @@ def test_partial_metrics_are_written_per_chunk_inside_a_group(make_ctx, tmp_path
     counts.restore()
     again = watch_models(ctx)
     score.run(ctx)
-    asr_needed = sum(1 for s in read_jsonl(ctx.paths.selection, SelectionRecord) for r in read_jsonl(ctx.paths.scores(s.line_id), CandidateScore) if r.route != "orig")
+    asr_needed = sum(1 for s in read_jsonl(ctx.paths.selection, SelectionRecord) for r in read_jsonl(ctx.paths.scores(s.line_id), CandidateScore) if "cer" not in (r.model_extra.get("na") or []))
     assert asr_needed > 16 and again["transcribe"] == asr_needed - 16, "the chunk that was finished before the kill was transcribed again"
     assert again["mos"] == 0
 
@@ -386,3 +387,169 @@ def test_score_progress_class():
     assert seen == []
     q = score._Progress(C(), total=5, done=9)
     assert q.done == 5
+
+
+# ---- laughter: the CER is about the words ---------------------------------------------------------------------------------------
+
+
+def test_cer_words_takes_the_laughter_out_of_both_sides():
+    from vndub.backends.score.cer import cer
+
+    assert score.cer_words("Haha, no way!", "no way") == ("no way!", "no way")
+    assert score.cer_words("Ха-ха! Ты серьёзно?", "ха-ха ты серьёзно") == ("Ты серьёзно?", "ты серьёзно")
+    assert score.cer_words("Хе-хе.", "хехе") == ("", "")
+    assert score.cer_words("Ты что, (смеётся) издеваешься?", "ты что издеваешься")[0] == "Ты что, издеваешься?"
+    assert score.cer_words("Привет, это тест.", "привет это тест") == ("Привет, это тест.", "привет это тест")  # no laughter: untouched
+    assert score.cer_words("", "") == ("", "")
+    # the laugh is what the ASR drops or garbles: counted as text it fails the gate, over the words it is a clean read
+    assert cer("Ха-ха, ты серьёзно?", "ты серьёзно") > CFG.score.gates.cer_max
+    assert cer(*score.cer_words("Ха-ха, ты серьёзно?", "ты серьёзно")) == 0.0
+    assert cer(*score.cer_words("Haha, no way!", "haha no way")) == 0.0
+    # a laugh the ASR heard as one stray syllable is not a recognizable laugh: the plain reading is the floor
+    assert cer(*score.cer_words("Ха-ха, да ну!", "ха да ну")) > cer("Ха-ха, да ну!", "ха да ну")
+    assert score.cer_over_words("Ха-ха, да ну!", "ха да ну") == pytest.approx(cer("Ха-ха, да ну!", "ха да ну"))
+    assert score.cer_over_words("Ха-ха, да ну!", "да ну") == 0.0 and score.cer_over_words("Haha, no way!", "no way") == 0.0
+    assert score.cer_over_words("Привет, это тест.", "привет это тест") == 0.0
+    assert score.cer_over_words("Привет, это тест.", "совсем другое") == pytest.approx(cer("Привет, это тест.", "совсем другое"))
+
+
+def test_a_laughter_line_has_no_cer_gate_and_can_be_accepted():
+    # no cer metric, "cer" in na (the stage's marking): the gate does not exist, nothing is unchecked
+    c = apply_scores(_c("a.wav", utmos=4.0, dur_ratio=1.0, spk_sim=0.6), CFG, 0.3, True)
+    c.notes = [score.LAUGHTER_NOTE]
+    c.model_extra["na"] = ["cer"]
+    assert c.passed and "cer" not in c.gates and score.unchecked_gates(c) == {}
+    assert score.unchecked_gates(c, {"cer": "ASR gone"}) == {}  # not even when the ASR is unavailable: it was never needed
+    s = _sel([c])
+    assert s.status == "auto" and "cer" not in s.reason
+    # failing the speaker or the MOS gate it says so plainly, and says nothing about the words
+    quiet = apply_scores(_c("b.wav", utmos=2.0, dur_ratio=1.0, spk_sim=0.1), CFG, 0.3, True)
+    quiet.notes = [score.LAUGHTER_NOTE]
+    quiet.model_extra["na"] = ["cer"]
+    for rounds, status in ((0, "regen"), (2, "review")):
+        s = _sel([quiet], rounds=rounds)
+        assert s.status == status and "utmos 2.00<" in s.reason and "spk_sim 0.10<0.30" in s.reason
+        assert "laughter only, no words to check" in s.reason and "misread" not in s.reason and "cer" not in s.reason
+    # the same failures on a line with words do not get the laughter wording
+    words = apply_scores(_c("w.wav", utmos=2.0, dur_ratio=1.0, spk_sim=0.1), CFG, 0.3, False)
+    assert "laughter" not in _sel([words]).reason
+
+
+def _laughter_ctx(make_ctx, tmp_path):
+    """genproj's project with line 0 = laughter and words, and its own "Хе-хе." line (laughter only) flagged as translate does."""
+    from vndub.manifest.io import write_jsonl
+
+    ctx = make_ctx(tmp_path / "game")
+    data = build(ctx, n_per=2)
+    trs = data["translations"]
+    words, only = trs[0], trs[2]
+    assert only.text_tgt == "Хе-хе."
+    words.text_tgt = words.text_tgt_short = words.text_tts = words.text_plain = "Ха-ха, ты серьёзно?"
+    words.flags = ["laughter"]
+    only.flags = ["interjection", "laughter"]
+    write_jsonl(ctx.paths.translation("ru"), trs)
+    synth.run(ctx)
+    return ctx, words.line_id, only.line_id
+
+
+def _tts_rows(ctx, lid):
+    return [r for r in read_jsonl(ctx.paths.scores(lid), CandidateScore) if r.route != "orig"]
+
+
+def test_stage_laughter_only_line_is_not_sent_to_the_asr_and_is_not_a_cer_failure(make_ctx, tmp_path, monkeypatch):
+    from vndub.backends import mock as mockb
+
+    ctx, words_id, only_id = _laughter_ctx(make_ctx, tmp_path)
+    asked: list[str] = []
+    orig = mockb.MockASR.op_transcribe
+
+    def deaf_on_the_laugh(self, item, lang="ja", **kw):
+        asked.append(item["wav"])
+        res = orig(self, item, lang=lang, **kw)
+        return {**res, "text": ""} if only_id in Path(item["wav"]).parts else res  # what an ASR hears in a laugh
+
+    monkeypatch.setattr(mockb.MockASR, "op_transcribe", deaf_on_the_laugh)
+    summary = score.run(ctx)
+    rows = _tts_rows(ctx, only_id)
+    assert rows
+    for r in rows:
+        assert r.metrics.get("cer") is None and "cer" in r.model_extra["na"] and score.LAUGHTER_NOTE in r.notes
+        assert "cer" not in r.gates and not any(n.startswith("cer failed") for n in r.notes)
+        assert r.metrics.get("utmos") is not None and r.metrics.get("spk_sim") is not None  # the other gates are measured
+    assert asked and not any(only_id in Path(w).parts for w in asked)  # nothing to transcribe: the ASR is not asked
+    sel = {s.line_id: s for s in read_jsonl(ctx.paths.selection, SelectionRecord)}[only_id]
+    assert sel.status == "auto" and "gate not checked" not in sel.reason and "cer" not in sel.reason, sel
+    assert "lines_with_unchecked_gates" not in summary and "review_without_regen" not in summary
+    # the ordinary line next to it is still checked word by word
+    assert all(r.metrics.get("cer") == 0.0 for r in _tts_rows(ctx, words_id))
+
+
+def test_stage_cer_ignores_a_laugh_the_asr_dropped(make_ctx, tmp_path, monkeypatch):
+    from vndub.backends import mock as mockb
+    from vndub.backends.score.cer import cer
+
+    ctx, words_id, _ = _laughter_ctx(make_ctx, tmp_path)
+    orig = mockb.MockASR.op_transcribe
+
+    def drops_the_laugh(self, item, lang="ja", **kw):
+        res = orig(self, item, lang=lang, **kw)
+        return {**res, "text": "Ты серьёзно?"} if words_id in Path(item["wav"]).parts else res
+
+    monkeypatch.setattr(mockb.MockASR, "op_transcribe", drops_the_laugh)
+    assert cer("Ха-ха, ты серьёзно?", "Ты серьёзно?") > CFG.score.gates.cer_max  # the old reading: a failed gate
+    score.run(ctx)
+    rows = _tts_rows(ctx, words_id)
+    assert rows and all(r.metrics["cer"] == 0.0 and r.gates["cer"] for r in rows)
+    assert all(r.model_extra["cer_ref"] == "ты серьёзно?" and r.model_extra["asr_text"] == "Ты серьёзно?" for r in rows)
+    assert all(r.model_extra["cer_rule"] == score.CER_RULE and "cer" not in (r.model_extra.get("na") or []) for r in rows)
+    sel = {s.line_id: s for s in read_jsonl(ctx.paths.selection, SelectionRecord)}[words_id]
+    assert sel.status == "auto"
+
+
+def test_stage_words_with_an_empty_or_laugh_only_transcript_stay_an_unchecked_gate(make_ctx, tmp_path, monkeypatch):
+    from vndub.backends import mock as mockb
+
+    ctx, words_id, _ = _laughter_ctx(make_ctx, tmp_path)
+    orig = mockb.MockASR.op_transcribe
+    heard = {"text": ""}
+
+    def hears(self, item, lang="ja", **kw):
+        res = orig(self, item, lang=lang, **kw)
+        return {**res, "text": heard["text"]} if words_id in Path(item["wav"]).parts else res
+
+    monkeypatch.setattr(mockb.MockASR, "op_transcribe", hears)
+    for text in ("", "ха-ха-ха"):  # nothing at all / only the laugh: the words were not heard either way
+        heard["text"] = text
+        summary = score.run(ctx)
+        rows = _tts_rows(ctx, words_id)
+        assert rows and all(r.metrics.get("cer") is None for r in rows), text
+        assert all("cer failed: the ASR heard no words in this take" in r.notes for r in rows), text
+        sel = {s.line_id: s for s in read_jsonl(ctx.paths.selection, SelectionRecord)}[words_id]
+        assert sel.status == "review" and "gate not checked" in sel.reason and "heard no words" in sel.reason, text
+        assert summary["lines_with_unchecked_gates"] >= 1
+
+
+def test_stage_recomputes_a_cer_stored_before_laughter_was_taken_out(make_ctx, tmp_path):
+    from vndub.manifest.io import write_jsonl
+
+    ctx, words_id, only_id = _laughter_ctx(make_ctx, tmp_path)
+    score.run(ctx)
+    # a project scored by the old rule: laughter counted as text (a CER on the laughter line, no cer_rule, no marking)
+    for lid, cer_value in ((words_id, 0.6), (only_id, 0.7)):
+        rows = read_jsonl(ctx.paths.scores(lid), CandidateScore)
+        for r in rows:
+            if r.route == "orig":
+                continue
+            r.metrics["cer"] = cer_value
+            r.model_extra["asr_text"] = "стёртый"
+            r.model_extra.pop("cer_rule", None)
+            r.model_extra.pop("cer_ref", None)
+            r.model_extra["na"] = []
+            r.notes = [n for n in r.notes if n != score.LAUGHTER_NOTE]
+        write_jsonl(ctx.paths.scores(lid), rows)
+    score.run(ctx)
+    for r in _tts_rows(ctx, words_id):
+        assert r.metrics["cer"] == 0.0 and r.model_extra["cer_rule"] == score.CER_RULE and r.model_extra["asr_text"] != "стёртый"
+    for r in _tts_rows(ctx, only_id):
+        assert r.metrics.get("cer") is None and "cer" in r.model_extra["na"] and score.LAUGHTER_NOTE in r.notes
+        assert "asr_text" not in r.model_extra and "cer" not in r.gates

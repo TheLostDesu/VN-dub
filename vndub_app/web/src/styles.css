@@ -1122,6 +1122,11 @@ fieldset.radio-group.is-inline legend {
   background: transparent;
   margin: 0.25rem 0 0;
 }
+/* a long path or URL in a message wraps instead of widening the card */
+.callout,
+.error-panel {
+  overflow-wrap: anywhere;
+}
 .details {
   font-family: var(--mono);
   font-size: 0.8rem;
@@ -1318,12 +1323,34 @@ fieldset.radio-group.is-inline legend {
   font-family: var(--mono);
   user-select: text;
 }
+/* the per-file rows of a download: a summary line and a box of its own (fixed height, own scrollbar), like the log */
+.files-panel {
+  margin: var(--space-3) 0;
+}
+.files-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  margin: 0 0 var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+.files-summary-bad {
+  color: var(--bad);
+  font-weight: 700;
+}
 .files-progress {
   list-style: none;
-  padding: 0;
-  margin: 0.5rem 0;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
   display: grid;
-  gap: 0.5rem;
+  gap: var(--space-2);
+  align-content: start;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 15rem;
+  overflow: auto;
 }
 .files-progress li {
   display: grid;
@@ -2419,4 +2446,20 @@ tr.is-flash > * {
 .error-link {
   margin: 0.4rem 0;
   overflow-wrap: anywhere;
+}
+
+/* what the built patch covers: the callout of the finished run and the three numbers of the install screen */
+.coverage-list {
+  margin: var(--space-1) 0 0;
+  padding-left: 1.2rem;
+  overflow-wrap: anywhere;
+}
+.coverage-list li {
+  margin: 0.2rem 0;
+}
+.coverage-list .btn {
+  margin-left: var(--space-1);
+}
+.coverage-counts {
+  margin: var(--space-3) 0;
 }

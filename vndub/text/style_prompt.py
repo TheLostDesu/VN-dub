@@ -15,6 +15,12 @@ language instruction (Qwen3-TTS CustomVoice ``instruct``, CosyVoice3 instruct
 before ``<|endofprompt|>``, VoxCPM2 parenthesized style), inline tags (Fish S2,
 Higgs), or scalar knobs (Chatterbox ``exaggeration``, Zonos2 sliders), plus the
 emotion reference clip choice.
+
+Laughter. ``StyleSpec.laughter`` (``{"kind", "units", "only", "stage"}``, from ``text_emotion`` or from the TTS text in
+synth) makes the laugh phrase specific ("laughing heartily", "giggling softly", "a short nervous laugh") instead of one
+generic "light laugh", and a line that is nothing but a laugh gets an instruction about the laugh alone. What the TEXT
+should carry is decided by :func:`laughter_decision` (``respell`` | ``inline:<token>`` | ``tag:<token>``) and applied
+by ``vndub.text.laughter`` in synth; the token vocabularies below follow the model cards (see the comments there).
 """
 
 from __future__ import annotations
@@ -22,6 +28,8 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Mapping
+
+from vndub.text.laughter import LAUGH_NOTES as _LAUGH_NOTES
 
 E2V_SET = ["angry", "disgusted", "fearful", "happy", "neutral", "other", "sad", "surprised", "unknown"]
 EXTRA = ["embarrassed"]
@@ -65,9 +73,17 @@ class StyleSpec:
     confidence: float = 0.0
     caption: str = ""
     emotion_probs: dict[str, float] = field(default_factory=dict)
+    # the laugh of the line: {"kind": hearty|chuckle|giggle|evil|nervous|snort, "units": syllables, "only": the line is nothing
+    # but a laugh, "stage": only a stage direction}; None = no information (the generic laugh phrase)
+    laughter: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if not d.get("laughter"):
+            # absent when empty: spec dicts (candidate cache keys, stored sidecars and passports) of lines without
+            # laughter stay byte-identical to what earlier versions wrote
+            d.pop("laughter", None)
+        return d
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "StyleSpec":
@@ -219,7 +235,7 @@ def _intensity_word(x: float) -> str:
 
 
 _EVENT_PHRASE = {
-    "laughter": "with a light laugh",
+    "laughter": "with a light laugh",  # a laugh of unknown kind; see laugh_phrase() for the specific ones
     "cry": "on the verge of tears, voice breaking",
     "breath": "with an audible breath",
     "whisper": "whispering",
@@ -227,19 +243,81 @@ _EVENT_PHRASE = {
     "cough": "with a small cough",
 }
 
+# Laugh phrase per kind and strength (0 soft / short, 1 normal, 2 strong / long). Free-form English: the CustomVoice
+# instruct and CosyVoice3 instruct models follow descriptions, none of them documents a laughter vocabulary (Qwen3-TTS model
+# card: "emotion ... via natural-language instructions"; CosyVoice instruct_list: only happy / sad / angry, speed, volume).
+_LAUGH_PHRASE: dict[str, tuple[str, str, str]] = {
+    "hearty": ("with a warm, easy laugh", "laughing heartily", "bursting into hearty laughter"),
+    "chuckle": ("with a quiet chuckle", "chuckling", "chuckling deeply"),
+    "giggle": ("giggling softly", "giggling", "giggling uncontrollably"),
+    "evil": ("with a low, sinister laugh", "laughing sinisterly", "cackling maniacally"),
+    "nervous": ("with a short, nervous laugh", "laughing nervously", "laughing nervously, voice trembling"),
+    "snort": ("with a short snort of laughter", "snorting with laughter", "snorting with laughter"),
+}
+# a line that is only a laugh: what to produce
+_LAUGH_ONLY: dict[str, str] = {
+    "hearty": "a hearty, natural laugh", "chuckle": "a low, quiet chuckle", "giggle": "a soft, breathy giggle",
+    "evil": "a sinister, drawn-out laugh", "nervous": "a short, nervous laugh", "snort": "a short snort of laughter",
+}
+# VoxCPM2 style word, Fish S2 free-form tag
+_LAUGH_WORD = {"hearty": "laughing heartily", "chuckle": "chuckling", "giggle": "giggling", "evil": "laughing sinisterly", "nervous": "laughing nervously", "snort": "snorting"}
+
+
+def _laugh_kind(spec: StyleSpec) -> str | None:
+    k = (spec.laughter or {}).get("kind")
+    return k if k in _LAUGH_PHRASE else None
+
+
+def _laugh_only(spec: StyleSpec) -> bool:
+    return bool((spec.laughter or {}).get("only")) and "laughter" in spec.events
+
+
+def _laugh_level(spec: StyleSpec) -> int:
+    long_ = int((spec.laughter or {}).get("units") or 0) >= 3
+    if spec.intensity >= 0.8 or (long_ and spec.intensity >= 0.6):
+        return 2
+    if spec.intensity < 0.4 and not long_:
+        return 0
+    return 1
+
+
+def laugh_phrase(spec: StyleSpec) -> str:
+    """The laugh as an instruction phrase: kind and strength specific when ``spec.laughter`` names a kind."""
+    kind = _laugh_kind(spec)
+    return _LAUGH_PHRASE[kind][_laugh_level(spec)] if kind else _EVENT_PHRASE["laughter"]
+
+
+def _notes_text(spec: StyleSpec) -> str:
+    """``spec.notes`` without the kind note (``"giggling"``) of a laugh the laugh phrase already says."""
+    notes = (spec.notes or "").strip()
+    if not notes or "laughter" not in spec.events:
+        return notes
+    parts = [p.strip() for p in notes.split(",")]
+    if not any(p in _LAUGH_NOTES for p in parts):
+        return notes
+    return ", ".join(p for p in parts if p and p not in _LAUGH_NOTES)
+
 
 def to_instruction(spec: StyleSpec, lang: str = "en", include_caption: bool = True) -> str:
     """Natural-language instruction (English; most instruct TTS follow English best)."""
     if lang != "en":
         # Only English templates are maintained; instruct models accept English.
         lang = "en"
-    parts = [f"Speak in a {_ADJ.get(spec.emotion, spec.emotion)} tone, {_intensity_word(spec.intensity)}"]
+    if _laugh_only(spec):
+        # the whole line is a laugh: the instruction is about the laugh, not about a tone to speak words in
+        noun = _LAUGH_ONLY.get(_laugh_kind(spec) or "", "a natural laugh")
+        parts = [f"Only laugh, no words: make {noun}, a real laugh and not syllables read out", _intensity_word(spec.intensity)]
+    else:
+        parts = [f"Speak in a {_ADJ.get(spec.emotion, spec.emotion)} tone, {_intensity_word(spec.intensity)}"]
     if spec.tempo != "normal":
         parts.append("at a fast pace" if spec.tempo == "fast" else "at a slow pace")
     if spec.loudness != "normal":
         parts.append("loudly" if spec.loudness == "loud" else "softly")
     for ev in spec.events:
-        if ev in _EVENT_PHRASE:
+        if ev == "laughter":
+            if not _laugh_only(spec):
+                parts.append(laugh_phrase(spec))
+        elif ev in _EVENT_PHRASE:
             parts.append(_EVENT_PHRASE[ev])
     vq = [q for q in spec.voice_quality if q not in ("whispery",)]
     if vq:
@@ -249,8 +327,9 @@ def to_instruction(spec: StyleSpec, lang: str = "en", include_caption: bool = Tr
     elif spec.arc == "falling_end":
         parts.append("with falling intonation at the end")
     text = ", ".join(parts) + "."
-    if spec.notes:
-        text += f" Delivery: {spec.notes.strip().rstrip('.')}."
+    notes = _notes_text(spec)
+    if notes:
+        text += f" Delivery: {notes.rstrip('.')}."
     if include_caption and spec.caption:
         text += f" Reference performance: {spec.caption.strip()}"
     return text
@@ -272,11 +351,15 @@ def to_voxcpm_prefix(spec: StyleSpec) -> str:
         words.append("faster" if spec.tempo == "fast" else "slower")
     if spec.loudness != "normal":
         words.append("loud" if spec.loudness == "loud" else "soft")
-    words += [{"laughter": "laughing", "cry": "tearful", "whisper": "whispering", "breath": "breathy", "sigh": "sighing"}.get(e, "") for e in spec.events]
+    words += [
+        (_LAUGH_WORD.get(_laugh_kind(spec) or "", "laughing") if e == "laughter" else {"cry": "tearful", "whisper": "whispering", "breath": "breathy", "sigh": "sighing"}.get(e, ""))
+        for e in spec.events
+    ]
     if spec.arc == "rising_end":
         words.append("rising at the end")
-    if spec.notes:
-        words.append(spec.notes.strip().rstrip("."))
+    notes = _notes_text(spec)
+    if notes:
+        words.append(notes.rstrip("."))
     return "(" + ", ".join(w for w in words if w) + ")"
 
 
@@ -284,16 +367,33 @@ _FISH_EMO = {
     "angry": "angry", "disgusted": "disgusted", "fearful": "scared", "happy": "happy", "neutral": "",
     "sad": "sad", "surprised": "surprised", "embarrassed": "embarrassed", "other": "", "unknown": "",
 }
-_FISH_EVENT = {"laughter": "laughing", "cry": "crying", "breath": "breath", "whisper": "whisper", "sigh": "sigh", "cough": "cough"}
+# Fish Audio S2 Pro takes free-form text in square brackets (model card huggingface.co/fishaudio/s2-pro: "free-form textual
+# descriptions", 15,000+ tags; docs.fish.audio emotions page: [laughing] "Ha, ha, ha", [chuckling] "Heh, heh", [inhale],
+# [exhale], [sigh], [whisper], [clearing throat]; "sound effects can go anywhere in the text", sentence-level cues work best at the
+# start of a sentence). The parenthesis syntax "(laughing)" belongs to the deprecated S1 / OpenAudio S1.
+_FISH_EVENT = {"laughter": "laughing", "cry": "crying", "breath": "inhale", "whisper": "whisper", "sigh": "sigh", "cough": "clearing throat"}
+# laugh tags per kind; [laughing] and [chuckling] are documented, the others are free-form in the same style (unverified by ear)
+_FISH_LAUGH = {
+    "hearty": "laughing", "chuckle": "chuckling", "giggle": "giggling", "nervous": "laughing nervously",
+    "evil": "evil laugh", "snort": "snorting",
+}
 
 
-def to_fish_tags(spec: StyleSpec) -> str:
-    """Fish S2 inline tags placed before the line, e.g. ``[happy] [laughing]``."""
+def to_fish_tags(spec: StyleSpec, inline_laughter: bool = False) -> str:
+    """Fish S2 inline tags placed before the line, e.g. ``[happy] [laughing]``.
+
+    ``inline_laughter``: the laughs of the text carry their own tag (``laughter.apply_laughter``), the prefix has none.
+    """
     tags = []
     emo = _FISH_EMO.get(spec.emotion, spec.emotion)
     if emo:
         tags.append(("very " if spec.intensity >= 0.8 else "") + emo)
-    tags += [_FISH_EVENT[e] for e in spec.events if e in _FISH_EVENT]
+    for e in spec.events:
+        if e == "laughter":
+            if not inline_laughter:
+                tags.append(_FISH_LAUGH.get(_laugh_kind(spec) or "", _FISH_EVENT["laughter"]))
+        elif e in _FISH_EVENT:
+            tags.append(_FISH_EVENT[e])
     if spec.loudness == "loud":
         tags.append("shouting" if spec.intensity >= 0.75 else "loud")
     elif spec.loudness == "soft" and "whisper" not in spec.events:
@@ -307,23 +407,70 @@ def to_fish_tags(spec: StyleSpec) -> str:
     return " ".join(f"[{t}]" for t in tags)
 
 
+# Higgs Audio v3 (model card huggingface.co/bosonai/higgs-audio-v3-tts-4b): tags are <|category:value|>. emotion: elation,
+# amusement, enthusiasm, determination, pride, contentment, affection, relief, contemplation, confusion, surprise, awe, longing,
+# arousal, anger, fear, disgust, bitterness, sadness, shame, helplessness (no "neutral": no tag); style: singing, shouting,
+# whispering; prosody: speed_*, pitch_*, pause, expressive_*. Emotion / style / speed / pitch tags go at the start of the input,
+# positional ones (pause, sfx) inline where they should occur; "pair each sfx tag with its suggested onomatopoeia written right
+# after it": laughter -> "Haha" / "Hehe" (so laughter.apply_laughter writes "<|sfx:laughter|>Haha" at the laugh itself).
 _HIGGS_EMO = {
-    "angry": "anger", "disgusted": "disgust", "fearful": "fear", "happy": "happiness", "neutral": "neutral",
-    "sad": "sadness", "surprised": "surprise", "embarrassed": "embarrassment", "other": "neutral", "unknown": "neutral",
+    "angry": "anger", "disgusted": "disgust", "fearful": "fear", "happy": "elation", "neutral": "",
+    "sad": "sadness", "surprised": "surprise", "embarrassed": "shame", "other": "", "unknown": "",
+}
+_HIGGS_SFX = {"laughter": "laughter", "cry": "crying", "sigh": "sigh", "cough": "cough"}  # "breath" has no tag in v3
+
+
+def to_higgs_tags(spec: StyleSpec, inline_laughter: bool = False) -> str:
+    emo = _HIGGS_EMO.get(spec.emotion, "")
+    if emo == "elation" and "laughter" in spec.events:
+        emo = "amusement"
+    tags = [f"<|emotion:{emo}|>"] if emo else []
+    if "whisper" in spec.events:
+        tags.append("<|style:whispering|>")
+    elif spec.loudness == "loud" and spec.intensity >= 0.75:
+        tags.append("<|style:shouting|>")
+    if spec.tempo != "normal":
+        tags.append(f"<|prosody:speed_{'fast' if spec.tempo == 'fast' else 'slow'}|>")
+    for e in spec.events:
+        if e in _HIGGS_SFX and not (e == "laughter" and inline_laughter):
+            tags.append(f"<|sfx:{_HIGGS_SFX[e]}|>")
+    return "".join(tags)
+
+
+# ----------------------------------------------------------------------------
+# laughter in the TEXT: what each tag syntax allows
+# ----------------------------------------------------------------------------
+
+# tags kind -> (mode, {laugh kind | "any": token}). "inline": the token replaces the written laugh (CosyVoice sound event);
+# "tag": the token precedes the spelled laugh (Fish S2 / Higgs are written "tag + onomatopoeia"). Backends without an entry
+# get the table respelling (configs/laughter.yaml).
+LAUGH_INLINE: dict[str, tuple[str, dict[str, str]]] = {
+    # CosyVoice: "[laughter]" is a special token of the CosyVoice2 / CosyVoice3 tokenizer (cosyvoice/tokenizer/tokenizer.py) and
+    # the CosyVoice2 example writes it inline ("他突然[laughter]停下来"); the CosyVoice3 example and model card only show [breath],
+    # so for CosyVoice3 it is a documented token that has not been heard here
+    "cosy_inline": ("inline", {"any": "[laughter]"}),
+    "fish": ("tag", {"any": "[laughing]", **{k: f"[{v}]" for k, v in _FISH_LAUGH.items()}}),
+    "higgs": ("tag", {"any": "<|sfx:laughter|>"}),
 }
 
 
-def to_higgs_tags(spec: StyleSpec) -> str:
-    tags = [f"<|emotion:{_HIGGS_EMO.get(spec.emotion, 'neutral')}|>"]
-    if "whisper" in spec.events:
-        tags.append("<|style:whisper|>")
-    if spec.tempo != "normal":
-        tags.append(f"<|prosody:speed_{'fast' if spec.tempo == 'fast' else 'slow'}|>")
-    sfx = {"cry": "crying", "breath": "breathing"}
-    for e in spec.events:
-        if e in ("laughter", "cry", "sigh", "cough", "breath"):
-            tags.append(f"<|sfx:{sfx.get(e, e)}|>")
-    return "".join(tags)
+def laughter_decision(caps: Mapping[str, Any]) -> str:
+    """How the text of a backend should carry laughter: ``respell`` | ``inline:<token>`` | ``tag:<token>``.
+
+    ``keep`` (leave the written laugh alone) is never chosen here: it comes from ``synth.laughter.enabled`` or a backend
+    section of ``configs/laughter.yaml``.
+    """
+    entry = LAUGH_INLINE.get(str(caps.get("tags", "none")))
+    if entry is None:
+        return "respell"
+    mode, toks = entry
+    return f"{mode}:{toks.get('any') or toks.get('hearty')}"
+
+
+def laughter_tokens(caps: Mapping[str, Any]) -> dict[str, str]:
+    """The laugh tokens of the backend tag syntax per kind (``any`` = every kind); ``{}`` for a backend without."""
+    entry = LAUGH_INLINE.get(str(caps.get("tags", "none")))
+    return dict(entry[1]) if entry else {}
 
 
 # Zonos emotion slider order: happiness, sadness, disgust, fear, surprise, anger, other, neutral
@@ -357,15 +504,20 @@ def to_knobs(spec: StyleSpec, backend: str, opts: Mapping[str, Any] | None = Non
     return {"tempo": spec.tempo, "loudness": spec.loudness, "intensity": spec.intensity, "arc": spec.arc, "emotion": spec.emotion}
 
 
-def render(spec: StyleSpec, caps: Mapping[str, Any], opts: Mapping[str, Any] | None = None, cross_lingual: bool = False) -> dict[str, Any]:
-    """Everything a backend needs from the style: ``instruct``, ``text_prefix``, ``knobs``, ``style_prompt``.
+def render(
+    spec: StyleSpec, caps: Mapping[str, Any], opts: Mapping[str, Any] | None = None, cross_lingual: bool = False, laughter_inline: bool = False,
+) -> dict[str, Any]:
+    """Everything a backend needs from the style: ``instruct``, ``text_prefix``, ``knobs``, ``style_prompt``, ``laughter``.
 
-    ``style_prompt`` is the human-readable string stored in the synth sidecar.
+    ``style_prompt`` is the human-readable string stored in the synth sidecar. ``laughter`` is the decision for the TEXT
+    (:func:`laughter_decision`: ``respell`` | ``inline:<token>`` | ``tag:<token>``); synth applies it with
+    ``vndub.text.laughter.apply_laughter`` (and may turn it into ``keep``). ``laughter_inline``: the text carries the
+    laugh tokens itself, so the Fish / Higgs prefix leaves its own laughter tag out.
     """
     instruct_kind = caps.get("instruct", "none")
     tags_kind = caps.get("tags", "none")
     knobs_kind = caps.get("knobs", "none")
-    out: dict[str, Any] = {"instruct": None, "text_prefix": "", "knobs": {}, "style_prompt": ""}
+    out: dict[str, Any] = {"instruct": None, "text_prefix": "", "knobs": {}, "style_prompt": "", "laughter": laughter_decision(caps)}
     if instruct_kind in ("natural", "qwen"):
         out["instruct"] = to_instruction(spec)
     elif instruct_kind == "cosy":
@@ -373,9 +525,9 @@ def render(spec: StyleSpec, caps: Mapping[str, Any], opts: Mapping[str, Any] | N
     elif instruct_kind == "voxcpm":
         out["text_prefix"] = to_voxcpm_prefix(spec)
     if tags_kind == "fish":
-        out["text_prefix"] = (out["text_prefix"] + " " + to_fish_tags(spec)).strip()
+        out["text_prefix"] = (out["text_prefix"] + " " + to_fish_tags(spec, laughter_inline)).strip()
     elif tags_kind == "higgs":
-        out["text_prefix"] = (out["text_prefix"] + to_higgs_tags(spec)).strip()
+        out["text_prefix"] = (out["text_prefix"] + to_higgs_tags(spec, laughter_inline)).strip()
     elif tags_kind == "cosy_inline" and "breath" in spec.events:
         out["text_prefix"] = (out["text_prefix"] + " [breath]").strip()
     if knobs_kind in ("chatterbox", "zonos"):
@@ -517,6 +669,7 @@ def apply_tuning(spec: StyleSpec, tuning: Mapping[str, Any] | None) -> StyleSpec
             out.emotion = "neutral"
             out.emotion_probs = {"neutral": 1.0}
             out.events = []
+            out.laughter = None
             out.arc = "flat"
             out.tempo = "normal"
             out.loudness = "normal"

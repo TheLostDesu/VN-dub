@@ -1,8 +1,10 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { api } from "../api/endpoints";
+import type { PatchCoverage } from "../api/types";
 import { ErrorPanel } from "../components/ErrorPanel";
 import { JobProgress } from "../components/JobProgress";
+import { CoverageCallout } from "../components/PatchCoverage";
 import { StepFooter } from "../components/StepFooter";
 import { Button, Callout, Card, Checkbox, Gauge, PageTitle } from "../components/ui";
 import { useI18n } from "../i18n";
@@ -13,6 +15,12 @@ import { useWizard } from "../state/wizard";
 import { stageDone } from "../util/format";
 
 const RUN_KINDS = ["full", "stage"];
+
+/** `result.coverage` of a finished full run (what the patch built by it covers), null when the job carries none. */
+function coverageOf(result: Record<string, unknown> | undefined): PatchCoverage | null {
+  const c = result?.coverage;
+  return c && typeof c === "object" && typeof (c as PatchCoverage).installed === "number" ? (c as PatchCoverage) : null;
+}
 
 export default function RunScreen() {
   const { t } = useI18n();
@@ -50,9 +58,35 @@ export default function RunScreen() {
   const finished = job?.state === "done" || (!job && stageDone(project?.stage_status, "report"));
   const running = tracker.busy;
 
+  // What the patch covers: the finished job carries it; the app opened on an already finished run asks the server.
+  const jobCoverage = job?.state === "done" ? coverageOf(job.result) : null;
+  const [fetchedCoverage, setFetchedCoverage] = useState<PatchCoverage | null>(null);
+  useEffect(() => {
+    if (!finished || running || jobCoverage) return;
+    let alive = true;
+    api
+      .patchCoverage()
+      .then((r) => alive && setFetchedCoverage(r.coverage ?? null))
+      .catch(() => alive && setFetchedCoverage(null));
+    return () => {
+      alive = false;
+    };
+  }, [finished, running, jobCoverage, job?.id]);
+  const coverage = jobCoverage ?? (finished && !running ? fetchedCoverage : null);
+  const staleImport = (project?.stale ?? []).some((s) => s.stage === "parse");
+
   return (
     <>
       <PageTitle title={t("run.title")} intro={t("run.intro")} testid="run-title" />
+
+      {staleImport && !running ? (
+        <Callout tone="warn" title={t("stale_import.title")} testid="run-stale-import">
+          <p>{t("stale_import.run_text")}</p>
+          <Button onClick={() => wiz.goto("game")} data-testid="run-stale-import-go">
+            {t("stale_import.go")}
+          </Button>
+        </Callout>
+      ) : null}
 
       <Card testid="run-setup">
         <Checkbox checked={shutdown} onChange={(v) => void update({ shutdown_when_done: v })} label={t("run.shutdown")} hint={t("run.shutdown_hint")} testid="run-shutdown" />
@@ -88,6 +122,8 @@ export default function RunScreen() {
           </Button>
         </Callout>
       ) : null}
+
+      {coverage && finished && !running ? <CoverageCallout coverage={coverage} onReview={() => void wiz.next("run")} /> : null}
 
       <StepFooter step="run" canNext={!!finished && !running} nextHint={t("run.next_hint")} />
     </>

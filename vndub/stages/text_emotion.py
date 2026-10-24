@@ -36,6 +36,10 @@ the cue's confidence; it is judged against ``min_confidence`` after the adjustme
 speaker lines of any kind (voiced ones included) so that a cue about a voiced heroine never leaks onto the
 unvoiced protagonist standing next to her.
 
+Laughter is read in the source language of the project (``ctx.src_lang``: kana, Cyrillic or Latin spellings, bracketed
+stage directions) and in the translation; it gives the ``laugh`` event, an emotion and a note by kind, and
+``delivery.laughter = {kind, units, stage, only}`` (``only`` = the line is nothing but a laugh), see ``text/delivery.py``.
+
 Runs without any translation file (the app runs it before ``translate``); item-level cached.
 """
 
@@ -69,7 +73,7 @@ from vndub.text.delivery import (  # noqa: F401  (load_cues / save_cues are this
 from vndub.util import hash_obj
 
 NAME = "text_emotion"
-VERSION = "1"
+VERSION = "2"  # 2: laughter kinds / Latin laughter / delivery.laughter (passports written by version 1 have none)
 CONFIG_SECTIONS = ("text_emotion",)
 
 NARRATOR = "narrator"
@@ -265,9 +269,10 @@ def build_delivery(
     llm_delivery: Mapping[str, Any] | None = None,
     lexicon: Mapping[str, str] | None = None,
     min_confidence: float = 0.6,
+    src_lang: str = "auto",
 ) -> Delivery:
     """rule -> cue -> llm for one line (see :func:`vndub.text.delivery.merge_layers`)."""
-    layers = [rule_pass(line.text_src, tgt_text, lexicon), cue_layer(hits), llm_layer(llm_delivery)]
+    layers = [rule_pass(line.text_src, tgt_text, lexicon, src_lang), cue_layer(hits), llm_layer(llm_delivery)]
     return merge_layers(layers, min_confidence)
 
 
@@ -361,14 +366,14 @@ def run(ctx: StageContext) -> dict[str, Any]:
             line.text_src, line.speaker_id, tgt_text, llm_d,
             [[h.line_id, h.lang, h.cue, h.confidence] for h in hits],
             window_context(lines, pos_of[lid], te.narration_window, tgt_texts), cues.hash,
-            lex_hash,
+            lex_hash, src_lang,
         )
         d: Delivery | None = None
         if prev is not None and cache.fresh(lid, key, [pp]):
             cached += 1
             d = Delivery.from_dict(prev.get("delivery") or {})
         else:
-            d = build_delivery(line, hits, tgt_text, llm_d, lexicon, te.min_confidence)
+            d = build_delivery(line, hits, tgt_text, llm_d, lexicon, te.min_confidence, src_lang)
             write_json(pp, text_passport(line, d))
             cache.put(lid, key)
             written += 1

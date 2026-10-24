@@ -20,6 +20,7 @@ src_lang auto / code            ``project.src_lang`` and ``work/project.yaml``: 
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,8 @@ from vndub_app import appdirs, session, viewdata
 from vndub_app.errors import AppError
 
 log = logging.getLogger("vndub_app.translation")
+
+_TRANSLATION_LOCK = threading.Lock()  # read-modify-write of the translation file (sync_text_flags)
 
 HONORIFICS_TO_GLOSSARY = {"drop": "drop", "keep": "transliterate", "adapt": "map"}
 HONORIFICS_FROM_GLOSSARY = {v: k for k, v in HONORIFICS_TO_GLOSSARY.items()}
@@ -255,6 +258,58 @@ def _sync_project_lang(h: appdirs.ProjectHandle, lang: str, src: str = "auto") -
         proj.src_lang, changed = "auto", True
     if changed:
         save_project_yaml(py, proj)
+
+
+# ----------------------------------------------------------------------------
+# edited text -> flags
+# ----------------------------------------------------------------------------
+
+LAUGHTER_FLAGS = ("laughter", "interjection")
+
+
+def retag_flags(flags: list[str], text: str) -> list[str]:
+    """The translation record's ``flags`` after its dialogue text became ``text``: ``laughter`` / ``interjection`` follow the new
+    text (``vndub.stages.translate.laughter_flags``), every other flag stays.
+
+    ``interjection`` is kept when the old flags show it did not come from a laugh (a kana interjection of the source text carries
+    it without ``laughter``): only a laughter-derived ``interjection`` is recomputed. Order and duplicates of the kept flags are
+    unchanged; the new ones are appended.
+    """
+    from vndub.stages.translate import laughter_flags
+
+    was_laugh = "laughter" in flags
+    kept = [f for f in flags if f != "laughter" and not (f == "interjection" and was_laugh)]
+    return kept + [f for f in laughter_flags(text) if f not in kept]
+
+
+def sync_text_flags(h: appdirs.ProjectHandle, line_id: str, text: str) -> bool:
+    """Make the ``laughter`` / ``interjection`` flags of a line's translation record follow the text the user wrote for it.
+
+    The score gate (``score.interjection_cer_max``, no CER check of a laughter-only line) and the number of takes (``synth``) read
+    these flags from the record, not from the override that carries the user's text, so a line the user turned into laughter (or out
+    of it) would otherwise be judged by its old text. Returns whether the record changed. A line without a record is left alone.
+    """
+    from vndub.manifest.io import TranslationRecord, read_jsonl, write_jsonl
+
+    ctx = session.read_ctx(h)
+    path = ctx.paths.translation(ctx.cfg.project.tgt_lang)
+    with _TRANSLATION_LOCK:
+        if not path.exists():
+            return False
+        recs = read_jsonl(path, TranslationRecord)
+        changed = False
+        for r in recs:
+            if r.line_id == line_id:
+                new = retag_flags(list(r.flags or []), text)
+                if new != list(r.flags or []):
+                    r.flags, changed = new, True
+                break
+        if changed:
+            write_jsonl(path, recs)  # atomic replace
+            log.info("line %s: flags follow the edited text -> %s", line_id, ", ".join(f for f in new if f in LAUGHTER_FLAGS) or "no laughter")
+    if changed:
+        viewdata.clear_cache(h.slug)
+    return changed
 
 
 # ----------------------------------------------------------------------------

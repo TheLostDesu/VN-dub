@@ -1,0 +1,88 @@
+# Laughter spelling for the TTS (stage `synth`, config `synth.laughter`).
+#
+# A TTS model reads written laughter letter by letter ("Ха-ха-ха" -> "ха", "ха", "ха", with pauses) unless it is spelled the way the
+# model met laughter in its training data, or replaced by the model's own laugh token. Before a line is sent to the TTS, synth finds
+# every laugh in it (the three scripts: kana, Cyrillic, Latin; and bracketed stage directions like *laughs*, (смеётся), (笑)) and
+# writes it the way this table says. Take the text the TTS got from the `text_used` field of the candidate's .json (and `laughter`
+# there: {kind, n, mode}); `text_plain` (the CER reference) is never respelled.
+#
+# Lookup: the TARGET language of the project (project.tgt_lang) -> laugh kind -> `short` (1-2 syllables in the line) or `long`
+# (3+ syllables: "ха-ха-ха", "hahaha"). A plain string means the same spelling for short and long. `default` is used for a language
+# that has no block of its own. Kinds: hearty (ha-ha), chuckle (heh-heh), giggle (hee-hee), evil (mwahaha), nervous (a laugh that trails
+# into "..."), snort (pfft). The sentence mark of a spelling ("!", "...") yields to the punctuation the line already has.
+#
+# These spellings are a starting point chosen without listening (the pipeline cannot hear): try a few lines on YOUR voice and edit.
+# What reads as a laugh depends on the model and on the performer clip. Things that tend to matter: a vowel-run without hyphens
+# ("Ахахаха") sounds like one breath, hyphens ("Ха-ха-ха") make separate syllables with pauses; a trailing "!" gives energy, "..." a
+# tired / nervous trail; a capital letter starts a fresh sentence.
+#
+# `stage: remove` (default): a stage direction is dropped from the spoken text. `respell`: it is spoken as a laugh of its kind.
+# A stage direction next to a spoken laugh in the same line is always dropped.
+stage: remove
+
+# Russian: the translator usually writes "Ха-ха" / "Хе-хе" (the dictionary spelling), and that hyphenated form is exactly what the
+# model reads syllable by syllable. The vowel-run forms below ("Ахаха") are how laughter is written in Russian chats and subtitles,
+# so a text-trained TTS has met them as laughter.
+ru:
+  hearty:  {short: "Ахаха!",       long: "Ахахаха!"}
+  chuckle: {short: "Хехе",         long: "Хехехе"}
+  giggle:  {short: "Хихи",         long: "Хихихи"}
+  evil:    {short: "Муахаха!",     long: "Муахахаха!"}
+  nervous: {short: "Ахаха...",     long: "Ахахаха..."}
+  snort:   {short: "Пфф",          long: "Пффф"}
+
+en: &en
+  hearty:  {short: "Haha!",        long: "Hahahaha!"}
+  chuckle: {short: "Hehe",         long: "Hehehe"}
+  giggle:  {short: "Hee hee",      long: "Hee hee hee"}
+  evil:    {short: "Mwahaha!",     long: "Mwahahaha!"}
+  nervous: {short: "Ahaha...",     long: "Ahahaha..."}
+  snort:   {short: "Pfft",         long: "Pfffft"}
+
+ja:
+  hearty:  {short: "あはは！",     long: "あははははは！"}
+  chuckle: {short: "ふふっ",       long: "ふふふ"}
+  giggle:  {short: "くすくす",     long: "くすくすくす"}
+  evil:    {short: "くくく……",    long: "ふはははは！"}
+  nervous: {short: "あはは……",    long: "えへへ……"}
+  snort:   {short: "ぷっ",         long: "ぷくく"}
+
+default: *en
+
+# Per backend (the key is the backend name from `vndub models list`). What a backend does with laughter is decided by its
+# capabilities (style_prompt.laughter_decision): a backend with its own laugh token gets it, every other backend gets the spelling
+# above. A section here overrides that:
+#   mode      respell | inline | tag | keep   inline = the token REPLACES the written laugh; tag = the token goes BEFORE the spelled
+#             laugh; keep = leave the written laugh as it is (stage directions are still dropped)
+#   token     the token for every kind        tokens  {kind: token}
+#   only      the mode for a line that is nothing but a laugh ("Ха-ха!")
+#   spelling  the language of the table used for the spelled laugh next to a tag
+#   stage     remove | respell for this backend
+#   <lang>    spelling overrides for this backend only, same shape as the blocks above
+#
+# Qwen3-TTS Base (the zero-shot cloner) has no laugh token and ignores `instruct`: the spelling is the only lever, so the `ru` block above is
+# what it voices. Put per-voice experiments under `qwen3_tts: {ru: {hearty: {short: ..., long: ...}}}`.
+backends:
+  qwen3_tts: {}
+
+  # CosyVoice3 / CosyVoice2 tokenizer special tokens: [laughter] (a sound event), <laughter>..</laughter> (speech while laughing), [breath].
+  # CosyVoice2 documents `[laughter]` inline in its cross-lingual example; the CosyVoice3 example only shows [breath], so [laughter]
+  # is documented but not heard here. `only: tag` keeps a spelling next to the token for a line that is only a laugh, so the model has
+  # something to say; set `only: inline` to try the bare token.
+  cosyvoice3:
+    only: tag
+
+  # Fish Audio S2: free-form bracket tags anywhere in the text; docs.fish.audio suggests "Ha, ha, ha" next to [laughing] and "Heh, heh" next
+  # to [chuckling]. The tag per kind is in style_prompt (LAUGH_INLINE); override with `tokens: {giggle: "[giggling softly]"}`.
+  fish_s2:
+    ru:
+      hearty:  {short: "Ха, ха, ха", long: "Ха, ха, ха, ха"}
+      chuckle: {short: "Хе, хе",     long: "Хе, хе, хе"}
+
+  # Higgs Audio v3: `<|sfx:laughter|>` paired with the onomatopoeia written right after it ("Haha" / "Hehe" in the model card); the card
+  # is English, so the spelled part is English even in a Russian line (set `spelling: ru` to use the ru block instead).
+  higgs_tts3:
+    spelling: en
+    en:
+      hearty:  {short: "Haha",  long: "Hahaha"}
+      chuckle: {short: "Hehe",  long: "Hehehe"}

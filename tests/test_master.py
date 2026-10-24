@@ -91,3 +91,27 @@ def test_master_orig_passthrough_and_review_skip(make_ctx, tmp_path):
     enc = ctx.paths.abs(finals[l0.line_id].encoded)
     assert enc.read_bytes() == Path(data["audio"][0].src_path).read_bytes()
     assert finals[l0.line_id].source == "orig"
+
+
+@requires_ffmpeg
+def test_master_installs_review_and_regen_lines_as_provisional_by_default(make_ctx, tmp_path):
+    ctx = make_ctx(tmp_path / "game")  # the test profile; the shipped default is the same value
+    assert ctx.cfg.master.include_review_lines == "provisional"
+    data = build(ctx, n_per=2, codec="vorbis", interjection=False)
+    sel = []
+    for i, (line, status) in enumerate(zip(data["lines"], ["auto", "review", "regen", "review"])):
+        cand = ctx.paths.synth_dir(line.line_id) / "mock_tts_A_0.wav"
+        speechlike(cand, data["audio"][i].duration, 200.0, sr=24000, seed=40 + i, amp=0.2)
+        winner = None if i == 3 else ctx.paths.rel(cand)  # the last one has no take at all
+        sel.append(SelectionRecord(line_id=line.line_id, winner=winner, backend="mock_tts", route="A", status=status, reason=f"why {status}"))
+    write_jsonl(ctx.paths.selection, sel)
+    s = master.run(ctx)
+    assert s["encoded"] == 3 and s["provisional"] == 2 and s["provisional_regen"] == 1 and s["skipped"] == {"no winner": 1}
+    finals = {r.line_id: r for r in read_jsonl(ctx.paths.final_index, FinalIndexRecord)}
+    assert [finals[l.line_id].status for l in data["lines"][:3]] == ["auto", "provisional", "provisional"]
+    r1, r2 = finals[data["lines"][1].line_id], finals[data["lines"][2].line_id]
+    assert (r1.model_extra["selection_status"], r1.model_extra["reason"]) == ("review", "why review")
+    assert (r2.model_extra["selection_status"], r2.model_extra["reason"]) == ("regen", "why regen")
+    ctx.cfg.master.include_review_lines = "skip"  # an explicit choice keeps them out, counted by status
+    s2 = master.run(ctx)
+    assert s2["skipped"] == {"review": 1, "regen": 1, "no winner": 1} and "provisional" not in s2
