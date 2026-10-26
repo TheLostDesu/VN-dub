@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from adapters.common.rpc import ModelImpl, audio_seconds, load_audio, load_audios, run_in_batches, weight_dir
+from adapters.common.yamlcompat import ruamel_old_api_compat
 
 
 def _save(out: str, vec) -> dict[str, Any]:
@@ -26,6 +27,7 @@ class EcapaEmbedder(ModelImpl):
     def load(self) -> dict[str, Any]:
         import torch
 
+        ruamel_old_api_compat()  # hyperparams.yaml goes through HyperPyYAML's old ruamel loader
         try:
             from speechbrain.inference.speaker import EncoderClassifier
         except ImportError:  # speechbrain < 1.0

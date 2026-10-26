@@ -14,6 +14,7 @@ import sys
 from typing import Any
 
 from adapters.common.rpc import TTSImpl, UnavailableError, env_src_dir, weight_dir
+from adapters.common.yamlcompat import ruamel_old_api_compat
 
 SYSTEM = "You are a helpful assistant."
 EOP = "<|endofprompt|>"
@@ -41,6 +42,7 @@ class CosyVoice3TTS(TTSImpl):
             if str(p) not in sys.path:
                 sys.path.insert(0, str(p))
         d = weight_dir(self.params, 0)
+        ruamel_old_api_compat()  # the model yaml goes through HyperPyYAML's old ruamel loader
         try:
             from cosyvoice.cli.cosyvoice import AutoModel
 

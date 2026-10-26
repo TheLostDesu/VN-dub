@@ -3,7 +3,10 @@
 # @git CosyVoice https://github.com/FunAudioLLM/CosyVoice 074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc --recursive
 conformer==0.3.2
 diffusers==0.29.0
-HyperPyYAML==1.2.2
+# HyperPyYAML 1.2.3 (the CosyVoice pin) requires ruamel.yaml < 0.19: 0.19 broke the old Loader classes it parses
+# configs with ("'Loader' object has no attribute 'max_depth'"); adapters/common/yamlcompat.py covers envs built before this.
+HyperPyYAML==1.2.3
+ruamel.yaml==0.18.17
 inflect==7.3.1
 lightning==2.2.4
 onnx==1.16.0
