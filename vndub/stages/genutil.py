@@ -25,9 +25,11 @@ from vndub.manifest.io import (
     SelectionRecord,
     SynthSidecar,
     TranslationRecord,
+    load_characters,
     read_json,
     read_jsonl,
     read_yaml,
+    save_characters,
 )
 from vndub.util import hash_obj
 
@@ -166,6 +168,45 @@ def src_duration(ctx: Any, line: LineRecord, passport: dict[str, Any] | None = N
     return 0.0
 
 
+def _merge_changes(theirs: Any, mine: Any, base: Any) -> Any:
+    """``theirs`` with the changes that ``mine`` made to ``base`` applied (dicts key by key, anything else wholesale)."""
+    if mine == base:
+        return theirs
+    if isinstance(mine, dict) and isinstance(base, dict) and isinstance(theirs, dict):
+        out = dict(theirs)
+        for k in {*mine, *base}:
+            if k not in mine:
+                out.pop(k, None)
+            elif k not in base or mine[k] != base[k]:
+                out[k] = _merge_changes(theirs.get(k), mine[k], base.get(k))
+        return out
+    return mine
+
+
+def snapshot_characters(chars: dict[str, Any]) -> dict[str, Any]:
+    """A deep copy to compare with later (see :func:`save_characters_merged`)."""
+    return {k: v.model_copy(deep=True) for k, v in chars.items()}
+
+
+def save_characters_merged(ctx: Any, chars: dict[str, Any], base: dict[str, Any]) -> None:
+    """Save ``chars`` onto ``characters.yaml`` *as it is now*, changing only what this run changed relative to ``base``
+    (the :func:`snapshot_characters` taken when ``chars`` was loaded).
+
+    A job that trains for hours (RVC, LoRA) used to write its start-of-run snapshot back over every casting edit made
+    meanwhile (a chosen design, tuning, a name, a description, a route).
+    """
+    path = ctx.paths.characters
+    latest = load_characters(path) if path.exists() else {}
+    for sid, mine in chars.items():
+        theirs = latest.get(sid)
+        if theirs is None:
+            latest[sid] = mine
+            continue
+        was = base.get(sid) or type(mine)()
+        latest[sid] = type(mine).model_validate(_merge_changes(theirs.model_dump(), mine.model_dump(), was.model_dump()))
+    save_characters(path, latest)
+
+
 def char_stats(ctx: Any, characters: dict[str, Any], speaker_id: str) -> dict[str, Any]:
     c = characters.get(speaker_id)
     return c.stats.model_dump() if c is not None else {}
@@ -216,6 +257,17 @@ def acquire_first(
     if group:
         record_unavailable(ctx, stage or getattr(ctx, "stage", "") or "stage", group, reason)
     return None, None, reason
+
+
+def resolve_backend(ctx: Any, name: str) -> tuple[Any, Any]:
+    """``ctx.models.resolve(name)`` where a name the registry does not have (a typo in the config, or an old name such as
+    ``librosa``) is a :class:`BackendUnavailable` with the registry's "did you mean" list, not a bare ``KeyError``
+    that ends the stage."""
+    try:
+        return ctx.models.resolve(name)
+    except KeyError as e:
+        msg = str(e.args[0]) if e.args else f"unknown backend {name!r}"
+        raise BackendUnavailable(name, msg, "the valid names are listed by `vndub models list`") from e
 
 
 _VRAM_MARKERS = ("out of memory", "cuda oom", "cublas_status_alloc_failed", "cudnn_status_alloc_failed", "vram")

@@ -489,6 +489,8 @@ def run(ctx: Any) -> dict[str, Any]:
                         cache.put(f"{j.cid}:tts", j.tts_key)  # the pre-VC wav is complete: a kill during VC does not redo it
                 else:
                     _finish(ctx, cache, j)
+            # progress last: it is where the app's cancel is raised, so every take of the chunk is on disk and in the cache by then
+            for j in part:
                 progress(j.line_id)
         if vram_failed:
             reason = f"out of memory on {len(vram_failed)} of {len(js)} item(s): {vram_failed[0].error[:160]}"
@@ -547,6 +549,7 @@ def run(ctx: Any) -> dict[str, Any]:
                     j.error = "vc returned no audio"
                 j.elapsed += el
                 _finish(ctx, cache, j)
+            for j in part:  # (after the whole chunk is recorded: the cancel check lives in progress)
                 progress(j.line_id)
         if vram_failed:
             reason = f"out of memory on {len(vram_failed)} of {len(js)} item(s): {vram_failed[0].error[:160]}"

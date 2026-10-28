@@ -1,4 +1,4 @@
-"""Chatterbox Multilingual V3 (Resemble AI, MIT), own ``chatterbox`` env.
+"""Chatterbox Multilingual (Resemble AI, MIT), own ``chatterbox`` env; chatterbox-tts 0.1.7 runs its V2 T3 checkpoint.
 
 Emotion via ``exaggeration`` (mapped from arousal into [0.3, 1.2]);
 ``cfg_weight=0`` for cross-lingual references (documented accent mitigation).
@@ -21,8 +21,10 @@ SPECS = [
             WeightSpec(
                 "hf",
                 repo="ResembleAI/chatterbox",
-                allow=("ve.pt", "s3gen.pt", "t3_mtl23ls_v3.safetensors", "t3_mtl23ls_v2.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json", "tokenizer.json"),
-                size_gb=3.0,
+                # chatterbox-tts 0.1.7 ``from_local(ckpt_dir, device)`` loads t3_mtl23ls_v2 and has no ``t3_model`` argument, so the
+                # 2.1 GB v3 checkpoint would only be downloaded to sit unused; measured on the hub (HF tree API): these files sum to 3.21 GB
+                allow=("ve.pt", "s3gen.pt", "t3_mtl23ls_v2.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json", "tokenizer.json"),
+                size_gb=3.2,
             ),
         ),
         options={"exaggeration_range": [0.3, 1.2], "cfg_weight": 0.5, "cfg_weight_cross_lingual": 0.0, "temperature": 0.8},

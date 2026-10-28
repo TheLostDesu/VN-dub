@@ -303,7 +303,7 @@ def kill_descendants(pid: int | None = None) -> int:
             if cur not in spared:
                 spared.add(cur)
                 todo.extend(children.get(cur, []))
-        order: list[tuple[int, str]] = []
+        order: list[tuple[int, str, int]] = []  # (pid, image, creation time): the time proves the pid is still that process
         seen = {root}
         todo = [(root, root_meta.created if root_meta else 0)]
         while todo:
@@ -315,16 +315,23 @@ def kill_descendants(pid: int | None = None) -> int:
                 m = api.meta(c)
                 if m is not None and cur_created and m.created and m.created < cur_created:
                     continue  # older than its "parent": the parent pid was reused, this is somebody else's child
-                order.append((c, m.image if m else snap[c][1]))
+                order.append((c, m.image if m else snap[c][1], m.created if m else 0))
                 todo.append((c, m.created if m else 0))
         killed = 0
-        for c, image in reversed(order):  # leaves first, so a parent cannot respawn a child it is watching
-            h = api.k32.OpenProcess(PROCESS_TERMINATE, False, c)
+        for c, image, created in reversed(order):  # leaves first, so a parent cannot respawn a child it is watching
+            h = api.k32.OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, False, c)
             if h:
-                if api.k32.TerminateProcess(h, 1):
-                    killed += 1
-                    log.info("terminated pid %d (%s): descendant of pid %d at the end of the app", c, image, root)
-                api.k32.CloseHandle(h)
+                try:
+                    if created:  # like kill_processes: a descendant that ended since the snapshot may have handed its pid to a stranger
+                        now = api.meta_of(h)
+                        if now is None or not now.alive or (now.created and now.created != created):
+                            log.info("not terminating pid %d: it is no longer %s", c, image)
+                            continue
+                    if api.k32.TerminateProcess(h, 1):
+                        killed += 1
+                        log.info("terminated pid %d (%s): descendant of pid %d at the end of the app", c, image, root)
+                finally:
+                    api.k32.CloseHandle(h)
         return killed
     except Exception as e:
         log.warning("kill_descendants failed: %s", e)
@@ -493,7 +500,7 @@ class ProcInfo:
     env: str | None  # folder directly under the envs root (``main``, ``_uv`` ...) when the image lies under <envs>/<env>/
     role: str  # adapter | llama_server | tool | other
     ours: bool  # a descendant of this process
-    orphan: bool  # its parent is gone, or no chain of live parents leads to a VNDub
+    orphan: bool  # its parent is gone (or is itself an orphan of the app's); a live parent that is none of the app's means somebody uses it
     started: int = 0  # creation time (FILETIME ticks): kill_processes uses it to be sure the pid still means this process
 
     def public(self) -> dict[str, Any]:
@@ -529,6 +536,7 @@ class _Scan:
         self.roots = [_root_forms(r) for r in roots]
         self.snap = self.api.snapshot()
         self._meta: dict[int, Meta | None] = {}
+        self._env_ok: dict[str, bool] = {}
         self.me = os.getpid()
         self.me_meta = self.meta(self.me)
         self.self_image = _norm(self.me_meta.image) if self.me_meta else ""
@@ -548,6 +556,27 @@ class _Scan:
                     return i, img[len(f) + 1:]
         return None
 
+    def scoped(self, image: str) -> tuple[int, str] | None:
+        """:meth:`locate`, but under the envs folder (``roots[0]``) only what belongs to an environment counts: ``<env>/`` folders that
+        hold a ``pyvenv.cfg`` and ``_uv`` (uv's Pythons), or the root itself when it is one environment (the installer frees one env
+        folder). The envs folder is chosen by the user and may be a whole drive or a shared folder like ``D:/AI``: a program of the user's that
+        happens to run from there is not an adapter of ours and must never be a kill target."""
+        where = self.locate(image)
+        if where is None or where[0] != 0:
+            return where
+        root, rel = self.roots[0][0], where[1]
+        if os.sep not in rel:
+            first = ""  # a file directly in the envs folder
+        else:
+            first = rel.split(os.sep)[0]
+        key = first.lower()
+        if key not in self._env_ok:
+            self._env_ok[key] = (
+                os.path.isfile(os.path.join(root, "pyvenv.cfg"))
+                or (bool(first) and (key == UV_ENV_DIR or os.path.isfile(os.path.join(root, first, "pyvenv.cfg"))))
+            )
+        return where if self._env_ok[key] else None
+
     def is_vndub(self, image: str) -> bool:
         """Is this a running VNDub: a ``VNDub.exe`` or the same program as this process (a source run)? Never something under the roots:
         an environment's interpreter can be the same Python build as the app's and is not the app."""
@@ -557,22 +586,28 @@ class _Scan:
     def judge(self, pid: int, created: int) -> tuple[bool, bool]:
         """``(ours, orphan)``: climb the chain of parents up to this process or to the end of the chain.
 
-        Reaching this process: ours. A chain that ends (the parent is gone, or its pid now belongs to a younger process) is an
-        orphan, unless it passed a running VNDub on the way up (another instance owns it: neither ours nor an orphan).
+        * Reaching this process: ours, whatever lies between.
+        * The parent is gone, or its pid now belongs to a younger process, and no running VNDub and no process of somebody else
+          lies below that point: an orphan. This is "the parent is dead, or the parent is itself an orphan": every process on
+          the way is one of the app's own (under the roots), so nobody who started the process is still around to use it.
+        * A running VNDub on the way up (another instance owns it): neither ours nor an orphan.
+        * A live parent that is none of the app's (a shell, a notebook, an IDE, a hand-started tool) means somebody is using the
+          process: never an orphan, however the chain above that parent ends. Most of the user's processes have a chain that ends
+          in a dead parent (Explorer's own parent is long gone), so "the chain ends" alone proves nothing.
         """
-        cur, cur_created, saw_vndub = pid, created, False
+        cur, cur_created, other_owner = pid, created, False
         for _ in range(64):
             ppid = self.snap.get(cur, (0, ""))[0]
             if ppid <= 0 or ppid == cur or ppid not in self.snap:
-                return False, not saw_vndub
+                return False, not other_owner
             pm = self.meta(ppid)
             if pm is None:
                 return False, False  # a live parent we may not look at (another user, protected): do not guess
             if not pm.alive or (cur_created and pm.created and pm.created > cur_created):
-                return False, not saw_vndub
+                return False, not other_owner
             if ppid == self.me:
                 return True, False
-            saw_vndub = saw_vndub or self.is_vndub(pm.image)
+            other_owner = other_owner or self.is_vndub(pm.image) or self.scoped(pm.image) is None
             cur, cur_created = ppid, pm.created
         return False, False
 
@@ -584,7 +619,7 @@ class _Scan:
             m = self.meta(pid)
             if m is None or not m.alive:
                 continue
-            where = self.locate(m.image)
+            where = self.scoped(m.image)
             if where is None:
                 continue
             idx, rel = where
@@ -636,10 +671,12 @@ def list_processes(roots: Iterable[str | os.PathLike[str]]) -> list[ProcInfo]:
     the other roots are tool folders (role ``tool``; ``llama-server*.exe`` is ``llama_server`` anywhere). One snapshot of the
     process table, every candidate opened once.
 
-    ``ours``: a descendant of this process. ``orphan``: its parent is gone, or the chain of its live parents does not lead
-    to a running VNDub (this process or another ``VNDub.exe``), so nobody who started it is still around to use it. A
-    parent pid that has been reused by a younger process counts as gone (the creation times are compared), which also
-    keeps the orphans of an earlier run from posing as children of this one when Windows hands out the same pid again.
+    ``ours``: a descendant of this process. ``orphan``: its parent is gone, or its parent is itself one of the app's processes
+    (under the roots) that is an orphan, so nobody who started it is still around to use it; a process with a live parent that
+    is none of the app's (the user's shell, a notebook, a hand-started ``llama-server``) is never an orphan, and neither is one
+    below a running ``VNDub.exe`` (another instance owns it). A parent pid that has been reused by a younger process counts as
+    gone (the creation times are compared), which also keeps the orphans of an earlier run from posing as children of this one
+    when Windows hands out the same pid again. Under ``roots[0]`` only environments count (:meth:`_Scan.scoped`).
     """
     if os.name != "nt":
         return []

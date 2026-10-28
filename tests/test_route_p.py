@@ -3,7 +3,6 @@ tuning cache invalidation, progress reporting, and where pack puts the unvoiced 
 
 from __future__ import annotations
 
-import json
 import shutil
 import statistics
 from pathlib import Path
@@ -16,12 +15,10 @@ from tests.genproj import build, speechlike
 from tests.p3_helpers import add_unvoiced
 from tests.test_pack import _manifest, _setup
 from vndub.audio import features, loudness
-from vndub.backends import registry
-from vndub.config import ProjectYaml, save_project_yaml
 from vndub.engines import xp3
-from vndub.manifest.io import FinalIndexRecord, SelectionRecord, load_characters, read_json, read_jsonl, save_characters, write_json, write_jsonl
+from vndub.manifest.io import FinalIndexRecord, SelectionRecord, load_characters, read_json, read_jsonl, write_json, write_jsonl
 from vndub.review.app import write_override
-from vndub.stages import master, pack, score, synth, voicebank
+from vndub.stages import master, score, synth, voicebank
 from vndub.stages.common import run_stage
 from vndub.stages.score import apply_scores, composite, evaluate_gates, terms
 

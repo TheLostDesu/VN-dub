@@ -25,7 +25,12 @@ A metric group whose backend cannot be acquired (VRAM taken by an orphan process
 through ``ctx.models.record_unavailable("score", group, reason)`` and noted on every candidate that lacks it. When it is a
 GATE group (``mos`` -> utmos, ``speaker`` -> spk_sim, ``cer`` -> cer) the gate cannot be evaluated, and a candidate that
 passed only because that gate was skipped must not be accepted on its own: the line's selection becomes ``review`` with
-the reason (see :func:`unchecked_gates`; it also works from the stored notes, so ``--reweight`` keeps the verdict).
+the reason (see :func:`unchecked_gates`; it also works from the stored notes, so ``--reweight`` keeps the verdict). Among the
+passing takes the fully checked ones rank first (a take without a CER has a composite renormalised without that term and must not
+outrank one that passed every gate); a line whose best take has no gate at all that could be evaluated goes to review at once, a new
+take could not be judged either. A take with no reference voice to compare with (no voicebank clip, performer clip or original line
+could be embedded) has its speaker gate unchecked too (``speaker failed: no reference voice to compare with``). ``--force`` computes
+every metric again (the embedding files on disk, keyed by the audio's mtime, are still reused).
 
 Laughter: an ASR model transcribes a laugh as nothing or as random syllables, so the CER is computed over the words
 only: :func:`cer_words` takes the laughs (``vndub.text.laughter``) out of the reference and of the transcript
@@ -343,14 +348,20 @@ def select(
         return rec(None, "review", f"no candidates{f' ({n_failed} failed generations)' if n_failed else ''}{unavail_note}")
     passing = [c for c in pool if c.passed]
     if passing:
-        best = max(passing, key=lambda c: c.composite or 0.0)
-        skipped = unchecked_gates(best, unavailable)
+        # a take whose gate could not be checked has a composite renormalised without that term, so it can outrank a take
+        # that passed every gate: rank the fully checked takes first, the composite only decides among equals
+        open_gates = {c.wav: unchecked_gates(c, unavailable) for c in passing}
+        best = max(passing, key=lambda c: (not open_gates[c.wav], c.composite or 0.0))
+        skipped = open_gates[best.wav]
         if skipped:
             # it passed the gates that ran; a gate that could not run (no backend) may have caught it: a person decides
             what = "; ".join(f"{GATE_LABELS[g]}: {r[:100]}" for g, r in skipped.items())
             return rec(best, "review", f"best of {len(passing)} passing, but not accepted automatically: gate not checked ({what})")
         return rec(best, "auto", f"best of {len(passing)} passing{unavail_note}")
     best = max(pool, key=lambda c: c.composite if c.composite is not None else -1.0)
+    if not best.gates:
+        # not one gate ran (every metric group unavailable, no reference audio): a new take cannot be judged either
+        return rec(best, "review", f"no gate could be evaluated: nothing to judge the takes by{unavail_note}")
     why = (best.model_extra or {}).get("failures") or "no gate could be evaluated"
     if is_laughter_line(best):
         why += " (laughter only, no words to check)"
@@ -521,6 +532,7 @@ def run(ctx: Any) -> dict[str, Any]:
     calib = read_json(ctx.paths.spk_calibration)
     thr, thr_src = spk_threshold(cfg, calib)
     reweight = bool(ctx.extra.get("reweight"))
+    force = bool(ctx.force) and not reweight  # --force: every metric is computed again (a reweight never looks at a model)
     mkey = _metric_key(cfg)
     unavailable: dict[str, str] = {}
     if cfg.score.emotion != cfg.analyze.e2v:
@@ -550,11 +562,11 @@ def run(ctx: Any) -> dict[str, Any]:
             rel = ctx.paths.rel(wav)
             fp = file_fingerprint(wav)
             prev = old.get(rel)
-            saved = None if reweight else partial.lookup(f"{line.line_id}|{wav.stem}", fp)
+            saved = None if (reweight or force) else partial.lookup(f"{line.line_id}|{wav.stem}", fp)
             if saved is not None:  # a killed run got this far (it started from the final record, if there was one)
                 record = CandidateScore.model_validate(saved)
                 restored += 1
-            elif prev is not None and (reweight or ((prev.model_extra or {}).get("fp") == fp and (prev.model_extra or {}).get("mkey") == mkey)):
+            elif prev is not None and (reweight or (not force and (prev.model_extra or {}).get("fp") == fp and (prev.model_extra or {}).get("mkey") == mkey)):
                 record = prev
             else:
                 record = CandidateScore(line_id=line.line_id, wav=rel, backend=side.backend, route=side.route, metrics={})
@@ -622,7 +634,7 @@ def run(ctx: Any) -> dict[str, Any]:
         summary["resumed_candidates"] = restored
     if unavailable:
         summary["metrics_unavailable"] = unavailable
-    unchecked = sum(1 for x in selections if x.status == "review" and "gate not checked" in x.reason)
+    unchecked = sum(1 for x in selections if x.status == "review" and ("gate not checked" in x.reason or "no gate could be evaluated" in x.reason))
     if unchecked:
         summary["lines_with_unchecked_gates"] = unchecked
     hopeless = sum(1 for x in selections if x.status == "review" and "a new take would not help" in x.reason)
@@ -809,6 +821,8 @@ def _compute_groups(ctx: Any, cands: list[Cand], unavailable: dict[str, str], pa
                     if want == "char":
                         refs = [r for r in gu.load_refs(ctx, sid) if r.usage in ("timbre", "both")] or gu.load_refs(ctx, sid)
                         for r in refs:
+                            if not ctx.paths.abs(r.path).exists():
+                                continue  # (embed_paths stats the wav even when the cached .npy is there: a gone clip must not end the stage)
                             k = f"ref|{sid}|{r.path}"
                             jobs.append((k, ctx.paths.abs(r.path), ctx.paths.vb(sid) / "emb" / f"ref_{Path(r.path).stem}.{name}.npy"))
                             keys.append(k)
@@ -825,7 +839,7 @@ def _compute_groups(ctx: Any, cands: list[Cand], unavailable: dict[str, str], pa
 
             for c in todo:
                 keys, _ = ref_keys(c.line.speaker_id, c.rec.route)
-                if not keys and (c.line.src_wav16 or c.line.src_wav):
+                if not keys and (c.line.src_wav16 or c.line.src_wav) and ctx.paths.abs(c.line.src_wav16 or c.line.src_wav).exists():
                     k = f"orig|{c.line.line_id}"
                     jobs.append((k, ctx.paths.abs(c.line.src_wav16 or c.line.src_wav), c.emb_dir / f"orig.{name}.npy"))
                 jobs.append((f"cand|{c.cid}", c.wav, c.emb_dir / f"{c.wav.stem}.{name}.npy"))
@@ -847,6 +861,10 @@ def _compute_groups(ctx: Any, cands: list[Cand], unavailable: dict[str, str], pa
                     elif kind == "perf":
                         c.rec.notes = [*c.rec.notes, "spk_sim vs the performer's sample (consistency; no original voice)"]
                     partial.touch(c)
+                else:
+                    # nothing to compare the take with (no reference clip, or none could be embedded): the gate is unchecked and the
+                    # line goes to a person, instead of the take passing without a speaker check
+                    failed(c, "speaker", "no reference voice to compare with")
             prog.add(len(todo), todo[-1].line.line_id)
         if s.speaker_extra:
             b2, name2 = _acquire(ctx, [s.speaker_extra], "speaker_extra", unavailable)

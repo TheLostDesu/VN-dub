@@ -29,6 +29,18 @@ def _n(value: int | float, **kw) -> str:
     return num2words(value, lang="ru", **kw)
 
 
+def _keep_unreadable(fn: Callable[[re.Match[str]], str]) -> Callable[[re.Match[str]], str]:
+    """Wrap a ``re.sub`` callback so a token num2words cannot spell (34+ digit runs raise KeyError) stays as written."""
+
+    def wrapper(m: re.Match[str]) -> str:
+        try:
+            return fn(m)
+        except (KeyError, IndexError, OverflowError, ValueError):
+            return m.group(0)
+
+    return wrapper
+
+
 # ----------------------------------------------------------------------------
 # numbers
 # ----------------------------------------------------------------------------
@@ -73,8 +85,9 @@ def _ordinal(num: int, suffix: str) -> str:
 
 def normalize_numbers(text: str) -> str:
     t = text or ""
-    t = _NO_PERIOD.sub(lambda m: "номер " + _n(int(m.group(1))), t)
+    t = _NO_PERIOD.sub(_keep_unreadable(lambda m: "номер " + _n(int(m.group(1)))), t)
 
+    @_keep_unreadable
     def time_sub(m: re.Match[str]) -> str:
         h, mi = int(m.group(1)), int(m.group(2))
         if mi == 0:
@@ -83,6 +96,7 @@ def normalize_numbers(text: str) -> str:
 
     t = _TIME.sub(time_sub, t)
 
+    @_keep_unreadable
     def pct_sub(m: re.Match[str]) -> str:
         raw = m.group(1).replace(",", ".")
         if "." in raw:
@@ -91,10 +105,10 @@ def normalize_numbers(text: str) -> str:
         return f"{_n(v)} {_plural_form(v, 'процент', 'процента', 'процентов')}"
 
     t = _PERCENT.sub(pct_sub, t)
-    t = _ORD.sub(lambda m: _ordinal(int(m.group(1)), m.group(2)), t)
-    t = _RANGE.sub(lambda m: f"от {_n(int(m.group(1)), case='g')} до {_n(int(m.group(2)), case='g')}", t)
-    t = _DECIMAL.sub(lambda m: _n(float(f"{m.group(1)}.{m.group(2)}")), t)
-    t = _INT.sub(lambda m: _n(int(m.group(0))), t)
+    t = _ORD.sub(_keep_unreadable(lambda m: _ordinal(int(m.group(1)), m.group(2))), t)
+    t = _RANGE.sub(_keep_unreadable(lambda m: f"от {_n(int(m.group(1)), case='g')} до {_n(int(m.group(2)), case='g')}"), t)
+    t = _DECIMAL.sub(_keep_unreadable(lambda m: _n(float(f"{m.group(1)}.{m.group(2)}"))), t)
+    t = _INT.sub(_keep_unreadable(lambda m: _n(int(m.group(0)))), t)
     return t
 
 
@@ -108,6 +122,8 @@ _ABBR = [
     (re.compile(r"\bи\s+т\.\s?п\.", re.I), "и тому подобное"),
     (re.compile(r"\bт\.\s?к\.", re.I), "так как"),
     (re.compile(r"\bи\s+др\.", re.I), "и другие"),
+    # "160 см." is centimetres; only a "см." that does not follow a number means "see" (the period stays: it may end the sentence)
+    (re.compile(r"(?<=\d)\s?см(?![\wа-яёА-ЯЁ])", re.I), " сантиметров"),
     (re.compile(r"\bсм\.", re.I), "смотри"),
     (re.compile(r"\bул\.", re.I), "улица"),
     (re.compile(r"\bруб\.", re.I), "рублей"),
@@ -116,7 +132,7 @@ _ABBR = [
     (re.compile(r"\bмлн\.?", re.I), "миллионов"),
     (re.compile(r"\bмлрд\.?", re.I), "миллиардов"),
     (re.compile(r"\bкм\b\.?"), "километров"),
-    (re.compile(r"\b(\d+)\s?г\.", re.I), lambda m: _n(int(m.group(1)), to="ordinal") + " год"),
+    (re.compile(r"\b(\d+)\s?г\.", re.I), _keep_unreadable(lambda m: _n(int(m.group(1)), to="ordinal") + " год")),
     (re.compile(r"\bг\.\s(?=[А-ЯЁ])"), "город "),
 ]
 
@@ -146,7 +162,8 @@ def expand_abbreviations(text: str) -> str:
 
 def strip_stress(text: str) -> str:
     t = unicodedata.normalize("NFD", text or "")
-    t = t.replace("́", "").replace("+", "")
+    # a "+" is a stress mark only directly before a vowel; "2+2" keeps its plus
+    t = re.sub(r"\+(?=[" + VOWELS + _LAT_VOWELS + r"])", "", t.replace("́", ""))
     return unicodedata.normalize("NFC", t)
 
 

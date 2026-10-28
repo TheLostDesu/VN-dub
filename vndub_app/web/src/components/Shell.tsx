@@ -161,7 +161,9 @@ export function ActiveJobBar({ currentStep }: { currentStep: StepId | null }) {
   );
 }
 
-let resumeDismissed = false;
+// Games for which the "continue where you left off?" question was dismissed in this session. Per game: closing it for one
+// game must not hide the question for another one that also has an interrupted job.
+const resumeDismissed = new Set<string>();
 
 /** "Продолжить с того места, где остановились?" when the last job was interrupted. */
 export function ResumePrompt() {
@@ -169,7 +171,8 @@ export function ResumePrompt() {
   const { project, reload } = useProject();
   const wiz = useWizard();
   const active = useActiveJob();
-  const [dismissed, setDismissed] = useState(resumeDismissed);
+  const [, rerender] = useState(0);
+  const dismissed = !!project && resumeDismissed.has(project.slug);
   const [error, setError] = useState<ErrorInfo | null>(null);
   const [busy, setBusy] = useState(false);
   const [keepShutdown, setKeepShutdown] = useState(false);
@@ -187,8 +190,8 @@ export function ResumePrompt() {
   const others = Array.from(new Set((project.resume.candidates ?? []).map((j) => tOr(j.title_key, t(`jobs.${j.kind}`)))));
 
   const dismiss = () => {
-    resumeDismissed = true;
-    setDismissed(true);
+    resumeDismissed.add(project.slug);
+    rerender((n) => n + 1);
   };
   const go = async () => {
     setBusy(true);
@@ -197,8 +200,8 @@ export function ResumePrompt() {
       const job = await api.resumeProject({ keep_shutdown: hadShutdown && keepShutdown });
       ingestJob(job);
       await reload();
-      resumeDismissed = true;
-      setDismissed(true);
+      resumeDismissed.add(project.slug);
+      rerender((n) => n + 1);
       const target = stepForJobKind(job.kind) ?? stepForJobKind(kind);
       if (target) wiz.goto(target);
     } catch (e) {

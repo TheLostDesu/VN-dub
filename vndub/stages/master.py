@@ -86,7 +86,11 @@ def target_lufs(ctx: Any, sid: str, chars: dict[str, Any], game_median: float | 
     return float(ctx.cfg.master.loudness.default_lufs), "default"
 
 
-_UNVOICED_EXT = {"vorbis": "ogg", "opus": "opus", "mp3": "mp3", "flac": "flac", "aac": "m4a", "pcm_s16le": "wav"}
+# every codec of _CODEC_MAP needs an entry: a PCM variant is encoded as pcm_s16le, so the file is a wav whatever the original's width
+_UNVOICED_EXT = {
+    "vorbis": "ogg", "opus": "opus", "mp3": "mp3", "flac": "flac", "aac": "m4a",
+    "pcm_s16le": "wav", "pcm_s24le": "wav", "pcm_f32le": "wav", "pcm_u8": "wav",
+}
 
 
 def unvoiced_name(line: LineRecord, codec: str | None) -> str:

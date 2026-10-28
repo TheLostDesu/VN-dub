@@ -154,7 +154,7 @@ The script text is the source of truth; the original audio is only an intonation
   A line is `ok` when every available signal agrees, `review` otherwise (reasons above, also in
   `review_queue.jsonl` with the `signals` dict `{dur_ratio, morae, voice_prefix, voice_index, no_text}`),
   `unmatched` only when the audio is missing (`audio_missing:<ref>`: the decoded clip is gone or the
-  script references a voice file that does not exist). No auto-repair: nothing is moved, orphan files
+  script references a voice file that does not exist); a clip of zero length is `review` with `audio_empty`. No auto-repair: nothing is moved, orphan files
   stay unbound. Summary adds `mode`, `confidence` (share of judged lines with all signals ok, 0..1),
   `outliers` (review + unmatched), `suggest_asr_check` (true when >= 5 lines were judged and the
   outlier share is at least `suggest_asr_share`, default 0.2: a healthy game flags a few percent;
@@ -517,8 +517,12 @@ Out: `out/<engine>/...` + `INSTALL.md` + `manifest_patch.json` (file, sha256, li
 backend, route, status; `reason` for provisional lines). Both state what the patch covers: how many of the dubbed
 lines have a file, how many of those are provisional ("best take installed, check it in Review"), how many are LEFT
 OUT and why (`review` / `regen` with `include_review_lines: skip`, `no winner`, `not mastered`; each listed in
-`manifest_patch.json` under `coverage.left_out_lines`), and how many narration lines are never dubbed. INSTALL.md is
-rebuilt on every pack (its sections never pile up). The pack summary carries `provisional` / `left_out` / `unnamed`.
+`manifest_patch.json` under `coverage.left_out_lines`), how many narration lines are never dubbed, and (Ren'Py) how
+many speaker lines are NOT INSTALLABLE because the script gives them a `voice` statement of their own (`own_voice`,
+`own_voice_lines`: `config.auto_voice` is never asked for them). INSTALL.md is rebuilt on every pack (its sections
+never pile up). A full pack also removes the files of the previous patch that the new one does not contain (nothing
+else under `out/<engine>` is touched; `--only` never deletes). The pack summary carries `provisional` / `left_out` /
+`own_voice` / `unnamed`.
 Ren'Py: loose `game/<voice>`; NScripter: loose files beside the exe;
 KiriKiri: `patchN.xp3` (Xp3Pack or the built-in unencrypted writer) or `unencrypted/`;
 Unity: UnityPy replacement script + checklist (experimental); others: directory layout +

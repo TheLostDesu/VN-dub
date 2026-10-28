@@ -414,7 +414,7 @@ def update_local_tools(updates: dict[str, str]) -> dict[str, str]:
             "# written by the VNDub installer (tool name -> executable)\n" + yaml.safe_dump({"tools": tools}, allow_unicode=True, sort_keys=True),
             encoding="utf-8",
         )
-        os.replace(tmp, f)
+        appdirs.replace_atomic(tmp, f)  # waits out a reader (a config refresh), and removes the tmp file when it cannot replace
         return tools
 
 
@@ -927,16 +927,28 @@ UTF8_SITECUSTOMIZE = (
 
 
 def ensure_utf8_output(py: Path) -> Path | None:
-    """Make every script run by ``py`` write UTF-8 to pipes (``sitecustomize.py`` in its site-packages)."""
+    """Make every script run by ``py`` write UTF-8 to pipes (``sitecustomize.py`` in its site-packages).
+
+    The child prints its site-packages path, which may hold non-ASCII characters (a user name with "e" umlaut, a Japanese
+    folder): ``-X utf8`` makes it write UTF-8 whatever the console code page (cp1251 / cp932) is, and the answer is read as
+    UTF-8. Without that the child died with ``UnicodeEncodeError`` and the sitecustomize was never installed.
+    Returns ``None`` (and says why in the log) when the file could not be placed.
+    """
+    why = ""
     try:
         r = subprocess.run(
-            [str(py), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
-            capture_output=True, text=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+            [str(py), "-X", "utf8", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
         )
         site = Path(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else None
-    except (OSError, subprocess.SubprocessError, IndexError):
-        site = None
+        if site is None:
+            last = (r.stderr or "").strip().splitlines()[-1:]  # the last line of a traceback names the error
+            why = f"exit code {r.returncode}: {last[0] if last else 'no output'}"
+    except (OSError, subprocess.SubprocessError, IndexError) as e:
+        site, why = None, f"{type(e).__name__}: {e}"
     if site is None or not site.is_dir():
+        log.warning("no UTF-8 sitecustomize for %s: its site-packages folder is unknown (%s)", py, why or f"{site} is not a folder")
         return None
     f = site / "sitecustomize.py"
     if not f.exists() or f.read_text(encoding="utf-8", errors="replace") != UTF8_SITECUSTOMIZE:
@@ -1466,6 +1478,22 @@ class EnvsInstallBody(BaseModel):
     torch: str = "auto"
 
 
+def _refuse_when_busy(kinds: tuple[str, ...] | None) -> Callable[[list[Any]], None]:
+    """The ``guard`` of the install jobs (``JobRunner.submit`` runs it under the runner's lock, so it is check-and-queue in one step).
+
+    ``kinds``: refuse (409 ``job_busy``) while a job of one of these kinds is active; ``None``: while any job is. An environments
+    install ends every process of the environments it rebuilds (:func:`free_folders`), the adapters of a running dub included, and
+    two installs at once would run ``make_envs`` on the same folders; the buttons of the UI already exclude each other, this is the
+    server's own guard."""
+
+    def guard(active: list[Any]) -> None:
+        busy = next((j for j in active if kinds is None or j.kind in kinds), None)
+        if busy is not None:
+            raise AppError("job_busy", params={"job_id": busy.id, "kind": busy.kind}, status=409)
+
+    return guard
+
+
 @router.get("/api/tools")
 def api_tools() -> list[dict[str, Any]]:
     return list_tools()
@@ -1480,7 +1508,10 @@ def api_tools_install(body: ToolsInstallBody) -> dict[str, Any]:
     for n in body.names:
         get_entry(n)  # unknown name -> 422 before a job is created
     names = list(body.names)
-    job = jobs.runner().submit("tools_install", lambda ctx: install_tools(names, ctx), params={"names": names}, gpu=False)
+    job = jobs.runner().submit(
+        "tools_install", lambda ctx: install_tools(names, ctx), params={"names": names}, gpu=False,
+        guard=_refuse_when_busy(("tools_install", "envs_install")),
+    )
     return job.info()
 
 
@@ -1500,5 +1531,8 @@ def api_envs_install(body: EnvsInstallBody) -> dict[str, Any]:
     if bad or not body.envs:
         raise AppError("bad_request", params={"field": "envs", "value": ",".join(bad)}, details=f"unknown envs {bad}", status=422)
     envs, torch = list(body.envs), body.torch
-    job = jobs.runner().submit("envs_install", lambda ctx: install_envs(envs, torch, ctx), params={"envs": envs, "torch": torch}, gpu=False)
+    job = jobs.runner().submit(
+        "envs_install", lambda ctx: install_envs(envs, torch, ctx), params={"envs": envs, "torch": torch}, gpu=False,
+        guard=_refuse_when_busy(None),
+    )
     return job.info()

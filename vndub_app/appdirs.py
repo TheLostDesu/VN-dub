@@ -36,6 +36,7 @@ import os
 import re
 import sys
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -511,7 +512,7 @@ def write_project_config(h: ProjectHandle, settings: Settings | None = None) -> 
     with _WRITE_LOCK:  # request threads and job threads both regenerate it
         tmp = h.config_file.with_name(f"{h.config_file.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, h.config_file)
+        replace_atomic(tmp, h.config_file)
     return h.config_file
 
 
@@ -527,11 +528,44 @@ def read_json(path: Path, default: Any = None) -> Any:
         return default
 
 
+REPLACE_TRIES = 10  # os.replace attempts before a PermissionError is given up on ...
+REPLACE_PAUSE_S = 0.03  # ... with this pause between them (0.3 s at most)
+
+
+def replace_atomic(tmp: Path, path: Path) -> None:
+    """``os.replace(tmp, path)`` that waits out a reader. On Windows the replace fails with ``PermissionError`` (a sharing
+    violation) while another thread has ``path`` open, and ``load_settings`` opens ``settings.json`` on nearly every request.
+    Retries a few times with a short pause; when it still fails ``tmp`` is deleted (no stray temp file) and the error raised."""
+    try:
+        for attempt in range(REPLACE_TRIES):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == REPLACE_TRIES - 1:
+                    raise
+                time.sleep(REPLACE_PAUSE_S)
+    except BaseException:
+        try:
+            Path(tmp).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def write_json_atomic(path: Path, data: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(data, ensure_ascii=False, indent=2)
+    try:
+        payload = text.encode("utf-8")
+    except UnicodeEncodeError:  # a lone surrogate (an odd NTFS file name in a log line): ASCII escapes keep it and json.loads restores it
+        payload = json.dumps(data, ensure_ascii=True, indent=2).encode("utf-8")
     with _WRITE_LOCK:  # several threads write settings / state / job records; a shared temp name would collide
         tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            tmp.write_bytes(payload)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        replace_atomic(tmp, path)

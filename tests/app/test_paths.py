@@ -554,3 +554,48 @@ def test_data_dir_switch_takes_the_default_envs_along(s_env: Path, tmp_path: Pat
 
         jobs.reset_runner(None)
         server.close_logging()
+
+
+# ---- a drive root or the profile folder is not a place for the app's folders ----------------------------------------------------
+
+
+def test_is_broad_folder_knows_roots_and_the_profile_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "Users" / "me"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    anchor = Path(tmp_path.anchor)
+    assert general.is_broad_folder(anchor)  # D:\ or C:\
+    assert general.is_broad_folder(Path(str(anchor).replace("\\", "/")))  # spelled the other way round
+    assert general.is_broad_folder(home)  # the profile folder ...
+    assert general.is_broad_folder(home.parent)  # ... and the folder above it (C:\Users)
+    assert general.is_broad_folder(tmp_path / "Users" / "me" / ".." / "me")  # a roundabout spelling of the same
+    assert not general.is_broad_folder(home / "VNDub")  # a folder of its own is fine
+    assert not general.is_broad_folder(home / "AppData" / "Local" / "VNDub")
+    assert not general.is_broad_folder(tmp_path / "AI")
+    assert not general.is_broad_folder(Path(str(anchor)) / "VNDub")
+
+
+def test_put_envs_and_models_dir_refuse_a_drive_root_and_the_profile_folder(s_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "profile"
+    home.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    c = client_for(general)
+    for field in ("envs_dir", "models_dir"):
+        for bad in (tmp_path.anchor, str(home)):
+            r = c.put("/api/settings", json={field: bad})
+            err = r.json()["error"]
+            assert r.status_code == 422 and err["code"] == "permission_denied" and err["params"]["path"] == bad, (field, bad, r.text)
+            assert "drive root" in err["details"]
+            assert c.get("/api/settings").json()[field] == ""  # nothing was saved
+    assert not (home / ".vndub_write_test").exists()  # refused before anything was written there
+    ok = c.put("/api/settings", json={"envs_dir": str(home / "VNDub-envs")})
+    assert ok.status_code == 200 and ok.json()["envs_dir"] == str(home / "VNDub-envs")
+
+
+def test_the_data_dir_cannot_be_a_drive_root_either(s_env: Path, tmp_path: Path) -> None:
+    c = client_for(general)
+    r = c.post("/api/settings/data-dir", json={"path": tmp_path.anchor})
+    assert r.status_code == 422 and r.json()["error"]["code"] == "permission_denied"
+    assert appdirs.data_dir() == s_env  # unchanged

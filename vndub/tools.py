@@ -24,6 +24,7 @@ class ToolInfo:
     engines: tuple[str, ...] = ()
     required: bool = False
     pip: str = ""  # pip-installable alternative
+    alt_exes: tuple[str, ...] = ()  # other names searched on PATH after ``exe``
 
 
 TOOL_INFO: dict[str, ToolInfo] = {
@@ -49,8 +50,9 @@ TOOL_INFO: dict[str, ToolInfo] = {
     "vntextpatch": ToolInfo("VNTextPatch", "text+names for 22 engines (extractlocal)", "https://github.com/arcusmaximus/VNTranslationTools/releases"),
     "llama_server": ToolInfo("llama-server", "local LLM server for translate", "https://github.com/ggml-org/llama.cpp/releases (Windows CUDA 12 build)"),
     "applio_dir": ToolInfo("", "Applio checkout used by the rvc env (if not in .venvs/rvc/src/Applio)", "https://github.com/IAHispano/Applio"),
-    "audiocpp": ToolInfo("audiocpp", "audio.cpp CLI (Fish S2 Pro and MOSS-TTS v1.5 GGUF)", "https://github.com/0xShug0/audio.cpp/releases"),
-    "zonos2_cli": ToolInfo("zonos2", "zonos2.cpp CLI", "https://github.com/Zyphra/zonos2.cpp/releases"),
+    # the shipped binaries are audiocpp_cli(.exe) and zonos2-cli(.exe); the first guesses stay as alternatives
+    "audiocpp": ToolInfo("audiocpp_cli", "audio.cpp CLI (Fish S2 Pro and MOSS-TTS v1.5 GGUF)", "https://github.com/0xShug0/audio.cpp/releases", alt_exes=("audiocpp",)),
+    "zonos2_cli": ToolInfo("zonos2-cli", "zonos2.cpp CLI", "https://github.com/Zyphra/zonos2.cpp/releases", alt_exes=("zonos2",)),
     "moss_tts_cli": ToolInfo("moss-tts", "MOSS-TTS llama.cpp CLI", "https://github.com/OpenMOSS/MOSS-TTS"),
 }
 
@@ -81,9 +83,10 @@ class Tools:
             return Path(found) if found else None
         info = TOOL_INFO.get(name)
         if info and info.exe:
-            found = shutil.which(info.exe)
-            if found:
-                return Path(found)
+            for exe in (info.exe, *info.alt_exes):
+                found = shutil.which(exe)
+                if found:
+                    return Path(found)
         return None
 
     def require(self, name: str, purpose: str = "") -> Path:

@@ -8,6 +8,7 @@ step skip with a reason when an earlier step failed. Total time is about three m
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -631,7 +632,7 @@ def test_22_full_run(flow: Flow) -> None:
     assert j["stage_index"] == 6 and j["result"]["shutdown"] is False and sum(j["result"]["score"].values()) >= 26
     assert j["stage"] == "report" and j["state"] == "done" and j["error"] is None
     cov = j["result"]["coverage"]  # what the patch built by this run covers (the Run screen's "done" callout)
-    assert set(cov) == {"dub_lines", "installed", "provisional", "provisional_review", "provisional_regen", "left_out", "left_out_reasons", "narration", "include_review_lines"}
+    assert set(cov) == {"dub_lines", "installed", "provisional", "provisional_review", "provisional_regen", "left_out", "left_out_reasons", "narration", "own_voice", "include_review_lines"}
     assert cov["dub_lines"] >= 26 and cov["installed"] + cov["left_out"] == cov["dub_lines"] and 0 <= cov["provisional"] <= cov["installed"]
     assert cov["include_review_lines"] == "provisional" and sum(cov["left_out_reasons"].values()) == cov["left_out"]
     assert cov["narration"] > 0, "the fixture has narration lines without a speaker"
@@ -667,6 +668,7 @@ def test_24_review_list_filters(flow: Flow) -> None:
     assert it["status"] in ("ok", "check", "failed") and it["touched"] is False and it["winner_label"] in ("A", "B", "C", "D")
     assert {i["patch"] for i in r["items"]} <= {"ok", "provisional"}, "after the full run every listed line has a file in the patch"
     assert {s["speaker_id"] for s in r["facets"]["speakers"]} >= {"sakura", "hero"} and {s["scene"] for s in r["facets"]["scenes"]} >= {"start", "after_menu"}
+    assert r["touched_count"] == 0, "the list says how many lines are touched in the whole project, whatever the filters show"
     # voiced -> audio delivery; unvoiced -> the text passport's layer
     by = {i["line_id"]: i for i in r["items"]}
     voiced = next(i for i in r["items"] if i["speaker_id"] == "sakura")
@@ -718,6 +720,10 @@ def test_25_review_detail(flow: Flow) -> None:
         assert {v["metric"] for v in c["verdicts"]} >= {"voice", "emotion", "quality"}
     assert d["why"] == [] and d["text_tts"] and d["refs"] and all(set(r) == {"path", "url", "emotion"} for r in d["refs"]) and d["tuning_override"] is None
     assert d["style_prompt"], "the winner's style prompt comes from its synth sidecar"
+    # a line's own tuning replaces the character's as a whole: the panel starts from the character's tuning (sakura's, set in test_16)
+    assert d["character_tuning"] == flow.get("/api/characters/sakura/tuning") and set(d["character_tuning"]) == {"pitch_st", "speed", "expressiveness", "energy", "timbre_preset", "character_note"}
+    # audio URLs carry the file's time stamp, so a take regenerated under the same name is a new URL to the player
+    assert re.fullmatch(r".+\.wav\?v=\d+", d["original_url"]) and all(re.fullmatch(r".+\.wav\?v=\d+", c["url"]) for c in cands)
     # an unvoiced line: no original, no voice / emotion verdicts against it
     hero = next(i for i in items if i["speaker_id"] == "hero")
     dh = flow.get(f"/api/review/lines/{hero['line_id']}")
@@ -824,6 +830,8 @@ def test_27_review_actions_and_apply(flow: Flow) -> None:
     assert ("set_text" in [a for _, a in tail]) and tail[-1] == (lc, "regen") and tail[-2] == (lc, "set_text"), "regen with text also records set_text first (as the Gradio tool does)"
     touched = flow.get("/api/review/lines", params={"q": ""})
     assert {i["line_id"] for i in touched["items"] if i["touched"]} == {la, lb, lc, ld}
+    assert touched["touched_count"] == 4
+    assert flow.get("/api/review/lines", params={"q": la})["touched_count"] == 4, "a filter does not shrink the project's touched count"
 
     # "mark all as route X where it passed"
     pr = flow.post("/api/review/prefer-route", {"route": "A", "speaker_id": "yui"})

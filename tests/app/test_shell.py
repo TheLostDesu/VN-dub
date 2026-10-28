@@ -1059,3 +1059,76 @@ def test_cleanup_sweeps_between_the_jobs_and_the_server_stop_when_asked_to(monke
     order.clear()
     shell._cleanup_for_exit(State(), Lock(), sweep=True)  # type: ignore[arg-type]
     assert order == ["jobs", "server", "lock"] and "terminating leftover processes failed: sweep broke" in caplog.text
+
+
+# ---- release 1.0 hardening ----------------------------------------------------------------------------------------------------
+
+
+def test_stop_jobs_leaves_interrupted_in_the_file_even_when_the_job_threads_save_is_slow(o_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The job thread used to set its done event BEFORE its final save: stop_jobs woke, wrote "interrupted", and the thread's older
+    snapshot ("cancelled") landed after it, so the next start did not offer to continue."""
+    state = tmp_path / "jobs.json"
+    r = jobs.JobRunner(state, None)
+    jobs.reset_runner(r)
+    real = appdirs.write_json_atomic
+
+    def slow(path: Path, data: Any) -> None:
+        if Path(path) == state:
+            time.sleep(0.12)  # a busy disk: the writes of the two threads overlap
+        real(path, data)
+
+    monkeypatch.setattr(appdirs, "write_json_atomic", slow)
+
+    def worker(ctx: Any) -> None:
+        while True:
+            ctx.checkpoint()
+            time.sleep(0.01)
+
+    for _ in range(4):  # the race was 5-12 % per trial
+        job = r.submit("full", worker, project="demo")
+        t0 = time.monotonic()
+        while r.get(job.id).state != "running" and time.monotonic() - t0 < 10:
+            time.sleep(0.01)
+        assert job.id in shell.stop_jobs(timeout=10)
+        saved = {j["id"]: j["state"] for j in json.loads(state.read_text(encoding="utf-8"))}
+        assert saved[job.id] == "interrupted" and r.get(job.id).state == "interrupted"
+        r.forget(job.id)
+
+
+def test_hard_exit_does_not_wait_for_a_stuck_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The watchdog is the last resort: when the sweep is stuck (on the lock the stuck cleanup holds) the process still ends."""
+    release = threading.Event()
+    ended: list[int] = []
+    monkeypatch.setattr(shell, "_final_sweep", lambda: release.wait(30))
+    monkeypatch.setattr(shell, "SWEEP_JOIN_S", 0.3)
+    monkeypatch.setattr(winproc, "end_process", ended.append)
+    t0 = time.monotonic()
+    shell._hard_exit(5)
+    assert ended == [5] and time.monotonic() - t0 < 5
+    release.set()
+
+
+def test_the_watchdog_ends_the_process_although_the_sweep_is_blocked_on_the_sweep_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    held, release, ended = threading.Event(), threading.Event(), []
+
+    def hold_the_lock() -> None:  # the main cleanup's sweep, stuck inside winproc.kill_orphans
+        with winproc._SWEEP_LOCK:  # noqa: SLF001
+            held.set()
+            release.wait(30)
+
+    holder = threading.Thread(target=hold_the_lock, daemon=True)
+    holder.start()
+    assert held.wait(5)
+
+    def blocked_sweep() -> None:  # the watchdog's own sweep wants the same lock
+        with winproc._SWEEP_LOCK:  # noqa: SLF001
+            pass
+
+    monkeypatch.setattr(shell, "_final_sweep", blocked_sweep)
+    monkeypatch.setattr(shell, "SWEEP_JOIN_S", 0.3)
+    monkeypatch.setattr(winproc, "end_process", ended.append)
+    wd = shell._start_exit_watchdog(7, delay=0.1)
+    wd.join(10)
+    release.set()
+    holder.join(5)
+    assert ended == [7] and not wd.is_alive()

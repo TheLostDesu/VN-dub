@@ -397,12 +397,16 @@ function CharacterTuning({ c, onChanged, allNames }: { c: Character; onChanged: 
   const timer = useRef<number | null>(null);
   const latest = useRef(value);
   latest.current = value;
+  // the debounced save runs long after the render that created it: it must spread the character as it is now (a voice,
+  // gender or RVC change made in between), not the one the card had when the first slider moved
+  const current = useRef({ c, onChanged });
+  current.current = { c, onChanged };
 
   const persist = useCallback(
     async (v: Tuning) => {
       try {
         const saved = await api.putTuning(sid, v);
-        onChanged({ ...c, tuning: withDefaults(saved ?? v) });
+        current.current.onChanged({ ...current.current.c, tuning: withDefaults(saved ?? v) });
         setError(null);
       } catch (e) {
         setError(toErrorInfo(e));

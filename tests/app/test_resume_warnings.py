@@ -325,3 +325,132 @@ def test_the_translate_flows_add_the_mixed_models_warning(client: Any, project: 
     job = r.submit("translate", pipeline.FLOWS["translate"].build(SLUG, {}), project=SLUG)
     r.wait(job.id, 60)
     assert job.state == "done" and "warnings" not in job.result
+
+
+# ----------------------------------------------------------------------------
+# release 1.0: a resume keeps the caches, a hand-run job replaces the offer, one heavy job at a time, Cancel is a cancel
+# ----------------------------------------------------------------------------
+
+
+def test_a_resume_does_not_carry_force_over(client: Any, project: dict[str, Any], app_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``force`` clears the stage caches: Continue on a forced job must keep the work that was done, not redo everything."""
+    stub_flows(monkeypatch, "import", "stage")
+    restart(app_env, [record("imp", "import", 5, {"engine": "renpy", "force": True})])
+    new = client.post("/api/project/resume").json()
+    assert new["params"] == {"engine": "renpy"}
+    assert wait_job(client, new)["state"] == "done"
+    restart(app_env, [record("st", "stage", 5, {"name": "synth", "only": None, "limit": None, "force": True, "sets": None})])
+    new = client.post("/api/project/resume").json()
+    assert new["params"] == {"name": "synth", "only": None, "limit": None, "sets": None}
+    assert wait_job(client, new)["state"] == "done"
+
+
+def test_running_the_job_again_by_hand_withdraws_the_continue_offer(client: Any, project: dict[str, Any], app_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_flows(monkeypatch, "full", "casting_listen")
+    restart(app_env, [record("full1", "full", 30), record("listen1", "casting_listen", 2, {"speaker_id": "a"})])
+    assert client.get("/api/project").json()["resume"]["job"]["id"] == "full1"
+    job = pipeline.submit("full", SLUG, {"shutdown_when_done": False})  # RunScreen starts the run directly, not through Continue
+    assert wait_job(client, job.id)["state"] == "done"
+    resume = client.get("/api/project").json()["resume"]
+    assert resume["job"]["id"] == "listen1"  # the old full run is no longer offered; the unrelated listen still is
+    assert [j.id for j in jobs.runner().interrupted(SLUG)] == ["listen1"]
+
+
+def test_two_clicks_on_a_heavy_flow_queue_one_job(client: Any, project: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """The busy check and the queueing are one step: a build that takes a moment lets the second click pass a check-then-submit."""
+    gate = threading.Event()
+
+    def slow_build(slug: str, p: dict[str, Any]) -> Any:
+        import time
+
+        time.sleep(0.15)
+        return lambda ctx: gate.wait(20) and None
+
+    monkeypatch.setitem(pipeline.FLOWS, "full", pipeline.Flow("full", slow_build, gpu=True, heavy=True))
+    results: list[Any] = []
+    barrier = threading.Barrier(2)
+
+    def click() -> None:
+        barrier.wait(5)
+        try:
+            results.append(pipeline.submit("full", SLUG, {"shutdown_when_done": False}))
+        except Exception as e:  # noqa: BLE001
+            results.append(e)
+
+    ts = [threading.Thread(target=click) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(15)
+    gate.set()
+    refused = [r for r in results if isinstance(r, Exception)]
+    queued = [r for r in results if isinstance(r, jobs.JobRecord)]
+    assert len(queued) == 1 and len(refused) == 1, results
+    assert getattr(refused[0], "code", None) == "job_busy" and refused[0].status == 409  # type: ignore[attr-defined]
+    assert len(jobs.runner().list(SLUG)) == 1
+
+
+def test_a_light_duplicate_still_returns_the_running_job(client: Any, project: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = threading.Event()
+    monkeypatch.setitem(pipeline.FLOWS, "report", pipeline.Flow("report", lambda slug, p: (lambda ctx: gate.wait(20) and None), gpu=False))
+    first = pipeline.submit("report", SLUG, {"slug": SLUG})
+    again = pipeline.submit("report", SLUG, {"slug": SLUG})
+    assert again is first and len(jobs.runner().list(SLUG)) == 1
+    gate.set()
+
+
+def _fake_review_pipeline(monkeypatch: pytest.MonkeyPatch, pack: Any) -> list[str]:
+    """Replace everything review_apply touches except its own control flow; ``pack()`` is what the pack stage does."""
+    from contextlib import contextmanager
+
+    calls: list[str] = []
+
+    @contextmanager
+    def fake_ctx(h: Any, job: Any, **kw: Any) -> Any:
+        yield object()
+
+    def fake_stages(ctx: Any, job: Any, names: list[str], **kw: Any) -> dict[str, Any]:
+        calls.append(",".join(names))
+        if names == ["pack"]:
+            pack()
+        return {}
+
+    state: dict[str, Any] = {"review": {"touched": ["a", "b", "z"]}}
+    monkeypatch.setattr(pipeline, "_handle", lambda slug: types_ns(slug=slug))
+    monkeypatch.setattr(pipeline, "pipeline_ctx", fake_ctx)
+    monkeypatch.setattr(pipeline, "run_stages", fake_stages)
+    monkeypatch.setattr(pipeline, "available_stages", lambda names: list(names))
+    monkeypatch.setattr(pipeline, "preserve_status", lambda ctx, names: fake_ctx(None, None))
+    monkeypatch.setattr(pipeline, "_final_state", lambda ctx, ids: {i: (None, None) for i in ids})
+    monkeypatch.setattr(appdirs, "read_app_state", lambda h: state)
+    monkeypatch.setattr(appdirs, "write_app_state", lambda h, st: calls.append("write_state"))
+    monkeypatch.setitem(pipeline.FLOWS, "review_apply", pipeline.Flow("review_apply", pipeline._build_review_apply, gpu=True, heavy=True))  # noqa: SLF001
+    return calls
+
+
+def types_ns(**kw: Any) -> Any:
+    import types
+
+    return types.SimpleNamespace(**kw)
+
+
+def test_cancel_during_the_pack_step_of_a_review_apply_is_a_cancel(client: Any, project: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    def cancelled_pack() -> None:
+        raise JobCancelled("cancelled by user")
+
+    calls = _fake_review_pipeline(monkeypatch, cancelled_pack)
+    job = pipeline.submit("review_apply", SLUG, {"line_ids": ["a", "b"]})
+    done = wait_job(client, job.id)
+    assert done["state"] == "cancelled" and "pack_error" not in done["result"]
+    assert "write_state" not in calls  # review.touched is not cleared: the lines still wait for an apply
+
+
+def test_a_failing_pack_step_is_still_reported_as_pack_error_on_a_done_job(client: Any, project: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_pack() -> None:
+        raise RuntimeError("zip failed")
+
+    calls = _fake_review_pipeline(monkeypatch, broken_pack)
+    job = pipeline.submit("review_apply", SLUG, {"line_ids": ["a", "b"]})
+    done = wait_job(client, job.id)
+    assert done["state"] == "done" and done["result"]["pack_error"]["code"] == "internal"
+    assert "write_state" in calls

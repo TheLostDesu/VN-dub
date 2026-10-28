@@ -36,8 +36,11 @@ function VerdictChip({ v }: { v: Verdict }) {
 
 interface Props {
   lineId: string;
-  /** an action was applied on the server: the list should refresh; `advance` asks to go to the next line */
-  onChanged: (action: ReviewActionName, advance: boolean) => void;
+  /**
+   * an action was applied on the server: the list should refresh; `advance` asks to go to the next line. Returns whether the
+   * screen moved to another line (this view is then replaced); false when there was no next line, so this one reloads itself.
+   */
+  onChanged: (action: ReviewActionName, advance: boolean) => boolean | void;
 }
 
 export const ReviewDetailView = forwardRef<ReviewDetailHandle, Props>(function ReviewDetailView({ lineId, onChanged }, ref) {
@@ -67,7 +70,8 @@ export const ReviewDetailView = forwardRef<ReviewDetailHandle, Props>(function R
       setTextTgt(d.line.text_tgt ?? "");
       setTextSrc(d.line.text_src ?? "");
       setStyle(d.style_prompt ?? "");
-      setTuning(withDefaults(d.tuning_override));
+      // a line's own tuning replaces the character's as a whole: without one the panel starts from the character's tuning
+      setTuning(withDefaults(d.tuning_override ?? d.character_tuning));
       setEmotion("");
       const winner = d.candidates.find((c) => c.is_winner) ?? d.candidates[0];
       setSelected(winner ? winner.id : null);
@@ -91,8 +95,9 @@ export const ReviewDetailView = forwardRef<ReviewDetailHandle, Props>(function R
       setNotice(null);
       try {
         await api.reviewAction(lineId, action, payload);
-        onChanged(action, advance);
-        if (!advance) {
+        const moved = onChanged(action, advance);
+        // nothing to advance to (the last row): this view stays, and its candidates must show the new state
+        if (!advance || moved === false) {
           await load();
           setNotice(t("review.action_saved"));
         }
@@ -258,7 +263,7 @@ export const ReviewDetailView = forwardRef<ReviewDetailHandle, Props>(function R
         </Callout>
       ) : (
         <ul className="candidates" data-testid="review-candidates">
-          {cands.slice(0, 3).map((c, i) => (
+          {cands.map((c, i) => (
             <CandidateCard
               key={c.id}
               c={c}
@@ -329,9 +334,11 @@ export const ReviewDetailView = forwardRef<ReviewDetailHandle, Props>(function R
         value={tuning}
         onChange={setTuning}
         onReset={() => {
-          setTuning({ ...DEFAULT_TUNING });
+          // back to the character's own tuning (the line's override is a full tuning, so defaults would drop its pitch and speed)
+          const base = withDefaults(detail.character_tuning);
+          setTuning(base);
           setEmotion("");
-          void act("tuning", { ...DEFAULT_TUNING });
+          void act("tuning", { ...base });
         }}
         lineMode
         prefix="review-line"

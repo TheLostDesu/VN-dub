@@ -16,7 +16,9 @@ SPECS = [
         commercial_ok=True,
         vram_estimate_gb=3.8,
         cpu_ok=True,
-        weights=(WeightSpec("hf", repo="FunAudioLLM/Fun-CosyVoice3-0.5B-2512", size_gb=3.4),),
+        # the whole snapshot: 9.75 GB on the hub (HF tree API: llm.pt 2.0 + llm.rl.pt 2.0 + flow.pt 1.3 + flow.decoder onnx 1.3
+        # + two speech_tokenizer onnx 1.0 each + CosyVoice-BlankEN 1.0 + hift/campplus); size_gb feeds the disk pre-check
+        weights=(WeightSpec("hf", repo="FunAudioLLM/Fun-CosyVoice3-0.5B-2512", size_gb=9.75),),
         options={"mode": "cross_lingual_instruct", "speed": 1.0, "text_frontend": True},
         caps={
             "instruct": "cosy",

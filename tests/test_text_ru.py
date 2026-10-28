@@ -72,3 +72,33 @@ def test_prepare_without_stresser_and_cer_reference_matches_cer_normalization():
     tts, plain = ru.prepare_tts_text("Я получила 100 баллов…", None)
     assert tts == "Я получила сто баллов..."
     assert normalize_for_cer(plain) == "я получила сто баллов"
+
+
+def test_cm_after_a_number_is_centimetres_not_see():
+    assert ru.normalize_for_tts("Мой рост 160 см.") == "Мой рост сто шестьдесят сантиметров."
+    assert ru.normalize_for_tts("Рост 160см, вес 50") == "Рост сто шестьдесят сантиметров, вес пятьдесят"
+    assert ru.expand_abbreviations("Рост 160 см. Дальше") == "Рост 160 сантиметров. Дальше"
+    # "см." that does not follow a number still means "see"
+    assert ru.expand_abbreviations("см. рисунок") == "смотри рисунок"
+    assert ru.expand_abbreviations("стр. 5, см. рис. 2") == "стр. 5, смотри рис. 2"
+
+
+def test_strip_stress_keeps_a_plus_that_is_not_a_stress_mark():
+    assert ru.strip_stress("2+2") == "2+2"
+    assert ru.strip_stress("С++ и 3 + 4") == "С++ и 3 + 4"
+    assert ru.strip_stress("в+ыход, з+амок, +ёлка, вы́ход") == "выход, замок, ёлка, выход"
+    tts, plain = ru.prepare_tts_text("Это 2+2", None, fmt="plain")
+    assert tts == plain == "Это два+два"  # used to collapse into "двадва"
+
+
+def test_normalize_numbers_leaves_unspellable_huge_numbers_alone():
+    huge = "9" * 40
+    # num2words raises KeyError from 34 digits up
+    assert ru.normalize_numbers(huge) == huge
+    assert ru.normalize_numbers(f"Я {huge} раз и 5 раз") == f"Я {huge} раз и пять раз"
+    assert ru.normalize_numbers(f"№{huge} и {huge}%") == f"№{huge} и {huge}%"
+    assert ru.normalize_numbers(f"{huge}-й") == f"{huge}-й"
+    assert ru.normalize_numbers(f"3-{huge}").endswith(huge)
+    assert ru.normalize_for_tts(f"В {huge} г.") == f"В {huge} г."
+    # 33 digits is still spelled
+    assert "9" not in ru.normalize_numbers("9" * 33)

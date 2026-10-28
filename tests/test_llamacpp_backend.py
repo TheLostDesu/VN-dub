@@ -49,6 +49,38 @@ def test_build_args_parallel_slots_scale_the_context() -> None:
     assert args[-2:] == ["-fa", "on"]
 
 
+def test_server_help_does_not_cache_a_failed_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A timeout once must not drop ``--fit off`` from every later command line of the process."""
+    import subprocess
+
+    monkeypatch.setattr(lc, "_help_cache", {})
+    calls: list[int] = []
+    answers: list[Any] = [subprocess.TimeoutExpired("llama-server", 30), OSError("busy"), HELP_WITH_FIT]
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        calls.append(1)
+        a = answers[len(calls) - 1]
+        if isinstance(a, BaseException):
+            raise a
+        return subprocess.CompletedProcess(cmd, 0, stdout=a.encode(), stderr=b"")
+
+    monkeypatch.setattr(lc.subprocess, "run", fake_run)
+    assert lc.server_help(BIN) == "" and lc.server_help(BIN) == ""  # both failed: nothing is remembered
+    text = lc.server_help(BIN)  # the third run answers
+    assert text == HELP_WITH_FIT and "--fit" in lc.build_args(BIN, GGUF, 8089, {}, text)
+    assert lc.server_help(BIN) == HELP_WITH_FIT and len(calls) == 3  # a real answer is cached
+
+
+def test_server_help_empty_output_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    monkeypatch.setattr(lc, "_help_cache", {})
+    outs = [b"", HELP_OLD.encode()]
+    monkeypatch.setattr(lc.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout=outs.pop(0), stderr=b""))
+    assert lc.server_help(BIN) == ""
+    assert lc.server_help(BIN) == HELP_OLD
+
+
 def test_parse_offload_takes_the_last_line() -> None:
     log = "load_tensors: offloaded 10/49 layers to GPU\nx\nload_tensors: offloaded 49/49 layers to GPU\n"
     assert lc.parse_offload(log) == (49, 49)

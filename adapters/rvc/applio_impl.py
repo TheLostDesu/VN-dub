@@ -50,7 +50,8 @@ def run_job(d: Path, job: dict[str, Any], logs_dir: Path | None, log_file: Path,
     try:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with open(log_file, "a", encoding="utf-8") as lf:
-            r = subprocess.run([sys.executable, str(JOB_SCRIPT), job_path], cwd=str(d), env=env, stdout=subprocess.PIPE, stderr=lf, text=True, timeout=timeout)
+            # stdin=DEVNULL: the job must not inherit the RPC request pipe (a child that reads stdin would swallow requests)
+            r = subprocess.run([sys.executable, str(JOB_SCRIPT), job_path], cwd=str(d), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=lf, text=True, timeout=timeout)
         last = next((l for l in reversed(r.stdout.splitlines()) if l.strip().startswith("{")), "")
         res = json.loads(last) if last else {"ok": False, "messages": [r.stdout[-500:]]}
         res["returncode"] = r.returncode

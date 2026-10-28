@@ -115,15 +115,29 @@ is read from `init python` / `define config.auto_voice`).
   processing (whitespace runs collapsed, escapes resolved).
   **Verified:** the Ren'Py documentation example under `label start`,
   `e "Thank you for taking a look at the Ren'Py translation framework."`,
-  gives `start_636ae3f5` (test `tests/test_renpy_ids.py`). Ren'Py 8.5.1 added
-  `config.tlid_only_considers_say` (default True from 8.6): with it, voice
-  statements no longer change ids - set
-  `parse.engine_opts.renpy.tlid_only_considers_say: true` for such games, or
-  better import `dialogue.tab`.
+  gives `start_636ae3f5` (test `tests/test_renpy_ids.py`). The translatable block that is hashed with a say is
+  exactly what Ren'Py's `Restructurer` groups: the `voice` / `voice sustain` statements and `nvl clear` right before
+  it, in script order, flushed by any other statement (1.0.0: before, one pending voice survived a `show` in between,
+  two voice statements kept only the last, and `nvl clear` was skipped). Ren'Py 8.5.1 added
+  `config.tlid_only_considers_say` (default True from 8.6): with it, voice statements no longer change ids. `parse`
+  reads the game's Ren'Py version (`renpy/vc_version.py` or `renpy/__init__.py` next to the game folder) and uses that
+  default (a parse note says which); `parse.engine_opts.renpy.tlid_only_considers_say: true|false` overrides it, and
+  `dialogue.tab` beats both. Since 1.0.0 character and image names may be any Ren'Py word (Cyrillic, CJK), and
+  `Character(kind=e)` inherits its name and voice tag from `e` (only an explicit `None` name is narration).
+* **Scripts**: `game/**/*.rpy`, every `.rpa` archive (unrpa) and every `.rpyc` without its `.rpy` (unrpyc, `--clobber`,
+  the decompiled tree mirrors the game's folders so two `script.rpyc` in different chapters do not collide). Only the
+  engine's own `renpy/` folder is skipped (1.0.0: the filter used to drop everything extracted from archives, because
+  the extraction folder is itself called `renpy/`).
 * **Fallback when ids cannot be reproduced** (unknown constructs, newer
-  Ren'Py rules): unclaimed files under the auto_voice directory are grouped by
-  their label prefix and assigned to that label's unvoiced lines in script
-  order (flag `auto_voice_order`; `link` verifies them by ASR).
+  Ren'Py rules): an unclaimed file under the auto_voice directory is bound to the one unvoiced line of its label only
+  when that label has exactly one of each (flag `auto_voice_order`; `link` verifies it by ASR). With more, nothing
+  is guessed (the files are named `<label>_<hash>`, so their order says nothing) and a parse note names the label.
+* **Lines with a `voice` statement of their own** whose file is missing or computed at run time are NOT dubbed through
+  `config.auto_voice` (Ren'Py never asks it for such a line); they are counted as `own_voice` in the patch coverage
+  and listed in INSTALL.md.
+* **Stale files**: a full `pack` removes from `out/renpy` the files the previous `manifest_patch.json` listed and the
+  voice files of its own folders that the new patch does not contain (a line rejected in review, a re-import that
+  renamed ids), nothing else; `--only` packs never delete.
 * `parse.engine_opts.renpy.dialogue_tab`: the launcher's *Extract Dialogue*
   TSV (`Identifier, Character, Dialogue, Filename, Line Number`); its ids
   override computed ones by (file, line) (flag `dialogue_tab_id`).

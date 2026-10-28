@@ -52,7 +52,7 @@ def test_append_and_bad_json(tmp_path: Path) -> None:
     append_jsonl(p, {"line_id": "a", "action": "accept"})
     append_jsonl(p, {"line_id": "b", "action": "reject"})
     assert len(read_jsonl(p)) == 2
-    p.write_text('{"ok": 1}\n{broken\n', encoding="utf-8")
+    p.write_text('{"ok": 1}\n{broken\n{"ok": 3}\n', encoding="utf-8")  # damage in the middle is an error (a cut LAST line is skipped: test_jsonl_tolerance.py)
     with pytest.raises(ValueError, match=":2:"):
         read_jsonl(p)
 

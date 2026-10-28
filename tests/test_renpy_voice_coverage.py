@@ -56,6 +56,11 @@ class Voice(Node):  # ``voice "x"`` is registered translatable: it joins the nex
         self.code = code
 
 
+class NvlClear(Voice):  # ``nvl clear`` is registered translatable too (common/00nvl_mode.rpy)
+    def __init__(self) -> None:
+        super().__init__("nvl clear")
+
+
 class Say(Node):
     kind = "say"
 
@@ -81,7 +86,8 @@ class If(Node):  # If.restructure: callback(block) for every entry
 
 
 class Restructurer:
-    def __init__(self) -> None:
+    def __init__(self, only_say: bool = False) -> None:
+        self.only_say = only_say  # config.tlid_only_considers_say
         self.label: str | None = None
         self.alternate: str | None = None
         self.identifiers: set[str] = set()
@@ -97,7 +103,10 @@ class Restructurer:
 
     def create_translate(self, block: list[Node]) -> None:
         md5 = hashlib.md5()
-        for i in block:
+        digest_block = block
+        if self.only_say and any(isinstance(i, Say) for i in block):
+            digest_block = [i for i in block if isinstance(i, Say)]
+        for i in digest_block:
             md5.update((i.code + "\r\n").encode("utf-8"))
         digest = md5.hexdigest()[:8]
         identifier = self.unique_identifier(self.label, digest)
@@ -133,8 +142,8 @@ class Restructurer:
             self.create_translate(group)
 
 
-def reference_ids(tree: list[Node]) -> list[tuple[str | None, str]]:
-    r = Restructurer()  # one per file
+def reference_ids(tree: list[Node], only_say: bool = False) -> list[tuple[str | None, str]]:
+    r = Restructurer(only_say)  # one per file
     r.callback(tree)
     return r.said
 
@@ -252,6 +261,74 @@ def test_voice_statement_joins_the_following_say_only():
     script = 'label start:\n    voice "a.ogg"\n    e "One."\n    e "Two."\n    voice sustain\n    e "Three."\n'
     tree = [Label("start", Voice('voice "a.ogg"'), Say("e", 'e "One."'), Say("e", 'e "Two."'), Voice("voice sustain"), Say("e", 'e "Three."'))]
     assert parsed_ids(script) == [i for _, i in reference_ids(tree)]
+
+
+def test_voice_before_a_statement_that_is_not_translatable_does_not_join_the_say():
+    # Restructurer.callback: the group is flushed at the first node that is not translatable; the say after ``show`` hashes alone
+    script = 'voice "a.ogg"\nshow eileen\ne "Hello"\n'
+    tree = [Voice('voice "a.ogg"'), Plain(), Say("e", 'e "Hello"')]
+    ids = parsed_ids(script)
+    assert ids == [i for _, i in reference_ids(tree)] == ["8d695913"]
+    assert ids != parsed_ids('voice "a.ogg"\ne "Hello"\n')  # right next to the say, it does join
+    for between in ('$ x = 1', 'with dissolve', 'jump somewhere', 'play music "m.ogg"', 'pause 1.0', 'window show', 'label other:'):
+        assert parsed_ids(f'voice "a.ogg"\n{between}\ne "Hello"\n')[0].endswith("8d695913"), between
+
+
+def test_nvl_clear_is_translatable_and_joins_the_next_say():
+    script = (
+        "label start:\n    nvl clear\n    n \"First line of the page.\"\n    n \"Second.\"\n"
+        "    voice \"a.ogg\"\n    nvl clear\n    n \"Third.\"\n    nvl clear\n    $ x = 1\n    n \"Fourth.\"\n"
+    )
+    tree = [
+        Label(
+            "start", NvlClear(), Say("n", 'n "First line of the page."'), Say("n", 'n "Second."'),
+            Voice('voice "a.ogg"'), NvlClear(), Say("n", 'n "Third."'), NvlClear(), Plain(), Say("n", 'n "Fourth."'),
+        )
+    ]
+    got = parsed_ids(script)
+    assert got == [i for _, i in reference_ids(tree)]
+    assert len(set(got)) == 4 and got[0] != parsed_ids("label start:\n    n \"First line of the page.\"\n")[0]
+
+
+def test_two_voice_statements_before_a_say_are_both_hashed_in_order():
+    script = 'label start:\n    voice "a.ogg"\n    voice "b.ogg"\n    e "Hello"\n    voice sustain\n    voice "c.ogg"\n    e "Again"\n'
+    tree = [Label("start", Voice('voice "a.ogg"'), Voice('voice "b.ogg"'), Say("e", 'e "Hello"'), Voice("voice sustain"), Voice('voice "c.ogg"'), Say("e", 'e "Again"'))]
+    got = parsed_ids(script)
+    assert got == [i for _, i in reference_ids(tree)]
+    assert got[0] != parsed_ids('label start:\n    voice "b.ogg"\n    e "Hello"\n')[0]  # the first voice counts, not only the last
+    st = renpy.RpyParse()
+    renpy.parse_rpy_text(script, "t.rpy", st, renpy.IdAllocator(), [None, None])
+    first, second = [s for s in st.says if s["kind"] == "say"]
+    assert first["voice"] == "b.ogg" and second["voice"] == "c.ogg" and second["sustain"]  # the later statement is the one that plays
+
+
+def test_a_voice_ends_with_its_block():
+    # ``voice`` as the last statement of an if-block is a group of its own (callback runs per block): the say after the block is alone
+    script = 'label start:\n    if x:\n        voice "a.ogg"\n    e "Hello"\n    if y:\n        voice "b.ogg"\n        e "Inside"\n    e "Hello"\n'
+    tree = [Label("start", If([Voice('voice "a.ogg"')]), Say("e", 'e "Hello"'), If([Voice('voice "b.ogg"'), Say("e", 'e "Inside"')]), Say("e", 'e "Hello"'))]
+    got = parsed_ids(script)
+    assert got == [i for _, i in reference_ids(tree)]
+    assert got[0] == "start_8d695913" and got[2] == "start_8d695913_1"
+
+
+def test_monologue_clear_paragraph_is_an_nvl_clear_statement():
+    # Lexer.triple_string / finish_say: a paragraph that is only {clear} becomes ``nvl clear``, which joins the next paragraph's block
+    script = 'label start:\n    n """\n    First.\n\n    {clear}\n\n    Second.\n    """\n    n "{clear}"\n'
+    tree = [Label("start", Say("n", 'n "First."'), NvlClear(), Say("n", 'n "Second."'), Say("n", 'n "{clear}"'))]
+    st = renpy.RpyParse()
+    renpy.parse_rpy_text(script, "t.rpy", st, renpy.IdAllocator(), [None, None])
+    says = [s for s in st.says if s["kind"] == "say"]
+    assert [s["what"] for s in says] == ["First.", "Second.", "{clear}"]  # the {clear} paragraph is not a line; a plain string "{clear}" is
+    assert [s["id"] for s in says] == [i for _, i in reference_ids(tree)]
+
+
+def test_only_say_mode_matches_tlid_only_considers_say():
+    script = 'label start:\n    voice "a.ogg"\n    nvl clear\n    e "Hello"\n    voice "b.ogg"\n    e "Hello"\n'
+    tree = [Label("start", Voice('voice "a.ogg"'), NvlClear(), Say("e", 'e "Hello"'), Voice('voice "b.ogg"'), Say("e", 'e "Hello"'))]
+    got = parsed_ids(script, only_say=True)
+    d = renpy.block_digest(['e "Hello"'])
+    assert got == [i for _, i in reference_ids(tree, only_say=True)] == [f"start_{d}", f"start_{d}_1"]
+    assert got != parsed_ids(script)
 
 
 def test_collision_suffixes_and_labels_start_over_in_every_file(tmp_path: Path):

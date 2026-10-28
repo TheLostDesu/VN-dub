@@ -12,7 +12,7 @@
       "required": true,
       "homepage": "https://www.gyan.dev/ffmpeg/builds/",
       "license": "GPL-3.0 (essentials build)",
-      "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip",
+      "url": "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip",
       "filename": "ffmpeg-9.0.2-essentials_build.zip",
       "archive": "zip",
       "size": 114768076,
@@ -23,7 +23,7 @@
         "ffprobe": "ffmpeg-9.0.2-essentials_build/bin/ffprobe.exe"
       },
       "extra": [],
-      "notes": "sha256 from https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip.sha256 (2026-10-21); zip layout read from its central directory."
+      "notes": "sha256 from https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip.sha256 (2026-10-21); zip layout read from its central directory. The url is the publisher's GitHub mirror (GyanD/codexffmpeg release 9.0.2): the same file (size 114768076, release asset digest = this sha256), while www.gyan.dev alternated between 200 and 503 (checked 2026-10-28)."
     },
     {
       "name": "rubberband",

@@ -154,14 +154,20 @@ def test_dialogue_tab_overrides_identifier(tmp_path: Path, make_ctx) -> None:
 
 
 def test_auto_voice_order_fallback(tmp_path: Path, make_ctx) -> None:
+    # ids we cannot reproduce. auto_voice files are named <label>_<md5 of the block>, so the order of their names is hash order:
+    # two files and two lines are NOT paired by position (that would put the dub of one line over the file of the other); a label
+    # that has exactly one unclaimed file and one line without a voice is (more in test_renpy_parser_fixes.py)
     game = tmp_path / "g" / "game"
     (game / "voice").mkdir(parents=True)
-    (game / "script.rpy").write_text('define e = Character("E")\ndefine config.auto_voice = "voice/{id}.ogg"\nlabel start:\n    e "One."\n    e "Two."\n', encoding="utf-8")
-    for n in ("start_00000001", "start_00000002"):  # ids we cannot reproduce
+    (game / "script.rpy").write_text(
+        'define e = Character("E")\ndefine config.auto_voice = "voice/{id}.ogg"\nlabel start:\n    e "One."\n    e "Two."\nlabel last:\n    e "Alone."\n',
+        encoding="utf-8",
+    )
+    for n in ("start_00000001", "start_00000002", "last_00000003"):
         (game / "voice" / f"{n}.ogg").write_bytes(b"OggS")
     from engine_helpers import detect_and_parse
 
     _, _, _, res = detect_and_parse(make_ctx(tmp_path / "g"))
-    assert [l.voice_file for l in res.lines] == ["voice/start_00000001.ogg", "voice/start_00000002.ogg"]
-    assert all("auto_voice_order" in l.flags for l in res.lines)
-    assert any("fallback" in n for n in res.notes)
+    assert [l.voice_file for l in res.lines] == [None, None, "voice/last_00000003.ogg"]
+    assert [("auto_voice_order" in l.flags) for l in res.lines] == [False, False, True]
+    assert any("fallback" in n and "start (2 unclaimed file(s), 2 line(s) without a voice)" in n for n in res.notes)

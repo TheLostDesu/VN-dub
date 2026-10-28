@@ -604,3 +604,174 @@ def test_the_reaper_log_stays_small(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         winproc._reaper_line(str(log), f"parent {i} ended; terminated 0")
     lines = log.read_text(encoding="utf-8").splitlines()
     assert len(lines) < 300 and lines[-1].endswith("parent 399 ended; terminated 0")  # the newest lines survive the trimming
+
+
+# ---- release 1.0: whose process is an orphan, what counts under a broad envs folder --------------------------------------------
+
+
+def synthetic_scan(tmp_path: Path, procs: dict[int, tuple[int, str, int, bool]]) -> winproc._Scan:
+    """A ledger scan over made-up processes: ``{pid: (parent pid, image path, creation time, alive)}`` (pid 100 is 'this' process).
+
+    Roots: ``<tmp>/envs`` (with the environment ``main``, which has a ``pyvenv.cfg``) and ``<tmp>/tools``.
+    """
+    (tmp_path / "envs" / "main").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "envs" / "main" / "pyvenv.cfg").write_text("home = x\n", encoding="utf-8")
+    (tmp_path / "tools").mkdir(exist_ok=True)
+    scan = object.__new__(winproc._Scan)
+    scan.roots = [winproc._root_forms(tmp_path / "envs"), winproc._root_forms(tmp_path / "tools")]
+    scan.snap = {pid: (ppid, Path(image).name) for pid, (ppid, image, _c, _a) in procs.items()}
+    scan._meta = {pid: winproc.Meta(image, created, alive) for pid, (_pp, image, created, alive) in procs.items()}
+    scan._env_ok = {}
+    scan.me = 100
+    scan.me_meta = scan._meta[100]
+    scan.self_image = winproc._norm(scan.me_meta.image)
+    return scan
+
+
+@windows_only
+def test_a_process_with_a_live_parent_that_is_not_the_apps_is_never_an_orphan(tmp_path: Path) -> None:
+    """The reviewer's case: a ping.exe under the root started from a bash that is alive was judged an orphan (and killed)."""
+    py = str(tmp_path / "envs" / "main" / "Scripts" / "python.exe")
+    llama = str(tmp_path / "tools" / "llama-server.exe")
+    scan = synthetic_scan(tmp_path, {
+        100: (1, r"C:\py\python.exe", 10, True),  # this process
+        # B: a hand-started tool below a live shell whose chain ends like every user process does (the top has no live parent)
+        210: (211, str(tmp_path / "tools" / "ping.exe"), 50, True),
+        211: (212, r"C:\Git\bash.exe", 40, True),
+        212: (999, r"C:\Windows\explorer.exe", 30, True),
+        # A: the parent is gone
+        200: (150, py, 50, True),
+        # C: below an adapter of the app whose own parent is gone
+        220: (221, llama, 60, True),
+        221: (888, py, 50, True),
+        # D: below an adapter of this process
+        230: (231, llama, 60, True),
+        231: (100, py, 50, True),
+        # E: this process is the ancestor, through a process that is not the app's
+        240: (241, py, 60, True),
+        241: (100, r"C:\other\cmd.exe", 50, True),
+        # F: another running VNDub.exe is above it
+        250: (251, py, 60, True),
+        251: (777, r"C:\Apps\VNDub\VNDub.exe", 50, True),
+        # G: the parent pid is alive-looking but ended; H: the parent pid was reused by a younger process; I: a parent we may not open
+        260: (261, py, 60, True),
+        261: (1, py, 50, False),
+        270: (271, py, 60, True),
+        271: (1, r"C:\x\other.exe", 90, True),
+        280: (281, py, 60, True),
+        # K: an app process below a live foreign process below an app orphan: somebody uses the chain, it is not an orphan
+        290: (291, py, 80, True),
+        291: (292, r"C:\Tools\jupyter.exe", 70, True),
+        292: (555, py, 50, True),
+    })
+    scan._meta[281] = None  # type: ignore[assignment]
+    scan.snap[281] = (1, "x.exe")
+    assert scan.judge(210, 50) == (False, False)  # the user's own process: never ours to kill
+    assert scan.judge(200, 50) == (False, True)  # parent gone
+    assert scan.judge(220, 60) == (False, True)  # parent is an app process that is itself an orphan
+    assert scan.judge(230, 60) == (True, False)  # ours
+    assert scan.judge(240, 60) == (True, False)  # ours through a foreign middle
+    assert scan.judge(250, 60) == (False, False)  # another VNDub owns it
+    assert scan.judge(260, 60) == (False, True)  # the parent ended
+    assert scan.judge(270, 60) == (False, True)  # the parent pid belongs to a younger process now
+    assert scan.judge(280, 60) == (False, False)  # a live parent we may not look at: no guess
+    assert scan.judge(290, 80) == (False, False)  # a foreign process in the chain protects the process below it
+
+
+@windows_only
+def test_under_the_envs_folder_only_environments_count(tmp_path: Path) -> None:
+    """The envs folder is the user's choice: a whole drive, a shared ``D:/AI``. Only ``<env>/`` folders with a pyvenv.cfg and ``_uv`` are ours."""
+    scan = synthetic_scan(tmp_path, {100: (1, r"C:\py\python.exe", 10, True)})
+    envs, tools = tmp_path / "envs", tmp_path / "tools"
+    (envs / "_uv" / "python" / "cpython-3.11").mkdir(parents=True)
+    (envs / "notebooks" / "Scripts").mkdir(parents=True)  # a folder of the user's own: no pyvenv.cfg
+    assert scan.scoped(str(envs / "main" / "Scripts" / "python.exe")) == (0, os.path.join("main", "Scripts", "python.exe"))
+    assert scan.scoped(str(envs / "_uv" / "python" / "cpython-3.11" / "python.exe")) is not None  # uv's interpreters
+    assert scan.scoped(str(envs / "notebooks" / "Scripts" / "python.exe")) is None
+    assert scan.scoped(str(envs / "jupyter.exe")) is None  # a file directly in the envs folder
+    assert scan.scoped(str(tools / "llama-server.exe")) is not None and scan.scoped(str(tools / "anything" / "x.exe")) is not None  # tool folders: all
+    assert scan.scoped(str(tmp_path / "elsewhere" / "x.exe")) is None
+    # the installer frees ONE environment: its folder is the root, and everything below it is the environment's
+    one = synthetic_scan(tmp_path, {100: (1, r"C:\py\python.exe", 10, True)})
+    one.roots = [winproc._root_forms(envs / "main")]
+    assert one.scoped(str(envs / "main" / "Scripts" / "python.exe")) is not None
+    assert one.scoped(str(envs / "main" / "Lib" / "site-packages" / "torch" / "bin" / "x.exe")) is not None
+
+
+def spawn_under_a_live_parent(py: Path, tmp_path: Path) -> tuple[int, int]:
+    """A sleeper of ``py`` started by a live intermediate (a stand-in for the user's shell) whose own parent has already ended.
+
+    Returns ``(sleeper pid, intermediate pid)``.
+    """
+    pid_file = tmp_path / "pids.txt"
+    pid_file.unlink(missing_ok=True)
+    middle = (
+        "import os, subprocess, time\n"
+        "n = subprocess.DEVNULL\n"
+        f"c = subprocess.Popen([r'{py}', '-c', '{SLEEP}'], stdin=n, stdout=n, stderr=n)\n"
+        f"open(r'{pid_file}', 'w').write(f'{{c.pid}} {{os.getpid()}}')\n"
+        "time.sleep(120)\n"
+    )
+    launcher = "import subprocess, sys\nn = subprocess.DEVNULL\n" f"subprocess.Popen([sys.executable, '-c', {middle!r}], stdin=n, stdout=n, stderr=n)\n"
+    subprocess.run([sys.executable, "-c", launcher], check=True, timeout=60)
+    assert wait_for(lambda: pid_file.exists() and pid_file.read_text().strip(), 30)
+    child, mid = pid_file.read_text().split()
+    return int(child), int(mid)
+
+
+@windows_only
+def test_something_the_user_started_from_a_live_shell_is_not_killed_as_an_orphan(tree: dict[str, Path], tmp_path: Path) -> None:
+    roots = [tree["envs"], tree["tools"]]
+    child, mid = spawn_under_a_live_parent(tree["main"], tmp_path)
+    try:
+        info = wait_for(lambda: find(roots, child))
+        assert info is not None and info.ours is False and info.orphan is False  # its parent is alive and none of the app's
+        assert winproc.kill_orphans(roots) == [] and winproc.process_alive(child)
+        # the shell ends: now nobody is left to use it, and it is an orphan like any other
+        subprocess.run(["taskkill", "/F", "/PID", str(mid)], capture_output=True)
+        assert wait_for(lambda: gone(mid), 10)
+        again = wait_for(lambda: (i := find(roots, child)) is not None and i.orphan and i)
+        assert again and again.orphan is True
+        assert [i.pid for i in winproc.kill_orphans(roots)] == [child]
+        assert wait_for(lambda: gone(child), 15)
+    finally:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(mid)], capture_output=True)
+        subprocess.run(["taskkill", "/F", "/PID", str(child)], capture_output=True)
+
+
+@windows_only
+def test_a_broad_envs_folder_does_not_turn_the_users_programs_into_targets(tree: dict[str, Path], procs: list[subprocess.Popen[bytes]]) -> None:
+    """With the envs folder set to a folder that holds much more than environments (here the parent of ``envs``, ``tools`` and ``app``)."""
+    broad = tree["root"]
+    stray = start(procs, tree["main"])  # runs from <broad>/envs/main: 'envs' is not an environment (no pyvenv.cfg)
+    app_env = start(procs, tree["root"] / "app" / "Scripts" / "python.exe")  # <broad>/app is a venv
+    found = wait_for(lambda: find([broad], app_env.pid))
+    assert found is not None and found.env == "app" and found.role == "adapter"
+    assert find([broad], stray.pid) is None
+    killed = winproc.kill_all_under([broad], reason="the user pressed kill all")
+    assert app_env.pid in [i.pid for i in killed] and stray.pid not in [i.pid for i in killed]
+    assert wait_for(lambda: app_env.poll() is not None, 15) and stray.poll() is None
+
+
+@windows_only
+def test_kill_descendants_leaves_a_descendant_whose_pid_changed_hands(tmp_path: Path) -> None:
+    """In a throw-away process: the creation time seen when the child is terminated differs from the one in the snapshot."""
+    code = (
+        f"import subprocess, sys, time; sys.path.insert(0, r'{REPO}')\n"
+        "from vndub_app import winproc\n"
+        f"child = subprocess.Popen([sys.executable, '-c', '{SLEEP}'])\n"
+        "time.sleep(1)\n"
+        "real, n = winproc._Api.meta_of, [0]\n"
+        "def moving(self, handle):\n"  # every look at a process shows a different creation time: 'a stranger now owns the pid'
+        "    n[0] += 1\n"
+        "    m = real(self, handle)\n"
+        "    return m._replace(created=m.created + n[0]) if m else m\n"
+        "winproc._Api.meta_of = moving\n"
+        "killed = winproc.kill_descendants()\n"
+        "winproc._Api.meta_of = real\n"
+        "print('killed', killed, 'child alive', child.poll() is None, flush=True)\n"
+        "child.kill()\n"
+    )
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=90)
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.strip().splitlines()[-1] == "killed 0 child alive True"

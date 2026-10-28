@@ -165,6 +165,21 @@ def test_import_jsonl_and_csv(make_ctx, tmp_path):
     ctx.models.close()
 
 
+def test_import_csv_picks_the_target_column_by_key_priority_not_column_order(make_ctx, tmp_path):
+    """`line_id,text,translation`: `text` is the source here, `translation` ranks higher among the target keys."""
+    ctx = _ctx(make_ctx, tmp_path)
+    p = tmp_path / "t.csv"
+    p.write_text("line_id,text,translation\ns01_01,テストで百点を取ったんだよ！,Сто баллов!\ns01_02,どうしたの、さくら？,Что такое?\n", encoding="utf-8")
+    assert translate.load_import(p, [], "ru", ctx.log) == {"s01_01": "Сто баллов!", "s01_02": "Что такое?"}
+    # a file with only the plain `text` column still imports it, and the language-code column outranks `text` too
+    q = tmp_path / "q.csv"
+    q.write_text("id,text\ns01_01,Привет\n", encoding="utf-8")
+    assert translate.load_import(q, [], "ru", ctx.log) == {"s01_01": "Привет"}
+    r = tmp_path / "r.tsv"
+    r.write_text("line_id\ttext\tru\ns01_01\tsrc\tОтвет\n", encoding="utf-8")
+    assert translate.load_import(r, [], "ru", ctx.log) == {"s01_01": "Ответ"}
+
+
 def test_import_vntextpatch_positional_and_by_source(make_ctx, tmp_path):
     ctx = _ctx(make_ctx, tmp_path)
     lines = ctx.lines()
@@ -411,6 +426,26 @@ def test_a_fully_cached_project_is_not_retranslated_when_the_preferred_model_doe
     ctx, cuda, made = _gpu_ctx(make_ctx, tmp_path, monkeypatch, cuda=_Cuda(other_gb=5.0))
     summary = run_stage("translate", ctx)
     assert summary["models_used"] == {"llm_big": 5} and made == []  # no load, nothing translated by the smaller model
+    ctx.models.close()
+
+
+def test_a_model_that_fails_to_load_is_not_tried_again_by_every_queued_scene(make_ctx, tmp_path, monkeypatch):
+    """llm.parallel > 1: the first scene's load failure is the answer for all of them (each retry walks the whole chain)."""
+    ctx = make_ctx(tmp_path, sets={"translate.llm.parallel": 2, "translate.glossary": str(tmp_path / "glossary.yaml")})
+    build_project(ctx, [
+        dict(line_id=f"s0{i}_01", speaker_id="sakura", speaker_raw="さくら", text=f"今日は{'とても' * i}いい天気ですね。", seconds=0.5, scene=f"s0{i}")
+        for i in range(1, 7)
+    ])
+    walks: list[int] = []
+
+    def refuse(c):
+        walks.append(1)
+        raise StageError("no translation backend usable: llm_big: needs 9.0 GB; llm_small: llama-server did not start")
+
+    monkeypatch.setattr(translate, "_acquire_llm", refuse)
+    with pytest.raises(StageError, match="no translation backend usable"):
+        run_stage("translate", ctx)
+    assert walks == [1], "six scenes, one walk over the model chain"
     ctx.models.close()
 
 

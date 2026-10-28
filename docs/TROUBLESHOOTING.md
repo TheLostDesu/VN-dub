@@ -1,8 +1,16 @@
 # Troubleshooting
 
-**`backend env 'hf' not created`** — the backend's virtual environment is missing:
-`powershell -ExecutionPolicy Bypass -File scripts/make_envs.ps1 -Env hf` (add `-Cpu` on a
-machine without an NVIDIA GPU). Logs of the adapter process: `work/logs/adapter_<env>.log`.
+**`backend env 'main' not created`** — the backend's virtual environment is missing:
+`powershell -ExecutionPolicy Bypass -File scripts/make_envs.ps1 -Env main` (add `-Cpu` on a
+machine without an NVIDIA GPU; the other envs are `funasr`, `chatterbox`, `f5`, `gguf`, `higgs`, `rvc`,
+`seedvc`). Logs of the adapter process: `work/logs/adapter_<env>.log`.
+
+**`ruaccent: OfflineModeIsEnabled: Cannot reach https://huggingface.co/api/models/ruaccent/accentuator`** —
+the `main` environment was recreated after `models pull ruaccent`: ruaccent keeps its koziev morphology data
+(~190 MB) inside its own package folder, which went with the old environment, while the weights folder stayed
+marked complete. Since 1.0.0 the pull keeps a copy in `models/ruaccent/koziev` and the adapter restores the
+package copy from it; an installation pulled by an older version has no such copy yet: run
+`uv run vndub models pull ruaccent` once more (the app: Models -> ruaccent -> download again).
 
 **`weights missing: run vndub models pull <name>`** — download once:
 `uv run vndub models pull <name>` (or `--profile default`). At run time adapters are
@@ -16,6 +24,12 @@ programs (browsers, games, other CUDA processes), or disable that backend
 **`CUDA not available`** — no NVIDIA driver/GPU visible (`nvidia-smi` must work). CPU-capable
 adapters can run with `--set gpu.allow_cpu_fallback=true` (very slow); the test profile
 enables it.
+
+**`no kernel image is available for execution on the device`** — the card is newer than the torch build of that
+environment: the `funasr` (torch 2.3.1, cu121), `seedvc` and `chatterbox` (torch 2.4/2.6, cu124) environments carry no
+kernels for compute capability 12.0 (RTX 50xx, Blackwell), so CosyVoice 3, emotion2vec, SenseVoice, Chatterbox and
+Seed-VC fail at their first kernel although CUDA itself is available. The `main` env (cu128 torch) is fine. Until those
+environments move to a cu128 torch, use the other backends on such a card (Qwen3-TTS, GigaAM, the llama.cpp translator).
 
 **CUDA out of memory during a run** — the adapter reports it as an error for the batch; the
 items are recorded with the error and the stage continues. Reduce `synth.n_candidates`, keep

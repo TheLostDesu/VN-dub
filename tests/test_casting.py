@@ -396,3 +396,71 @@ def test_refs_follow_an_edited_source_text(proj):
     run_stage("voicebank", ctx)
     refs2 = {r["line_id"]: r for r in read_json(ctx.paths.vb_refs_json("sakura"))}
     assert refs2[lid]["text"] == "直した本文。"
+
+
+# --- release 1.0 review fixes -------------------------------------------------------------------------------------------------
+
+
+def test_choosing_another_design_does_not_reuse_the_old_performer_embedding(proj):
+    import numpy as np
+
+    from tests.test_voicebank import _HashEmbedder, fingerprint
+    from vndub.stages import genutil as gu
+
+    ctx = proj
+    voicebank.propose_designs(ctx, "sakura", n=2)
+    ds = [d for d in voicebank.list_designs(ctx, "sakura") if d["kind"] != "clone"]
+    assert len(ds) >= 2
+    fake = _HashEmbedder()
+
+    def performer_vectors():
+        perf = gu.load_performer(ctx, "sakura")
+        jobs = [(f"perf|{r['path']}", ctx.paths.abs(r["path"]), ctx.paths.vb("sakura") / "emb" / f"perf_{Path(r['path']).stem}.fake.npy") for r in perf["refs"]]
+        vecs = gu.embed_paths(ctx, fake, jobs)
+        return {key: (vecs[key], fingerprint(wav)) for key, wav, _ in jobs}
+
+    voicebank.choose_design(ctx, "sakura", ds[0]["design_id"], "B")
+    first = performer_vectors()
+    assert first and all(np.array_equal(got, want) for got, want in first.values())
+    voicebank.choose_design(ctx, "sakura", ds[1]["design_id"], "B")  # the copies under neutral_01.wav are another voice now
+    second = performer_vectors()
+    assert all(np.array_equal(got, want) for got, want in second.values())  # copied with a fresh mtime, the old npy is gone
+    assert any(not np.array_equal(first[k][0], second[k][0]) for k in first if k in second)
+
+
+def test_train_rvc_keeps_casting_edits_made_during_the_training(proj, monkeypatch):
+    from vndub.manifest.io import save_characters
+
+    ctx = proj
+    voicebank.propose_designs(ctx, "sakura", n=2)
+    voicebank.choose_design(ctx, "sakura", voicebank.list_designs(ctx, "sakura")[0]["design_id"], "B")
+    real = voicebank._rvc_train_character
+
+    def edited_meanwhile(ctx_, cache, sid, clips, chars, char_f0, holder, reasons, progress=None):
+        out = real(ctx_, cache, sid, clips, chars, char_f0, holder, reasons, progress)  # the (hours-long) training
+        edited = load_characters(ctx.paths.characters)  # ... during which the user went on casting
+        edited[sid].description = "tired teacher"
+        edited[sid].route = "A"
+        edited["haruto"].gender = "f"
+        save_characters(ctx.paths.characters, edited)
+        return out
+
+    monkeypatch.setattr(voicebank, "_rvc_train_character", edited_meanwhile)
+    res = voicebank.train_rvc(ctx, "sakura")
+    assert res["state"] == "done"
+    after = load_characters(ctx.paths.characters)
+    assert after["sakura"].rvc["model"] == res["meta"]["model"]  # the result of the training is saved ...
+    assert after["sakura"].description == "tired teacher" and after["sakura"].route == "A" and after["haruto"].gender == "f"  # ... the edits are not reverted
+
+
+def test_auto_cast_gives_route_p_to_a_character_with_too_little_audio_for_rvc(proj):
+    ctx = proj
+    voicebank.propose_designs(ctx, "sakura", n=2)
+    voicebank.propose_designs(ctx, "haruto", n=2)
+    ctx.cfg.voicebank.min_minutes_for_voicebank = 30.0  # the stage trains no RVC model below this
+    voicebank.auto_cast(ctx)
+    chars = load_characters(ctx.paths.characters)
+    assert chars["sakura"].route == "P" and chars["haruto"].route == "P"  # B would convert with a model that is never made
+    ctx.cfg.voicebank.min_minutes_for_voicebank = 0.0
+    voicebank.auto_cast(ctx)
+    assert load_characters(ctx.paths.characters)["sakura"].route == "B"

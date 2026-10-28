@@ -1,5 +1,6 @@
 import { Suspense, lazy, useEffect, type ReactNode } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ErrorPanel } from "./components/ErrorPanel";
 import { ActiveJobBar, ResumePrompt, Stepper, TopBar } from "./components/Shell";
 import { ToastProvider } from "./components/ui";
@@ -81,7 +82,9 @@ function StepRoute() {
   const step = (STEP_IDS as string[]).includes(param ?? "") ? (param as StepId) : null;
 
   useEffect(() => {
-    if (step && project && project.state.step !== step) void saveState({ step });
+    // Diagnostics is a side trip (the top bar link, the first launch): it is never "where the user stopped", so the
+    // wizard link and the next launch keep opening the step saved before it
+    if (step && step !== "doctor" && project && project.state.step !== step) void saveState({ step });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, project?.slug]);
 
@@ -109,7 +112,8 @@ function Landing() {
     );
   }
   if (!project) return <Navigate to={stepPath(firstRunDone() ? "game" : "doctor")} replace />;
-  return <Navigate to={stepPath(project.state.step)} replace />;
+  // a project saved by an older build may still have "doctor" as its step
+  return <Navigate to={stepPath(project.state.step === "doctor" ? "game" : project.state.step)} replace />;
 }
 
 function Plain({ children }: { children: ReactNode }) {
@@ -132,16 +136,18 @@ export default function App() {
         <Attention />
         <ToastProvider>
           <ProjectProvider>
-            <Routes>
-              <Route path="/" element={<Landing />} />
-              <Route path="/step/:step" element={<StepRoute />} />
-              <Route path="/models" element={<Plain><ModelsScreen tab="models" /></Plain>} />
-              <Route path="/tools" element={<Plain><ModelsScreen tab="tools" /></Plain>} />
-              <Route path="/settings" element={<Plain><SettingsScreen /></Plain>} />
-              <Route path="/help" element={<Plain><HelpScreen /></Plain>} />
-              <Route path="/help/:id" element={<Plain><HelpScreen /></Plain>} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Routes>
+            <ErrorBoundary>
+              <Routes>
+                <Route path="/" element={<Landing />} />
+                <Route path="/step/:step" element={<StepRoute />} />
+                <Route path="/models" element={<Plain><ModelsScreen tab="models" /></Plain>} />
+                <Route path="/tools" element={<Plain><ModelsScreen tab="tools" /></Plain>} />
+                <Route path="/settings" element={<Plain><SettingsScreen /></Plain>} />
+                <Route path="/help" element={<Plain><HelpScreen /></Plain>} />
+                <Route path="/help/:id" element={<Plain><HelpScreen /></Plain>} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Routes>
+            </ErrorBoundary>
           </ProjectProvider>
         </ToastProvider>
       </SettingsProvider>

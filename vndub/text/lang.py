@@ -10,7 +10,8 @@ script -- kana, han (kanji / hanzi), hangul, Cyrillic, Latin -- and decides from
 kana among the CJK letters means Japanese, han without kana Chinese, hangul Korean, Cyrillic
 Russian (Ukrainian when its own letters і ї є ґ appear), Latin one of en / de / fr / es / it / pt by
 a small stop-word vote (English when nothing wins). The confidence is the share of the winning
-script among all letters, scaled down for very short samples.
+script among all letters, scaled down for very short samples. Text in any other script (Arabic, Thai, Greek,
+Hindi ...) gives an empty code: the language is unknown.
 
 :func:`speech_units` is the length of a line in *mora equivalents*: exact morae for Japanese
 (:func:`vndub.text.ja.count_morae`), otherwise an estimated syllable count scaled by
@@ -93,7 +94,7 @@ def detect_language(texts: Iterable[str], max_lines: int = 4000, min_letters: in
     """Guess the language of the script lines (see the module docstring).
 
     ``max_lines`` lines are sampled evenly over the input; fewer than ``min_letters`` letters scale the
-    confidence down. An empty input gives ``LangGuess("", 0.0)``.
+    confidence down. An empty input, or text mostly in a script that is not detected, gives an empty ``lang``.
     """
     rows = [t for t in texts if t and t.strip()]
     if len(rows) > max_lines:
@@ -125,6 +126,10 @@ def detect_language(texts: Iterable[str], max_lines: int = 4000, min_letters: in
         lang, conf = "ko", share["hangul"]
     elif cjk and cjk >= counts["latin"] + counts["cyrillic"]:
         lang, conf = "zh", share["han"]
+    elif counts["other"] > max(counts["cyrillic"], counts["latin"]):
+        # Arabic / Thai / Greek / Hindi ...: no detector here knows them, and "ru" (the old tie-break at zero
+        # Cyrillic and zero Latin letters) would make translate see source == target and keep the text as is
+        lang, conf = "", share["other"]
     elif counts["cyrillic"] >= counts["latin"]:
         lang, conf = ("uk" if uk / max(1, counts["cyrillic"]) >= 0.01 else "ru"), share["cyrillic"]
     else:

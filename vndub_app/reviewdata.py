@@ -167,7 +167,7 @@ def lines_view(
     snap = viewdata.snapshot(h, ctx)
     sel = viewdata.selection(ctx)
     if not sel or not snap.lines:
-        return {"items": [], "facets": {"speakers": [], "scenes": []}, "counts": {"ok": 0, "check": 0, "failed": 0}, "total": 0}
+        return {"items": [], "facets": {"speakers": [], "scenes": []}, "counts": {"ok": 0, "check": 0, "failed": 0}, "total": 0, "touched_count": len(touched_ids(h))}
     trs = viewdata.translations(ctx)
     chars = viewdata.load_characters(ctx)
     ovs = viewdata.overrides_by_line(ctx)
@@ -212,7 +212,8 @@ def lines_view(
         r.pop("_order", None)
     speakers = [{"speaker_id": k, "name": viewdata.display_name(k, chars), "count": v} for k, v in sorted(sp_count.items(), key=lambda kv: (-kv[1], kv[0]))]
     scenes = [{"scene": k, "count": v} for k, v in scene_count.items()]
-    return {"items": rows, "facets": {"speakers": speakers, "scenes": scenes}, "counts": counts, "total": total}
+    # every touched line, whatever the filter shows: it is what "Apply" will re-synthesize
+    return {"items": rows, "facets": {"speakers": speakers, "scenes": scenes}, "counts": counts, "total": total, "touched_count": len(touched)}
 
 
 # ----------------------------------------------------------------------------
@@ -304,6 +305,9 @@ def line_detail(h: appdirs.ProjectHandle, line_id: str) -> dict[str, Any]:
     for o in ovs:
         if o.action == "tuning":
             tuning_override = o.payload
+    # a line's own tuning replaces the character's as a whole (vndub.stages.synth), so the panel starts from the character's
+    char = chars.get(line.speaker_id)
+    character_tuning = casting.get_tuning(char) if char is not None else dict(casting.TUNING_DEFAULT)
     pp = viewdata.passport(ctx, line_id)
     if pp and pp.get("source") == "text":
         delivery: dict[str, Any] | None = {"source": "text", "layer": (pp.get("delivery") or {}).get("layer")}
@@ -316,7 +320,7 @@ def line_detail(h: appdirs.ProjectHandle, line_id: str) -> dict[str, Any]:
         "line": row,
         "original_url": session.work_url(h, line.src_wav) if snap.is_voiced(line_id) and line.src_wav else None,
         "candidates": out_cands, "why": why, "style_prompt": style_prompt,
-        "text_tts": (tr.text_tts or tr.text_tgt) if tr else "", "refs": refs, "tuning_override": tuning_override,
+        "text_tts": (tr.text_tts or tr.text_tgt) if tr else "", "refs": refs, "tuning_override": tuning_override, "character_tuning": character_tuning,
         "selection": {"status": sel.status, "route": sel.route, "backend": sel.backend},
     }
 

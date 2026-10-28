@@ -55,9 +55,34 @@ def health() -> dict[str, Any]:
     return {"ok": True, "version": __version__, "profile": s.profile, "mock": s.profile == "apptest"}
 
 
+def is_broad_folder(path: Path) -> bool:
+    """Is ``path`` a drive root (or a network share root), the user's profile folder or a folder above it (``C:/Users``)?"""
+    p = Path(os.path.normpath(str(path)))
+    if p.parent == p:
+        return True
+    try:
+        home = os.path.normcase(str(Path.home()))
+    except (RuntimeError, OSError):  # no home folder to compare with
+        return False
+    me = os.path.normcase(str(p)).rstrip(os.sep + "/")
+    return home.rstrip(os.sep + "/") == me or home.startswith(me + os.sep)
+
+
+def _refuse_broad_folder(raw: str) -> None:
+    """The folders of the app hold what it may end: the processes that run from the environments folder are terminated as
+    orphans and when the environments are reinstalled. On a drive root or the profile folder those would be the user's own
+    programs, so such a folder is not accepted (a folder of its own is: ``D:/VNDub``)."""
+    if raw and is_broad_folder(Path(raw)):
+        raise AppError(
+            "permission_denied", params={"path": raw}, status=422,
+            details=f"{raw} is a drive root or the user profile folder: the app files need a folder of their own (for example {Path(raw) / 'VNDub'})",
+        )
+
+
 def _check_folder(field: str, value: Any, *, busy_check: bool = False) -> str:
     """A folder chosen in Settings: ``""`` (the default) or an absolute path the app can create and write to.
 
+    A drive root or the user's profile folder is refused (:func:`_refuse_broad_folder`).
     ``busy_check`` refuses (409 ``job_busy``) while any job runs: a job may be using the old folder.
     """
     if value is None:
@@ -67,6 +92,7 @@ def _check_folder(field: str, value: Any, *, busy_check: bool = False) -> str:
     raw = value.strip()
     if raw and not Path(raw).is_absolute():
         raise _bad(field, raw)
+    _refuse_broad_folder(raw)
     if busy_check:
         active = jobs.runner().list(active_only=True)
         if active:
@@ -205,6 +231,7 @@ def set_data_dir(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     raw = str(body.get("path") or "").strip()
     if not raw:
         raise _bad("path", raw)
+    _refuse_broad_folder(raw)
     active = jobs.runner().list(active_only=True)
     if active:
         raise AppError("job_busy", params={"job_id": active[-1].id, "kind": active[-1].kind}, status=409)

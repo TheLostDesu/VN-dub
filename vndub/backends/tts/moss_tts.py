@@ -7,9 +7,11 @@ exist, and the official ``OpenMOSS-Team/MOSS-TTS-GGUF`` is the older v1.0 for Op
 (gated, plus separate embedding/LM-head/ONNX-tokenizer downloads, no CLI). The weights used here are the audio.cpp
 package of v1.5 that audio.cpp's own ``model_specs/moss_tts_v15.json`` installs from:
 ``christopherthompson81/MOSS-TTS-v1.5-GGUF`` (community conversion of the Apache-2.0 ``OpenMOSS-Team/MOSS-TTS-v1.5``;
-one self-contained file with the backbone, the encoder+decoder codec and the tokenizer). Q4_K is 9.3 GB and its
-voice-cloning peak is about 9 GiB of VRAM (measured on an RTX 3090 by the package author): it does NOT fit an 8 GB card.
-Q8_0 (13.2 GB) and bf16 (20.5 GB) are in the same repo.
+one self-contained file with the backbone, the encoder+decoder codec and the tokenizer). Q4_K is 9.3 GB on disk and its
+voice-cloning peak is 14.1 GiB of VRAM (audio.cpp ``docs/models/moss_tts_v15.md``, measured on an RTX 3090: cloning keeps
+both halves of the codec resident): it fits neither an 8 GB nor a 12 GB card, hence ``vram_estimate_gb`` 14.5 (an estimate
+of 9.5 let a 12 GB card pass the fit check and spill or run out of memory). Q8_0 (13.2 GB, 17.9 GiB peak) and bf16
+(20.5 GB, does not clone on 24 GiB) are in the same repo.
 
 ``args`` is the documented audio.cpp command line (``docs/models/moss_tts_v15.md``): ``--task clon --family moss_tts_v15``,
 ``duration_frames`` = the duration budget. audio.cpp lists en/zh as the tested languages and the adapter passes no
@@ -26,7 +28,7 @@ SPECS = [
         adapter="moss_tts",
         license="Apache-2.0",
         commercial_ok=True,
-        vram_estimate_gb=9.5,
+        vram_estimate_gb=14.5,  # q4_k CUDA cloning peak 14.1 GiB (audio.cpp docs/models/moss_tts_v15.md)
         weights=(
             WeightSpec(
                 "hf_file",

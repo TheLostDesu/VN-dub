@@ -191,10 +191,29 @@ def test_audio_serves_only_inside_work_and_out(client: Any, project: dict[str, A
         if r.status_code == 404:
             assert r.json()["error"]["code"] == "file_not_found"
     # another project / unknown project
-    assert_error(client.get(f"/api/audio/nope/audio/src/a.wav"), "project_not_found", 404)
+    assert_error(client.get("/api/audio/nope/audio/src/a.wav"), "project_not_found", 404)
     # the data folder's own files are not reachable through any slug
     r = client.get(f"/api/audio/{slug}/..%2f..%2f..%2fsettings.json")
     assert r.status_code == 404 and r.json()["error"]["code"] == "file_not_found"
+
+
+def test_audio_urls_carry_the_file_version(client: Any, project: dict[str, Any]) -> None:
+    """A take regenerated under the same name must get a new URL, or a player that compares URLs keeps the old sound."""
+    import os
+
+    from vndub_app import appdirs, session
+
+    h = appdirs.project_handle(project["slug"])
+    wav = write_wav(h.work / "final" / "l1.wav")
+    base = f"/api/audio/{h.slug}/final/l1.wav"
+    url = session.work_url(h, wav)
+    assert url is not None and url.startswith(base + "?v=") and url.split("?v=")[1].isdigit()
+    assert session.work_url(h, "final/l1.wav") == url  # the relative and the absolute spelling agree
+    assert client.get(url).status_code == 200  # the file route ignores the query
+    st = wav.stat()
+    os.utime(wav, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    assert session.work_url(h, wav) != url
+    assert session.work_url(h, "final/none.wav") == f"/api/audio/{h.slug}/final/none.wav"  # no file, no version
 
 
 def test_audio_rejects_symlinks_leaving_the_project(client: Any, project: dict[str, Any], tmp_path: Path) -> None:

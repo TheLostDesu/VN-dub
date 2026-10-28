@@ -43,7 +43,7 @@ import re
 import threading
 import urllib.error
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -714,7 +714,7 @@ def load_import(path: Path, lines: list[LineRecord], tgt: str, log: Any, src: st
                 rows = list(csv.reader(f, delimiter=delim))
             if rows and rows[0] and rows[0][0].strip().lower() in _ID_KEYS:
                 hdr = [h.strip().lower() for h in rows[0]]
-                ti = next((i for i, h in enumerate(hdr) if h in _tgt_keys(tgt)), 1)
+                ti = next((hdr.index(k) for k in _tgt_keys(tgt) if k in hdr), 1)  # the keys' priority decides, not the column order
                 rows = [[r[0], r[ti] if ti < len(r) else ""] for r in rows[1:]]
             for r in rows:
                 if len(r) >= 2 and r[0].strip():
@@ -1135,14 +1135,21 @@ def translate_llm(
         return r
 
     translator: LlmTranslator | None = None
+    load_error: BaseException | None = None
     backend_name = ""
     tr_lock = threading.Lock()
 
     def get_translator() -> LlmTranslator:
-        nonlocal translator, backend_name
+        nonlocal translator, backend_name, load_error
         with tr_lock:  # the model is loaded once, whichever scene thread misses the cache first
+            if load_error is not None:
+                raise load_error  # the walk over the whole model chain failed once: the other scenes do not walk (and spawn a server) again
             if translator is None:
-                backend, backend_name = _acquire_llm(ctx)
+                try:
+                    backend, backend_name = _acquire_llm(ctx)
+                except BaseException as e:
+                    load_error = e
+                    raise
                 if backend_name != key_backend:
                     # the model the key walk named did not load after all (or the card changed in between): what this
                     # run writes goes under the key of the model that really answers, never under the other's
@@ -1256,9 +1263,12 @@ def translate_llm(
         # scenes are independent (the rolling context never crosses a scene): each worker drives one llama-server
         # slot, so the server decodes several answers in one batch
         ctx.log.info("translating %d scenes on %d llama-server slots", len(scenes), workers)
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="translate") as pool:
-            for fut in [pool.submit(do_scene, scene, scene_lines) for scene, scene_lines in scenes.items()]:
-                fut.result()  # the first failure (backend unavailable ...) is raised here, after the others finished
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="translate")
+        try:
+            for fut in as_completed([pool.submit(do_scene, scene, scene_lines) for scene, scene_lines in scenes.items()]):
+                fut.result()  # the first failure (backend unavailable, a cancel ...) is raised here
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)  # the scenes that did not start yet are dropped, those running finish
     else:
         for scene, scene_lines in scenes.items():
             do_scene(scene, scene_lines)

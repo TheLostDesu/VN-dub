@@ -344,12 +344,19 @@ def test_signature_check_accepts_microsoft_and_rejects_everything_else(tmp_path:
 def test_installer_version_is_the_app_version() -> None:
     import tomllib
 
+    import vndub
     import vndub_app
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert project["version"] == vndub_app.__version__
+    assert project["version"] == vndub.__version__, "vndub/__init__.py is stale: `vndub --version` prints it"
     default = re.search(r'#define AppVersion "([^"]+)"', _iss_text())
     assert default and default.group(1) == project["version"], "the .iss fallback version is stale"
+    web = ROOT / "vndub_app" / "web"
+    package = json.loads((web / "package.json").read_text(encoding="utf-8"))
+    assert package["version"] == project["version"], "vndub_app/web/package.json is stale"
+    lock = json.loads((web / "package-lock.json").read_text(encoding="utf-8"))
+    assert lock["version"] == project["version"] and lock["packages"][""]["version"] == project["version"], "vndub_app/web/package-lock.json is stale"
 
 
 @pytest.mark.skipif(not sys.platform.startswith("win") or shutil.which("powershell") is None, reason="needs Windows PowerShell")

@@ -16,8 +16,14 @@ SPECS = [
         commercial_ok=False,
         vram_estimate_gb=3.0,
         cpu_ok=True,
-        # the repo holds many 5 GB training checkpoints: pull only the v4_winter inference weights + vocab
-        weights=(WeightSpec("hf", repo="Misha24-10/F5-TTS_RUSSIAN", allow=("F5TTS_v1_Base_v4_winter/model_212000.safetensors", "F5TTS_v1_Base/vocab.txt"), size_gb=1.35),),
+        weights=(
+            # the repo holds many 5 GB training checkpoints: pull only the v4_winter inference weights + vocab
+            WeightSpec("hf", repo="Misha24-10/F5-TTS_RUSSIAN", allow=("F5TTS_v1_Base_v4_winter/model_212000.safetensors", "F5TTS_v1_Base/vocab.txt"), size_gb=1.35),
+            # F5TTS_v1_Base decodes its mel with Vocos; f5-tts 1.1.9 fetches it from the hub unless ``vocoder_local_path`` is
+            # given, and the adapter runs with HF_HUB_OFFLINE=1, so without this entry the model never loads on a clean machine
+            # (adapters/f5/f5_impl.py finds this directory by its name, ``vocos-mel-24khz``)
+            WeightSpec("hf", repo="charactr/vocos-mel-24khz", allow=("config.yaml", "pytorch_model.bin"), size_gb=0.06),
+        ),
         options={"arch": "F5TTS_v1_Base", "ckpt_glob": "F5TTS_v1_Base_v4_winter/*.safetensors", "vocab_glob": "F5TTS_v1_Base/vocab.txt", "nfe_step": 32, "cfg_strength": 2.0},
         caps={"instruct": "none", "tags": "none", "knobs": "none", "duration": True, "stress_format": "plus", "needs_ref_text": True, "sr": 24000, "langs": ["ru", "en"]},
         profiles=("optional",),

@@ -28,6 +28,7 @@ export default function SettingsScreen() {
   const [confirmPath, setConfirmPath] = useState<{ kind: PathKind; path: string } | null>(null);
   const [gpu, setGpu] = useState(settings.gpu_budget_gb);
   const gpuTimer = useRef<number | null>(null);
+  const gpuPending = useRef<number | null>(null);
 
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
@@ -55,13 +56,21 @@ export default function SettingsScreen() {
 
   const setGpuBudget = (v: number) => {
     setGpu(v);
+    gpuPending.current = v;
     if (gpuTimer.current !== null) window.clearTimeout(gpuTimer.current);
-    gpuTimer.current = window.setTimeout(() => void update({ gpu_budget_gb: v }), 600);
+    gpuTimer.current = window.setTimeout(() => {
+      gpuTimer.current = null;
+      gpuPending.current = null;
+      void update({ gpu_budget_gb: v });
+    }, 600);
   };
+  // leaving the screen within the debounce must not drop the change: save it now (like the other autosaves)
   useEffect(
     () => () => {
       if (gpuTimer.current !== null) window.clearTimeout(gpuTimer.current);
+      if (gpuPending.current !== null) void update({ gpu_budget_gb: gpuPending.current });
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
 
@@ -90,6 +99,9 @@ export default function SettingsScreen() {
       setShowPath(false);
       setNewDir("");
       toast.show(t("settings.data_dir.changed"));
+      // The server now works on another folder, but this page still holds the old game, its jobs and a progress socket
+      // attached to the old runner: start the page over (after a moment, so the message can be read).
+      window.setTimeout(() => window.location.reload(), 1200);
     } catch (e) {
       setError(toErrorInfo(e));
     }

@@ -19,8 +19,14 @@
 * Records are persisted to ``<data>/jobs.json``; jobs that were active when the app
   stopped come back as ``interrupted`` and the UI offers to continue (the pipeline resumes
   from ``work/stage_status.json`` + its caches); an interrupted record nobody continued is forgotten after
-  ``INTERRUPTED_KEEP_DAYS`` days. A record keeps the ``settings`` it was submitted with (``pipeline.submit``), so a
-  resume can tell that the budget, the translation model or the folders changed in between.
+  ``INTERRUPTED_KEEP_DAYS`` days, or as soon as a job of the same kind in the same project finishes (the user did the work
+  again by hand). The file keeps the newest ``JOBS_KEEP`` finished records plus every active and interrupted one. A record
+  keeps the ``settings`` it was submitted with (``pipeline.submit``), so a resume can tell that the budget, the translation
+  model or the folders changed in between.
+* Bookkeeping never fails a job and never ends the worker thread: saving ``jobs.json`` and the throughput file catch their errors
+  (a log line), snapshot and write of a save are one step (the later snapshot is the one on disk), the done event is set after
+  the final save, and strings that cannot be encoded as UTF-8 (lone surrogates of an undecodable file name) are cleaned on the
+  way in. ``submit(guard=...)`` checks "is something else running?" under the runner lock, so check and queue are one step.
 * ``result["warnings"]``: what a run skipped or substituted (``JobContext.add_warnings``; shapes in API.md section 4).
 * Every change is published to subscribers (the ``/api/progress`` WebSocket) as
   ``{"type": "job", "job": JobInfo}`` and ``{"type": "log", "job_id", "line"}``.
@@ -58,6 +64,7 @@ EMIT_INTERVAL_S = 0.25
 JOB_LOG_KEEP = 30  # per-job log files kept in <data>/logs/jobs (the newest by name = by start time)
 JOB_LOG_FLUSH_S = 2.0  # the flusher thread writes buffered job log lines to disk at least this often
 JOB_LOG_READ_MAX = 5 * 1024 * 1024  # GET /api/jobs/{id}/log returns at most this much (newest lines)
+JOBS_KEEP = 100  # finished records kept in jobs.json (active and interrupted ones are always kept)
 INTERRUPTED_KEEP_DAYS = 14  # an interrupted record nobody continued is forgotten at the next start after this long
 MIN_RECORD_ITEMS = 10  # a job that processes fewer lines (listen, tuning) does not feed the throughput store
 MIN_RECORD_MEASURED = 20  # a stage is recorded when it measured this many items ...
@@ -70,6 +77,29 @@ _SECRET_KEY_RE = re.compile(r"token|secret|passw|api_?key", re.IGNORECASE)
 def _stamp() -> str:
     """Local wall-clock time ``HH:MM:SS`` that prefixes every job log line."""
     return time.strftime("%H:%M:%S")
+
+
+def _clean(text: str) -> str:
+    """``text`` with lone surrogates (what an undecodable NTFS file name turns into) replaced by ``?``: they cannot be written as
+    UTF-8, and one in a log line, a result or a message used to break the job log, ``jobs.json``, the API and the socket."""
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "replace").decode("utf-8")
+
+
+def _clean_obj(value: Any) -> Any:
+    """:func:`_clean` for every string inside ``value`` (dicts, lists, tuples); other values pass through."""
+    if isinstance(value, str):
+        return _clean(value)
+    if isinstance(value, dict):
+        return {(_clean(k) if isinstance(k, str) else k): _clean_obj(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean_obj(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clean_obj(v) for v in value)
+    return value
 
 
 def _first_line(text: str | None, limit: int = 200) -> str:
@@ -248,7 +278,10 @@ class ThroughputStore:
             if self.path:
                 from vndub_app.appdirs import write_json_atomic
 
-                write_json_atomic(self.path, self.data)
+                try:
+                    write_json_atomic(self.path, self.data)
+                except OSError as e:  # the speed of a stage is bookkeeping: a locked file must not fail a job whose work is done
+                    log.warning("cannot save the throughput of stage %s to %s: %s", stage, self.path, e)
 
     def estimate(self, stages: list[str], n_items: int) -> float | None:
         vals = [self.data.get(s) for s in stages]
@@ -300,8 +333,13 @@ class JobRecord:
     settings: dict[str, Any] = field(default_factory=dict)
     log_tail: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        # not a dataclass field (asdict would try to copy it): guards ``result`` against being changed while info() copies it
+        self._lock = threading.RLock()
+
     def info(self, with_log: bool = False) -> dict[str, Any]:
-        d = asdict(self)
+        with self._lock:  # set_result / add_warnings change ``result`` from the job thread: "dictionary changed size during iteration"
+            d = asdict(self)
         if not with_log:
             d.pop("log_tail", None)
         return d
@@ -337,7 +375,7 @@ class _JobLogFile:
         with self._lock:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                self._f = open(self.path, "w", encoding="utf-8", newline="\n")  # noqa: SIM115  (closed by close())
+                self._f = open(self.path, "w", encoding="utf-8", errors="replace", newline="\n")  # noqa: SIM115  (closed by close(); a lone surrogate becomes "?")
             except OSError as e:
                 self._failed(e)
                 return False
@@ -569,7 +607,8 @@ class JobContext:
         self.runner._log(self.job, line)
 
     def set_result(self, **kv: Any) -> None:
-        self.job.result.update(kv)
+        with self.job._lock:
+            self.job.result.update(_clean_obj(kv))
         self.runner._update(self.job, force=True)
 
     def add_warnings(self, items: list[dict[str, Any]]) -> int:
@@ -597,6 +636,7 @@ class JobRunner:
         self._subs: list[Callable[[dict[str, Any]], None]] = []
         self._last_emit: dict[str, float] = {}
         self._last_save = 0.0
+        self._save_lock = threading.Lock()
         self._gpu_q: "queue.Queue[str | None]" = queue.Queue()
         self._done_events: dict[str, threading.Event] = {}
         self._load()
@@ -635,13 +675,21 @@ class JobRunner:
         self._last_save = now
         from vndub_app.appdirs import write_json_atomic
 
-        with self._lock:
-            recs = sorted(self._jobs.values(), key=lambda r: r.created)[-100:]
-            data = [r.info(with_log=True) for r in recs]
-        try:
-            write_json_atomic(self.state_file, data)
-        except OSError as e:  # never let bookkeeping kill a job
-            log.warning("cannot save jobs: %s", e)
+        # Snapshot and write are one step: with two savers (the job thread's final save, stop_jobs) the file must end up with
+        # the later snapshot, not with an older one that happened to be written last.
+        with self._save_lock:
+            with self._lock:
+                recs = sorted(self._jobs.values(), key=lambda r: r.created)
+                # the newest JOBS_KEEP finished records; an active or an interrupted one is never dropped (a hundred 3-line
+                # listen jobs must not push the job the user can still continue out of the file)
+                keep = [r for r in recs if r.state in ACTIVE or r.state == "interrupted"]
+                rest = [r for r in recs if r.state not in ACTIVE and r.state != "interrupted"][-JOBS_KEEP:]
+                recs = sorted(keep + rest, key=lambda r: r.created)
+                data = [r.info(with_log=True) for r in recs]
+            try:
+                write_json_atomic(self.state_file, data)
+            except Exception as e:  # never let bookkeeping kill a job (or the worker thread that runs the next one)
+                log.warning("cannot save jobs: %s: %s", type(e).__name__, e)
 
     # -- pub/sub -------------------------------------------------------------
     def subscribe(self, cb: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
@@ -666,10 +714,10 @@ class JobRunner:
                 log.debug("subscriber failed: %s", e)
 
     def _update(self, job: JobRecord, force: bool = False, **fields: Any) -> None:
-        with self._lock:
+        with self._lock, job._lock:
             old_state = job.state
             for k, v in fields.items():
-                setattr(job, k, v)
+                setattr(job, k, _clean_obj(v))
             new_state = job.state
         if new_state != old_state:
             self._on_state(job, old_state, new_state)
@@ -681,7 +729,7 @@ class JobRunner:
 
     def _log(self, job: JobRecord, line: str) -> None:
         """One job log line: ``HH:MM:SS text`` into the record's tail, the job's log file and the subscribers."""
-        line = f"{_stamp()} {line}"
+        line = f"{_stamp()} {_clean(line)}"
         with self._lock:
             job.log_tail.append(line)
             if len(job.log_tail) > LOG_TAIL:
@@ -803,12 +851,20 @@ class JobRunner:
         project: str | None = None,
         gpu: bool = True,
         settings: dict[str, Any] | None = None,
+        guard: Callable[[list[JobRecord]], JobRecord | None] | None = None,
     ) -> JobRecord:
+        """Queue ``fn``. ``guard(active)`` (optional) is called with every active job under the runner lock, right before the
+        record is added, so that "is something else running?" and "queue this" are one step: two clicks on Start cannot both pass.
+        It raises (``job_busy``) to refuse, or returns an active job to hand back instead of queueing a new one."""
         job = JobRecord(
             id=uuid.uuid4().hex[:12], kind=kind, title_key=title_key or f"jobs.{kind}", params=params or {},
             project=project, gpu=gpu, created=now_iso(), settings=dict(settings or {}),
         )
         with self._lock:
+            if guard is not None:
+                existing = guard(sorted((r for r in self._jobs.values() if r.state in ACTIVE), key=lambda r: r.created))
+                if existing is not None:
+                    return existing
             self._jobs[job.id] = job
             self._ctx[job.id] = JobContext(self, job)
             self._fns[job.id] = fn
@@ -818,17 +874,18 @@ class JobRunner:
         if gpu:
             self._gpu_q.put(job.id)
         else:
-            threading.Thread(target=self._execute, args=(job.id,), name=f"vndub-job-{job.id}", daemon=True).start()
+            threading.Thread(target=self._run_guarded, args=(job.id,), name=f"vndub-job-{job.id}", daemon=True).start()
         return job
 
     def add_warnings(self, job: JobRecord, items: list[dict[str, Any]]) -> int:
         """Append the ``result["warnings"]`` items the job does not have yet (never overwrites); returns how many were new."""
-        with self._lock:
+        with self._lock, job._lock:
             have = list(job.result.get("warnings") or [])
             added = 0
             for it in items:
+                it = _clean_obj(dict(it))
                 if it not in have:
-                    have.append(dict(it))
+                    have.append(it)
                     added += 1
             if not added:
                 return 0
@@ -923,7 +980,28 @@ class JobRunner:
             job_id = self._gpu_q.get()
             if job_id is None:
                 return
+            self._run_guarded(job_id)
+
+    def _run_guarded(self, job_id: str) -> None:
+        """:meth:`_execute` that never raises. The GPU worker is one thread for every job: if bookkeeping around a job raised and
+        ended it, each later job would stay ``queued`` for good."""
+        try:
             self._execute(job_id)
+        except Exception as e:
+            log.exception("job %s: the runner itself failed (%s): the job is marked failed, the worker goes on", job_id, type(e).__name__)
+            job = self._jobs.get(job_id)
+            try:
+                if job is not None and job.state in ACTIVE:
+                    from vndub_app.errors import error_from_exception
+
+                    self._update(job, state="failed", finished=now_iso(), error=error_from_exception(e).to_dict(), force=True)
+            except Exception:
+                if job is not None and job.state in ACTIVE:
+                    job.state = "failed"
+            finally:
+                ev = self._done_events.get(job_id)
+                if ev is not None:
+                    ev.set()
 
     def _execute(self, job_id: str) -> None:
         job = self.get(job_id)
@@ -943,8 +1021,10 @@ class JobRunner:
             res = fn(ctx)
             ctx._finish_stage()
             if res:
-                job.result.update(res)
+                with job._lock:
+                    job.result.update(_clean_obj(res))
             self._update(job, state="done", finished=now_iso(), eta_s=0.0, stage_eta_s=0.0, force=True)
+            self._forget_superseded(job)
         except JobCancelled:
             ctx._end_stage_log("cancelled")
             self._update(job, state="cancelled", finished=now_iso(), force=True)
@@ -961,8 +1041,26 @@ class JobRunner:
             self._log(job, f"ERROR: {err.details.splitlines()[0] if err.details else err.code}")
             self._update(job, state="failed", finished=now_iso(), error=err.to_dict(), force=True)
         finally:
-            self._done_events[job_id].set()
-            self._save(force=True)
+            # The save comes first: whoever wakes on the event (shell.stop_jobs sets "interrupted" and saves) must not be
+            # overtaken by this save of an older snapshot ("cancelled") that lands after it.
+            try:
+                self._save(force=True)
+            finally:
+                self._done_events[job_id].set()
+
+    def _forget_superseded(self, job: JobRecord) -> None:
+        """``job`` finished: the interrupted records of the same kind in the same project are obsolete, the user has done the
+        work again (by hand, not through Continue). Without this "Continue where you left off?" came back for 14 days."""
+        if not job.project:
+            return  # only a project's interrupted jobs are ever offered
+        try:
+            with self._lock:
+                old = [r.id for r in self._jobs.values() if r.state == "interrupted" and r.kind == job.kind and r.project == job.project and r.created < job.created]
+            for jid in old:
+                log.info("job %s (%s): forgotten, job %s did the same work again", jid, job.kind, job.id)
+                self.forget(jid)
+        except Exception:  # bookkeeping: it must not turn a finished job into a failed one
+            log.exception("job %s: cannot forget the interrupted jobs it supersedes", job.id)
 
 
 _RUNNER: JobRunner | None = None

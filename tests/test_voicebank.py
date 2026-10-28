@@ -127,3 +127,197 @@ def test_voicebank_reports_a_missing_embedder(make_ctx, tmp_path):
     assert "unavailable" in str(s["calibration"])
     got = {(u.stage, u.group): u.reason for u in ctx.models.unavailable}
     assert "orphan process" in got[("voicebank", "speaker embedder")]
+
+
+# ---- release 1.0 review fixes -------------------------------------------------------------------------------------------------
+
+
+class _HashEmbedder:
+    """A fake embedder whose vector is a fingerprint of the file's bytes: a cache that reuses a stale npy shows up as a wrong vector."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def call(self, op, items, **kw):
+        import numpy as np
+
+        assert op == "embed"
+        out = []
+        for it in items:
+            self.calls.append(it["id"])
+            np.save(it["out"], fingerprint(it["wav"]))
+            out.append({"id": it["id"], "path": it["out"]})
+        return out
+
+
+def fingerprint(path):
+    import hashlib
+    from pathlib import Path
+
+    import numpy as np
+
+    return np.frombuffer(hashlib.sha256(Path(path).read_bytes()).digest()[:8], dtype=np.uint8).astype(np.float32)
+
+
+def _chosen(line):
+    return [{"line": line, "emotion": "neutral", "arousal": None, "valence": None, "snr": 20.0, "duration": 1.0, "usage": "both"}]
+
+
+def test_new_refs_under_an_old_name_are_not_scored_with_the_old_embedding(vb):
+    import os
+    import time
+
+    import numpy as np
+
+    from vndub.stages import genutil as gu
+
+    ctx, _ = vb
+    sid = "sakura"
+    ls = [l for l in ctx.voiced_lines(apply_only=False) if l.speaker_id == sid]
+    # the second source clip is OLDER than the embedding made in between: shutil.copy2 kept that mtime on the copy
+    os.utime(ctx.paths.abs(ls[1].src_wav), (time.time() - 7200, time.time() - 7200))
+    fake = _HashEmbedder()
+
+    def embed():
+        refs = gu.load_refs(ctx, sid)
+        jobs = voicebank._ref_clip_jobs(ctx, sid, refs, [], {}, "fake")
+        return jobs, gu.embed_paths(ctx, fake, jobs)
+
+    voicebank._write_refs(ctx, sid, _chosen(ls[0]))
+    jobs, vecs = embed()
+    assert len(jobs) == 1 and np.array_equal(vecs[jobs[0][0]], fingerprint(jobs[0][1]))
+    first_calls = len(fake.calls)
+    voicebank._write_refs(ctx, sid, _chosen(ls[1]))  # a different clip, the same name neutral_01.wav
+    jobs2, vecs2 = embed()
+    assert jobs2[0][0] == jobs[0][0] and len(fake.calls) == first_calls + 1  # recomputed, not reused
+    assert np.array_equal(vecs2[jobs2[0][0]], fingerprint(jobs2[0][1])) and not np.array_equal(vecs[jobs[0][0]], vecs2[jobs2[0][0]])
+    # the F0 of the old refs goes too (it is keyed by the same stem)
+    stale = ctx.paths.vb(sid) / "feat" / "neutral_01.f0.npy"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    np.save(stale, np.zeros(3))
+    voicebank._write_refs(ctx, sid, _chosen(ls[0]))
+    assert not stale.exists()
+
+
+def test_refs_cache_key_follows_the_passport_fields_select_refs_reads(vb):
+    from vndub.manifest.io import write_json
+    from vndub.stages import genutil as gu
+
+    ctx, _ = vb
+    sid = "sakura"
+    ref = gu.load_refs(ctx, sid)[0]
+    pp = read_json(ctx.paths.passport(ref.line_id))
+    assert (pp["emotion"].get("adv") or {}).get("arousal") != 0.123
+    # analyze ran again (the ADV model is available now): the new arousal and emotion must reach refs.json
+    pp["emotion"]["adv"] = {"arousal": 0.123, "valence": 0.321, "dominance": 0.5}
+    pp["style"] = {**(pp.get("style") or {}), "emotion": "angry"}
+    write_json(ctx.paths.passport(ref.line_id), pp)
+    voicebank.run(ctx)
+    now = {r.line_id: r for r in gu.load_refs(ctx, sid)}
+    assert now[ref.line_id].arousal == 0.123 and now[ref.line_id].valence == 0.321 and now[ref.line_id].emotion == "angry"
+
+
+def test_refs_without_any_passport_are_chosen_by_duration(make_ctx, tmp_path):
+    import shutil
+
+    from vndub.stages import genutil as gu
+
+    ctx = make_ctx(tmp_path / "game")
+    build(ctx, n_per=3)
+    shutil.rmtree(ctx.paths.passport("x").parent)  # analyze never ran
+    s = voicebank.run(ctx)
+    assert s["refs"] > 0 and s["characters"] == 2  # "refs use durations only" used to leave every character without refs
+    refs = gu.load_refs(ctx, "sakura")
+    assert refs and all(r.snr is None and r.arousal is None and r.duration > 0 for r in refs)
+
+
+def test_run_keeps_casting_edits_made_while_it_trains(vb, monkeypatch):
+    from vndub.manifest.io import save_characters
+
+    ctx, _ = vb
+    ctx.force = True  # train again
+
+    def slow_training(ctx_, cache, sid, clips, chars, char_f0, holder, reasons, progress=None):
+        edited = load_characters(ctx.paths.characters)  # the user works in the casting screen meanwhile
+        edited[sid].description = f"edited while {sid} trains"
+        edited[sid].names = {**edited[sid].names, "tgt": "New name"}
+        edited[sid].performer = {**edited[sid].performer, "tuning": {"pitch_st": 2.0}}
+        save_characters(ctx.paths.characters, edited)
+        chars[sid].rvc = {"model": f"voicebank/{sid}/rvc/trained.pth", "f0_transpose": 0}
+        return "done"
+
+    monkeypatch.setattr(voicebank, "_rvc_train_character", slow_training)
+    voicebank.run(ctx)
+    after = load_characters(ctx.paths.characters)
+    for sid in ("sakura", "haruto"):
+        assert after[sid].description == f"edited while {sid} trains" and after[sid].names["tgt"] == "New name"
+        assert after[sid].performer["tuning"] == {"pitch_st": 2.0}  # the stage's own performer record kept the rest
+        assert after[sid].performer["design_id"] and after[sid].rvc["model"].endswith("trained.pth")
+        assert after[sid].refs  # what the run itself produced is saved too
+
+
+def test_only_a_speaker_with_unvoiced_lines_does_not_run_the_voiced_ones(make_ctx, tmp_path):
+    from tests.p3_helpers import add_unvoiced
+
+    ctx = make_ctx(tmp_path / "game", sets={"synth.voice_unvoiced": True})
+    build(ctx, n_per=3)
+    add_unvoiced(ctx)
+    ctx.only = {"hero"}
+    s = voicebank.run(ctx)
+    assert s["mode_b"] == ["hero"] and s["characters"] == 0 and s["refs"] == 0
+    assert not ctx.paths.vb_refs_json("sakura").exists() and not ctx.paths.vb_refs_json("haruto").exists()
+    assert ctx.paths.vb_performer("hero").exists()
+
+
+def _without_design_backend(monkeypatch):
+    from vndub.stages import genutil as gu
+
+    real = gu.acquire_first
+
+    def no_design_backend(ctx_, names, options=None, *, group=None, stage=None):
+        if group == "performer design backend":
+            return None, None, "the design backend is not installed"
+        return real(ctx_, names, options, group=group, stage=stage)
+
+    monkeypatch.setattr(gu, "acquire_first", no_design_backend)
+
+
+def test_no_design_backend_leaves_variants_undecided(vb, monkeypatch):
+    from vndub.manifest.io import write_yaml
+    from vndub.stages import designs as dz
+
+    ctx, _ = vb
+    sid = "sakura"
+    did = next(d["design_id"] for d in voicebank.list_designs(ctx, sid) if d["kind"] == "voice_design")
+    voicebank.choose_design(ctx, sid, did, "B")
+    # the chosen design has no emotion variants yet and the performer says so
+    ds = dz.load_designs(ctx, sid)
+    for d in ds:
+        d.pop("variants", None)
+    dz.save_designs(ctx, sid, ds)
+    perf = read_yaml(ctx.paths.vb_performer(sid))
+    perf["variants_done"] = False
+    write_yaml(ctx.paths.vb_performer(sid), perf)
+
+    with monkeypatch.context() as m:
+        _without_design_backend(m)
+        voicebank.run(ctx)
+    assert "variants" not in dz.get_design(ctx, sid, did)  # used to be stored as [] and never tried again
+    assert read_yaml(ctx.paths.vb_performer(sid))["variants_done"] is False
+    voicebank.run(ctx)  # the backend is back: the variants are made now
+    assert "variants" in dz.get_design(ctx, sid, did)
+    assert read_yaml(ctx.paths.vb_performer(sid))["variants_done"] is True
+
+
+def test_designs_json_does_not_keep_designs_whose_files_were_deleted(vb, monkeypatch):
+    from vndub.stages import designs as dz
+
+    ctx, _ = vb
+    sid = "sakura"
+    before = dz.load_designs(ctx, sid)
+    assert before and all(d["origin"] == "stage" for d in before)
+    ctx.paths.vb_performer(sid).unlink()  # the performer is lost: the stage designs are made again
+    _without_design_backend(monkeypatch)
+    voicebank.run(ctx)
+    assert dz.load_designs(ctx, sid) == []  # their wavs were deleted above; the list used to keep them
+    assert not any((ctx.paths.vb(sid) / "designs" / d["design_id"]).exists() for d in before)

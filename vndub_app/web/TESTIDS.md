@@ -58,6 +58,7 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 | `resume-candidates` | line "Ещё прерваны: ..." (one title per kind) when `resume.candidates` is not empty; those jobs stay interrupted and are offered next time |
 | `toasts` | live region of short messages |
 | `splash` | start screen while settings load / when the server is unreachable |
+| `app-error`, `app-error-text`, `app-error-reload` | the card that replaces a screen which threw while rendering (`app-error-text` is the error message, `app-error-reload` reloads the window); a navigation clears it |
 | `settings-paths` | Settings: the "Folders" card; rows `settings-path-<data|models|envs|tools>` with the path in `settings-path-<key>-value`; `settings-open-<models|envs|tools>` opens the folder; `settings-change-<models|envs>` picks a new one (dialog `settings-path-dialog`, `settings-path-confirm`; without a native dialog the text field `settings-path-input` + `settings-path-apply`); `settings-reset-<models|envs>` goes back to the default |
 
 ## Shared pieces
@@ -69,7 +70,7 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 | `manual-target-dir`, `manual-copy-target`, `manual-open-target` | same card when the error carries `params.target_dir` ("put the file into this folder") |
 | `report-problem`, `report-button`, `report-done`, `report-open-folder` | "Собрать отчёт о проблеме" |
 | `job-progress` and variants `game-job`, `translate-job`, `preview-job`, `run-job`, `models-download-job`, `models-hf-job`, `models-check-job`, `tools-install-job`, `envs-install-job`, `install-apply-job`, `install-rollback-job`, `install-zip-job`, `review-apply-job`, `casting-gen-job-<sid>`, `casting-listen-job-<sid>` | job panel; inside: `job-title`, `job-stage`, `job-bar`, `job-overall`, `job-counter`, `job-eta`, `job-rate`, `job-item`, `job-stage-list`, `job-pause`, `job-resume`, `job-cancel`, `job-continue`, `job-warnings`, `job-log-toggle`, `job-log`, `job-log-copy`, `job-control-error` (`job-stage` and `job-overall` are absent once a multi-stage job is `done`: one bar then). `job-warnings` is the warn callout of a run that substituted a model or skipped a part (`result.warnings`: substitution / unavailable / mixed_models / settings_changed), one `li` per warning with `data-kind`; it is shown for active and finished jobs, above the log toggle, and absent when there are none |
-| `files-progress`, `file-row-<id>` (`data-state`) | per-file rows of download / install jobs: bytes from `result.files[]`, environments show a state only. Download jobs (`models_download`, `tools_install`, `ffmpeg_download`) count megabytes, `envs_install` environments, `install_*` files; `job-rate` ("реплик в минуту") is only shown for line-based jobs |
+| `files-progress`, `file-row-<id>` (`data-state`) | per-file rows of download / install jobs: bytes from `result.files[]`, environments show a state only. Download jobs (`models_download`, `tools_install`, `ffmpeg_download`) count megabytes, `envs_install` environments, `install_zip` megabytes (`job-counter` reads "N of M MB"), `install_apply` / `install_rollback` a percent only (their totals are not a file count: the backup pass and the copy pass share one); `job-rate` ("реплик в минуту") is only shown for line-based jobs |
 | `save-indicator` (`data-status`) | autosave state (`saving`, `saved`, `error`) |
 | players | `<base>` root with `<base>-play` (button), `<base>-volume` (range): `clip-<sid>-<neutral|emotional|longest>`, `sample-<sid>-<design_id>-<n>`, `review-original`, `candidate-player-<label>`, `library-player-<voice id>`, `listen-<sid>-<line_id>` (A/B: `-a`, `-b`, `-seq`), `preview-ab-<id>` (same suffixes) |
 
@@ -147,7 +148,7 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 `run-title`, `run-setup`, `run-shutdown` (checkbox, default off), `run-shutdown-warning`, `run-start`, `run-closable`,
 `run-progress`, `run-job` (with `job-stage-list`, `job-log`), `run-gpu` (only while `gpu` events arrive), `run-done`, `run-to-review`,
 `run-coverage` (callout under `run-done`: what the patch holds; warn tone when something is provisional or left out; inside `run-coverage-installed`,
-`run-coverage-provisional` + `run-coverage-review` (button to the review), `run-coverage-left-out`, `run-coverage-narration`; the last three only when the number is above 0),
+`run-coverage-provisional` + `run-coverage-review` (button to the review), `run-coverage-left-out`, `run-coverage-narration`, `run-coverage-own-voice` (Ren'Py lines with a `voice` statement of their own, not installable); the last four only when the number is above 0),
 `run-stale-import` + `run-stale-import-go` (warn callout when the project was imported by an older version; button to Step 1).
 
 ## Step 6 Review (`screen-review`)
@@ -156,7 +157,7 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 |---|---|
 | `review-title`, `review-toolbar` | |
 | `review-filter-speaker`, `review-filter-scene`, `review-filter-status`, `review-filter-min`, `review-filter-max`, `review-search` | filters |
-| `review-prefer-a`, `review-apply`, `review-apply-job`, `review-apply-result` | bulk "Пометить всех, как A..." and "Применить изменения" (shows the diff count) |
+| `review-prefer-a`, `review-apply`, `review-apply-job`, `review-apply-result` | bulk "Пометить всех, как A..." and "Применить изменения" (the badge is the server's count of every touched line, whatever the filters show; a running `review_apply` is picked up again when the screen is reopened) |
 | `review-counts`, `review-list`, `review-row-<id>` (`data-status`), `review-empty` | list (virtualized: only rows near the viewport exist in the DOM) |
 | `review-prev`, `review-next` | previous / next line |
 | `review-detail` (`data-line`), `review-detail-status`, `review-why`, `review-asr-badge`, `review-delivery-chip`, `review-detail-patch` | selected line (`review-detail-patch`: "в патче как предварительная" / "нет в патче", absent for a line that is in the patch normally) |
@@ -164,9 +165,9 @@ Browser mode: `POST /api/system/pick-folder` answers `unsupported`, so the SPA s
 | `review-text-src` (only for `text_from_asr` lines: editable) / `review-text-src-readonly`, `review-src-edit`, `review-save-src` | source text |
 | `review-text-tgt`, `review-save-text` | translated text |
 | `review-original`, `review-candidates`, `candidate-<label>` (`data-selected`), `candidate-label-<label>`, `candidate-player-<label>`, `candidate-verdicts-<label>`, `verdict-<voice|emotion|clarity|length|quality>` (`data-level`), `candidate-accept-<label>`, `review-no-candidates` | original and variants |
-| `review-actions`, `review-accept`, `review-regen`, `review-reject`, `review-keep-original`, `review-notice` | actions |
+| `review-actions`, `review-accept`, `review-regen`, `review-reject`, `review-keep-original`, `review-notice` | actions (accepting the last row of the list reloads the detail instead of moving on) |
 | `review-style-toggle`, `review-style`, `review-refs-toggle`, `review-use-ref` | style text, other reference sample |
-| `review-line-tuning` (+ `-toggle`, `-pitch`, `-speed`, `-expressiveness`, `-energy`, `-timbre-*`, `-note`, `-reset`), `review-emotion`, `review-line-tuning-apply` | "Только для этой реплики" |
+| `review-line-tuning` (+ `-toggle`, `-pitch`, `-speed`, `-expressiveness`, `-energy`, `-timbre-*`, `-note`, `-reset`), `review-emotion`, `review-line-tuning-apply` | "Только для этой реплики" (the sliders start from the line's own tuning, else from the character's; reset returns to the character's) |
 
 Keyboard (not in a text field): `Space` play / pause the last used player, `1` original, `2` A, `3` B, `4` C,
 `Enter` accept the selected variant (and go to the next line), `R` regenerate, arrow keys previous / next line.
@@ -175,10 +176,11 @@ They use physical keys (`event.code`), so they also work on the Russian layout.
 ## Step 7 Install (`screen-install`)
 
 `install-title`, `install-plan`, `install-engine`, `install-engine-steps` (plain-language, engine-specific explanation from i18n `install.engine.<engine>.steps`),
-`install-md-toggle` (collapsible "Подробная техническая инструкция (на английском)"), `install-md` (rendered INSTALL.md; it stays in the DOM, hidden, while the section is collapsed), `install-files-toggle`, `install-files`,
+`install-md-toggle` (collapsible "Подробная техническая инструкция (на английском)"), `install-md` (rendered INSTALL.md; it stays in the DOM, hidden, while the section is collapsed), `install-files-toggle` (the title counts every file of the patch: `plan.file_count`), `install-files` (the first 300 only), `install-files-truncated` (hint above the list when the plan holds more files than it lists),
+`install-notes` (info callout with the plan `notes`: `install-note-<unvoiced_manual|encrypted>`, and the plan `helpers`: `install-helper-<name>` with `data-in-game`; absent when there are none),
 `install-manual` (manual engines: never a success message), `install-actions`, `install-backup` (checkbox, default on),
 `install-apply`, `install-apply-job`, `install-done`, `install-backup-select`, `install-no-backups`, `install-rollback`,
-`install-rollback-dialog`, `install-rollback-confirm`, `install-rollback-job`, `install-open-patch`, `install-zip`, `install-zip-job`,
+`install-rollback-dialog`, `install-rollback-confirm`, `install-rollback-job`, `install-rollback-partial` (warn callout under a finished rollback that could not restore some files: they were replaced without a backup), `install-open-patch`, `install-zip`, `install-zip-job`,
 `install-zip-done`, `install-zip-open`, `install-coverage` (three chips beside the file count: `install-coverage-installed`, `install-coverage-provisional`, `install-coverage-left-out`; absent for a patch built before the coverage existed).
 
 ## Models and tools (`/#/models`, `/#/tools`)

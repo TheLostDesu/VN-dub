@@ -115,3 +115,15 @@ def test_master_installs_review_and_regen_lines_as_provisional_by_default(make_c
     ctx.cfg.master.include_review_lines = "skip"  # an explicit choice keeps them out, counted by status
     s2 = master.run(ctx)
     assert s2["skipped"] == {"review": 1, "regen": 1, "no winner": 1} and "provisional" not in s2
+
+
+def test_unvoiced_extension_matches_the_encoder_for_every_codec_master_knows():
+    from vndub.manifest.io import LineRecord
+
+    line = LineRecord(line_id="s_1", scene="s", order=1, speaker_id="e", dialogue_id="start_636ae3f5")
+    for codec in master._CODEC_MAP:  # every ffprobe codec name that master maps to an encoder needs an extension
+        assert codec in master._UNVOICED_EXT, codec
+    # the PCM variants are all encoded as 16-bit PCM, so the file is a wav (it used to be named .ogg and hold PCM)
+    for codec in ("pcm_s16le", "pcm_s24le", "pcm_f32le", "pcm_u8"):
+        assert master.unvoiced_name(line, codec) == "unvoiced/start_636ae3f5.wav", codec
+    assert master.unvoiced_name(line, "vorbis").endswith(".ogg") and master.unvoiced_name(line, None).endswith(".ogg")

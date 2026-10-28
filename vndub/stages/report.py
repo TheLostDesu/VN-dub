@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from jinja2 import Environment, FileSystemLoader, select_autoescape
+from jinja2 import Environment, FileSystemLoader, Undefined, select_autoescape
 
 from vndub.manifest.io import (
     AudioIndexRecord,
@@ -21,7 +21,6 @@ from vndub.manifest.io import (
     SelectionRecord,
     iter_jsonl,
     load_characters,
-    load_lines,
     read_json,
     read_jsonl,
 )
@@ -108,7 +107,9 @@ def collect(ctx: Any) -> dict[str, Any]:
             "total": len(links),
             "ok_pct": round(100.0 * cnt.get("ok", 0) / max(1, len(links)), 1),
             "relinked": sum(1 for r in links if r.relinked_from),
-            "match": _stats([r.match_score for r in links]),
+            # only records an ASR text was compared for: a no_asr record carries the default match_score 0.0, which put
+            # "median match 0" in the report of the app's default mode (the same rule as link's own mean_match)
+            "match": _stats([r.match_score for r in links if r.asr_text]),
             "consistency": _stats([r.spk_consistency for r in links if r.spk_consistency is not None]),
         }
     else:
@@ -300,7 +301,7 @@ def _env() -> Environment:
     env = Environment(loader=FileSystemLoader(str(TEMPLATES)), autoescape=select_autoescape(["html", "j2"]), trim_blocks=True, lstrip_blocks=True)
 
     def fmt(v: Any, nd: int = 3) -> str:
-        if v is None:
+        if v is None or isinstance(v, Undefined):  # a stats dict without data has no "median" key
             return "–"
         if isinstance(v, float):
             return f"{v:.{nd}f}"

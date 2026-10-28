@@ -41,7 +41,7 @@ from vndub.stages import genutil as gu
 from vndub.stages._opcache import OpCache
 from vndub.stages.common import StageContext
 from vndub.stages.link import expected_texts
-from vndub.text import ja
+from vndub.text.lang import speech_units
 from vndub.text.style_prompt import build_style, emotion_vote
 
 NAME = "analyze"
@@ -110,10 +110,12 @@ def run_part(
     value_of: Callable[[LineRecord, dict[str, Any]], Any] | None = None,
     stop_on: Callable[[str], bool] | None = None,
     on_items: Callable[[int, str | None], None] | None = None,
+    options: dict[str, Any] | None = None,
 ) -> PartResult:
     """Run ``op`` for every line with the first usable backend in ``names``.
 
-    Results are cached per line (key = backend + op kwargs + item fields + wav content).
+    Results are cached per line (key = backend + op kwargs + item fields + wav content). ``options`` override the
+    backend's own options when it is loaded (and are part of the key).
     A backend that becomes unavailable mid-way hands over to the next name for all lines,
     so one part never mixes two models (embeddings would not be comparable).
     """
@@ -123,7 +125,7 @@ def run_part(
     for name in [n for n in names if n]:
         res = PartResult()
         try:
-            spec, _ = ctx.models.resolve(name)
+            spec, _ = gu.resolve_backend(ctx, name)
         except BackendUnavailable as e:
             reasons.append(str(e))
             continue
@@ -132,7 +134,7 @@ def run_part(
         for l in lines:
             item = make_item(l)
             sig = {k: v for k, v in item.items() if k not in ("id", "out", "wav")}
-            key = store.key(spec.name, op, op_kwargs, sig, files=[item["wav"]])
+            key = store.key(spec.name, op, op_kwargs, sig, *([options] if options else []), files=[item["wav"]])
             hit = store.get(l.line_id, key, outputs(l) if outputs else ())
             if hit is not None:
                 res.values[l.line_id] = hit
@@ -142,7 +144,7 @@ def run_part(
             on_items(len(lines) - len(todo), None)
         try:
             if todo:
-                backend = ctx.models.acquire(name)
+                backend = ctx.models.acquire(name, options)
                 stopped = False
                 for i in range(0, len(todo), CHUNK):
                     chunk = todo[i : i + CHUNK]
@@ -226,7 +228,9 @@ def build_passport(
     text: str,
     core: dict[str, Any],
     parts: dict[str, PartResult],
+    lang: str = "",
 ) -> Passport:
+    """``lang``: the language of ``text`` (morae of a Japanese line, mora equivalents of the syllables of any other)."""
     p = Passport(line_id=l.line_id, duration_s=core["duration_s"])
     backends: dict[str, str] = {}
     missing: dict[str, str] = {}
@@ -293,8 +297,9 @@ def build_passport(
         backends["timing"] = "vad_only"  # mora rate over the VAD speech time (no forced alignment for this line)
     span = (float(chars[-1]["t1"]) - float(chars[0]["t0"])) if len(chars) >= 2 else 0.0
     speech_s = span if span > 0.2 else (prof["speech_s"] or max(0.1, p.duration_s - prof["leading_silence_s"] - prof["trailing_silence_s"]))
-    morae = ja.count_morae(text)
-    rate = round(morae / speech_s, 3) if speech_s > 0 and morae else None
+    morae = speech_units(text, lang or ctx.src_lang)  # count_morae for every language gave 0 for a Russian / English script: no rate, no tempo
+    # an empty clip has no speaking rate: max(0.1, ...) above would report 140 mora/s for a 14-mora line
+    rate = round(morae / speech_s, 3) if speech_s > 0 and morae and p.duration_s > 0 else None
 
     p.events = events
     p.prosody = {
@@ -421,8 +426,12 @@ def run(ctx: StageContext) -> dict[str, Any]:
         parts["adv"] = run_part(ctx, "adv", [a.adv], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "adv", on_items=step,
                                 value_of=lambda l, r: {k: r.get(k) for k in ("arousal", "dominance", "valence")})
     if a.events:
+        # SenseVoice ships with options.language "ja" (a Japanese decoding hint); the event tags do not depend on the
+        # language, so for voices in another language let the model detect it instead of forcing Japanese
+        events_opts = {"language": "auto"} if audio_lang and audio_lang != "ja" else None
         parts["events"] = run_part(ctx, "events", [a.events], lines, lambda l: {"id": l.line_id, "wav": wav16(l)}, "events", on_items=step,
-                                   value_of=lambda l, r: {"events": list(r.get("events") or []), "raw": event_tags(r.get("raw", ""))})
+                                   value_of=lambda l, r: {"events": list(r.get("events") or []), "raw": event_tags(r.get("raw", ""))},
+                                   options=events_opts)
     if a.aligner and audio_lang != src_lang:
         # a translated release keeps the original voices: the text says something else, nothing to align
         parts["align"] = PartResult()
@@ -463,7 +472,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
     written = 0
     for l in lines:
         core = core_features(ctx, l, core_store)
-        p = build_passport(ctx, l, texts.get(l.line_id, l.text_src), core, parts)
+        p = build_passport(ctx, l, texts.get(l.line_id, l.text_src), core, parts, src_lang)
         prev = read_json(ctx.paths.passport(l.line_id))
         if prev and prev.get("style"):
             p.style = prev["style"]
@@ -509,7 +518,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "lines": written,
         "characters": len(by_spk),
-        "backends": {k: (v.backend or f"unavailable") for k, v in parts.items()},
+        "backends": {k: (v.backend or "unavailable") for k, v in parts.items()},
         "emotions": dict(emo_counts.most_common()),
         "missing_parts": dict(missing),
         "ref_candidates": {sid: len(chars[sid].ref_candidates) for sid in by_spk},

@@ -1,6 +1,6 @@
 ﻿; VNDub installer (Inno Setup 6.3 or newer). Build: packaging\build_app.ps1 (does everything), or only the installer:
 ;   packaging\build_app.ps1 -InstallerOnly                 -> installer\VNDub-Setup.exe from the existing dist\VNDub
-;   iscc /DAppVersion=0.7.1 packaging\VNDub.iss            -> the same, by hand
+;   iscc /DAppVersion=1.0.0 packaging\VNDub.iss            -> the same, by hand
 ; Per-user install (no administrator rights): %LOCALAPPDATA%\Programs\VNDub, Start-menu shortcut, entry under HKCU in
 ; "Apps & features". The one exception is the Microsoft Visual C++ Redistributable the models need: when the runtime
 ; of the machine is missing or older than 14.40, Setup runs {app}\redist\vc_redist.x64.exe, which shows Microsoft's own
@@ -31,7 +31,7 @@
 
 #define AppName "VNDub"
 #ifndef AppVersion
-  #define AppVersion "0.7.1"
+  #define AppVersion "1.0.0"
 #endif
 #define AppPublisher "VNDub"
 #define AppExe "VNDub.exe"
@@ -285,6 +285,9 @@ end;
 
 // Setup closes a running VNDub by itself (CloseApplications); Uninstall does not, and the app has no AppMutex, so
 // the uninstaller closes the copy that runs from this folder: the window first, the process if it ignores that.
+// The reaper (VNDub.exe --reaper, a window-less helper that outlives the app for a few seconds to sweep what the app
+// left behind) is not closed like the app: it has no window, and it waits for the app to exit, so it is dealt with after
+// the app is gone, given time to finish its sweep and killed only if it does not.
 // Other copies of VNDub.exe (another folder, a dev build) are left alone. Needs Windows PowerShell (always there).
 procedure StopRunningApp();
 var
@@ -293,12 +296,19 @@ var
 begin
   Script :=
     'param([string]$Exe)' + #13#10 +
+    '$apps = @(); $reapers = @()' + #13#10 +
     'Get-Process -Name VNDub -ErrorAction SilentlyContinue | ForEach-Object {' + #13#10 +
     '  $w = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $_.Id)' + #13#10 +
     '  if ($w -and $w.ExecutablePath -eq $Exe) {' + #13#10 +
-    '    [void]$_.CloseMainWindow()' + #13#10 +
-    '    if (-not $_.WaitForExit(15000)) { $_.Kill(); [void]$_.WaitForExit(5000) }' + #13#10 +
+    '    if ([string]$w.CommandLine -like "*--reaper*") { $reapers += $_ } else { $apps += $_ }' + #13#10 +
     '  }' + #13#10 +
+    '}' + #13#10 +
+    'foreach ($p in $apps) {' + #13#10 +
+    '  [void]$p.CloseMainWindow()' + #13#10 +
+    '  if (-not $p.WaitForExit(15000)) { $p.Kill(); [void]$p.WaitForExit(5000) }' + #13#10 +
+    '}' + #13#10 +
+    'foreach ($p in $reapers) {' + #13#10 +
+    '  if (-not $p.WaitForExit(10000)) { $p.Kill(); [void]$p.WaitForExit(5000) }' + #13#10 +
     '}' + #13#10;
   Ps := ExpandConstant('{tmp}\vndub-stop.ps1');
   if SaveStringToFile(Ps, Script, False) then

@@ -45,6 +45,32 @@ def test_loudness_normalize_and_true_peak() -> None:
     assert info2["limiter_db"] < 0
 
 
+def test_lufs_of_short_clips_matches_long_clip_of_same_level() -> None:
+    # a clip under the 0.4 s gating block used to be zero-padded: 0.2 s read 3 dB and 0.1 s read 6 dB low
+    ref = loudness.lufs(_tone(2.0), SR)
+    assert ref is not None
+    for sec in (0.05, 0.1, 0.2, 0.3):
+        short = loudness.lufs(_tone(sec), SR)
+        assert short is not None and abs(short - ref) < 0.5, (sec, short, ref)
+    # normalize no longer boosts a short interjection by the padding error
+    out, info = loudness.normalize(_tone(0.1, amp=0.05), SR, target_lufs=-20.0)
+    assert info["lufs_before"] == pytest.approx(loudness.lufs(_tone(2.0, amp=0.05), SR), abs=0.5)
+    assert loudness.lufs(np.zeros(0, dtype=np.float32), SR) is None
+    assert loudness.lufs(np.zeros(100, dtype=np.float32), SR) is None  # digital silence stays "no measurement"
+
+
+def test_limit_true_peak_on_clip_shorter_than_release_window() -> None:
+    # 30 ms at 24 kHz = 720 samples, shorter than the 50 ms release window: np.convolve "same" used to return the kernel length
+    sr = 24000
+    y = _tone(0.03, f0=440.0, amp=0.99, sr=sr)
+    assert y.size == 720 and loudness.true_peak_db(y, sr) > -1.0
+    out, reduction = loudness.limit_true_peak(y, sr, -1.0)
+    assert out.shape == y.shape and reduction < 0
+    assert loudness.true_peak_db(out, sr) <= -1.0 + 0.05
+    out2, info = loudness.normalize(y, sr, target_lufs=-3.0, ceiling_dbtp=-1.0)
+    assert out2.shape == y.shape and loudness.true_peak_db(out2, sr) <= -1.0 + 0.05
+
+
 def test_energy_vad_and_silence_profile() -> None:
     y = np.concatenate([np.zeros(int(0.3 * SR)), _tone(0.5), np.zeros(int(0.4 * SR)), _tone(0.6), np.zeros(int(0.2 * SR))]).astype(np.float32)
     segs = vad.energy_vad(y, SR)

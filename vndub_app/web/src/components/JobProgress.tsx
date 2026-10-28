@@ -2,9 +2,9 @@ import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { api } from "../api/endpoints";
 import { toErrorInfo } from "../api/client";
 import { ACTIVE_STATES, type ErrorInfo, type JobInfo, type JobWarning } from "../api/types";
-import { useI18n } from "../i18n";
+import { useI18n, type TFunc } from "../i18n";
 import { ingestJob, useJobLog } from "../state/progress";
-import { fmtBytes, fmtDuration, fmtNumber, jobWarnings, normalizeFiles, stageLabel, stageSlotFraction } from "../util/format";
+import { clamp, fmtBytes, fmtDuration, fmtNumber, jobWarnings, normalizeFiles, stageLabel, stageSlotFraction } from "../util/format";
 import { ErrorPanel } from "./ErrorPanel";
 import { Button, Callout, Chip, Collapsible, ProgressBar, copyText } from "./ui";
 
@@ -31,10 +31,12 @@ export function LogViewer({ jobId, fallback }: { jobId: string; fallback?: strin
   linesRef.current = lines;
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<number | null>(null);
+  // the store keeps the last LOG_CAP lines, so once the log is full its length stays the same: follow the newest line instead
+  const newest = lines[lines.length - 1];
   useEffect(() => {
     const el = ref.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [lines.length]);
+  }, [lines.length, newest]);
   useEffect(
     () => () => {
       if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
@@ -236,22 +238,42 @@ export function FilesProgress({ files }: { files: unknown }) {
   );
 }
 
-/** Jobs whose done / total are megabytes, environments or files rather than lines. */
+/** Jobs whose done / total are whole megabytes, environments or files rather than lines. */
 const BYTE_JOBS = ["models_download", "models_hf_add", "tools_install", "ffmpeg_download"];
-const FILE_JOBS = ["install_apply", "install_rollback", "install_zip"];
+/** The zip is built byte by byte: its done / total are bytes, shown as megabytes like the downloads above. */
+const RAW_BYTE_JOBS = ["install_zip"];
+/**
+ * The install counts its backup pass and its copy pass in one total (twice the files when a backup is made) and a rollback is
+ * a single step, so neither has an honest "N of M files": they show the percent only.
+ */
+const PERCENT_JOBS = ["install_apply", "install_rollback"];
 
 /** The unit of a stage's counter: synth counts takes (several per line), score the checks it runs on them. */
 function counterKey(kind: string, stage: string | null): string {
-  if (BYTE_JOBS.includes(kind)) return "job.counter_mb";
+  if (BYTE_JOBS.includes(kind) || RAW_BYTE_JOBS.includes(kind)) return "job.counter_mb";
   if (kind === "envs_install") return "job.counter_envs";
-  if (FILE_JOBS.includes(kind)) return "job.counter_files";
+  if (PERCENT_JOBS.includes(kind)) return "job.counter_percent";
   if (stage === "synth") return "job.counter_takes";
   if (stage === "score") return "job.counter_checks";
   return "job.counter";
 }
 
+function megabytes(bytes: number): string {
+  const mb = bytes / 1e6;
+  return mb >= 10 ? String(Math.round(mb)) : fmtNumber(mb, 1);
+}
+
+/** The "N of M ..." line of a job, in the unit the job reports in. */
+function counterText(t: TFunc, job: JobInfo): string {
+  const done = job.state === "done" ? job.total : job.done;
+  const key = counterKey(job.kind, job.stage);
+  if (PERCENT_JOBS.includes(job.kind)) return t(key, { percent: Math.round(clamp(done / job.total, 0, 1) * 100) });
+  if (RAW_BYTE_JOBS.includes(job.kind)) return t(key, { done: megabytes(done), total: megabytes(job.total) });
+  return t(key, { done, total: job.total });
+}
+
 function showsLineRate(kind: string): boolean {
-  return !BYTE_JOBS.includes(kind) && kind !== "envs_install" && !FILE_JOBS.includes(kind) && kind !== "report";
+  return !BYTE_JOBS.includes(kind) && !RAW_BYTE_JOBS.includes(kind) && !PERCENT_JOBS.includes(kind) && kind !== "envs_install" && kind !== "report";
 }
 
 interface Props {
@@ -342,7 +364,7 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
           <ProgressBar value={twoBars ? stageFrac : finished ? 1 : (overall ?? stageFrac)} label={stageName || title} testid="job-bar" />
           <div className="job-numbers">
             {hasTotal ? (
-              <span data-testid="job-counter">{t(counterKey(job.kind, job.stage), { done: job.state === "done" ? job.total : job.done, total: job.total })}</span>
+              <span data-testid="job-counter">{counterText(t, job)}</span>
             ) : active ? (
               <span>{t("job.working")}</span>
             ) : null}

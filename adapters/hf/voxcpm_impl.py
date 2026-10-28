@@ -62,14 +62,16 @@ class VoxCPM2TTS(TTSImpl):
     def generate(self, item: dict[str, Any]):
         text = _style_prefix(item) + item["text"]
         ref = item.get("timbre_ref")
-        kw: dict[str, Any] = {"reference_wav_path": ref, "seed": item.get("seed")}
+        # no ``seed`` here: voxcpm 2.0.3 ``generate`` takes no seed (and no **kwargs), so passing one raised TypeError
+        # for every item; the seed is applied once per item by ``TTSImpl.op_synthesize`` -> ``set_seed`` (torch/numpy/random)
+        kw: dict[str, Any] = {"reference_wav_path": ref}
         if self.options.get("ultimate") and ref and item.get("timbre_ref_text"):
             kw.update(prompt_wav_path=ref, prompt_text=item["timbre_ref_text"])
         return self._gen(text, **kw)
 
     def design_generate(self, item: dict[str, Any]):
         desc = (item.get("description") or item.get("instruct") or "").strip().strip("()")
-        return self._gen(f"({desc}){item['text']}", seed=item.get("seed"))
+        return self._gen(f"({desc}){item['text']}")  # seed: see generate()
 
     # -- route C -----------------------------------------------------------------
     def op_train_lora(self, job: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
@@ -108,7 +110,8 @@ class VoxCPM2TTS(TTSImpl):
         free_cuda()
         log = out / "train.log"
         with open(log, "w", encoding="utf-8") as lf:
-            r = subprocess.run([sys.executable, str(script), "--config_path", str(cfg_path)], cwd=str(repo), stdout=lf, stderr=subprocess.STDOUT)
+            # stdin=DEVNULL: the training run must not inherit the RPC request pipe
+            r = subprocess.run([sys.executable, str(script), "--config_path", str(cfg_path)], cwd=str(repo), stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT)
         if r.returncode != 0:
             raise RuntimeError(f"VoxCPM LoRA training failed (exit {r.returncode}); see {log}")
         ckpts = sorted((out / "checkpoints").rglob("lora_weights*"), key=lambda p: p.stat().st_mtime)

@@ -296,7 +296,7 @@ def test_engine_instructions_and_job_files_have_keys(ru: dict[str, str], en: dic
     engines = ("renpy", "kirikiri", "nscripter", "siglus", "bgi", "catsystem2", "artemis", "tyrano", "unity", "yuris", "majiro", "generic")
     keys = {f"install.engine.{e}.steps" for e in engines} | {"install.engine.title", "install.md.title"}
     keys |= {f"job.file.{s}" for s in ("pending", "downloading", "verifying", "extracting", "installing", "done", "failed", "skipped", "verified")}
-    keys |= {"job.counter_mb", "job.counter_envs", "job.counter_files"}
+    keys |= {"job.counter_mb", "job.counter_envs", "job.counter_files", "job.counter_percent"}
     keys |= {"jobs.casting_auto", "casting.auto_done", "manual.download.target", "manual.download.open_target"}
     keys |= {"models.env_needed.title", "models.env_needed.text", "models.env_needed.install", "models.env_needed.open"}
     missing_report(keys, ru, en, "engine instructions, download job rows, manual card, env_missing models")

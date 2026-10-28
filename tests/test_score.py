@@ -13,6 +13,7 @@ from vndub.backends.score import prosody as pros
 from vndub.backends.score.speaker_sim import calibrate_eer
 from vndub.config import load_config
 from vndub.manifest.io import CandidateScore, OverrideRecord, SelectionRecord, SynthSidecar, TranslationRecord, read_jsonl
+from vndub.stages import genutil as gu
 from vndub.stages import score, synth
 from vndub.stages.score import apply_scores, composite, cer_reference, evaluate_gates, select, terms, translation_problem
 
@@ -553,3 +554,118 @@ def test_stage_recomputes_a_cer_stored_before_laughter_was_taken_out(make_ctx, t
     for r in _tts_rows(ctx, only_id):
         assert r.metrics.get("cer") is None and "cer" in r.model_extra["na"] and score.LAUGHTER_NOTE in r.notes
         assert "asr_text" not in r.model_extra and "cer" not in r.gates
+
+
+# ---- release 1.0.0 review: ranking among passing takes, nothing to judge by, the speaker gate, --force ----------------------------------
+
+
+def test_select_prefers_a_fully_checked_take_over_a_higher_composite_that_skipped_a_gate():
+    """A take without a CER has its composite renormalised without that term and can outrank a take that passed everything."""
+    blind = apply_scores(_c("a.wav", utmos=4.5, dur_ratio=1.0, spk_sim=0.95), CFG, 0.3, False)  # the ASR heard no words in it
+    blind.notes = ["cer failed: the ASR heard no words in this take"]
+    full = apply_scores(_c("b.wav", utmos=3.6, cer=0.05, dur_ratio=1.0, spk_sim=0.5), CFG, 0.3, False)
+    assert blind.passed and full.passed and blind.composite > full.composite
+    s = _sel([blind, full])
+    assert s.status == "auto" and s.winner == "b.wav" and s.reason == "best of 2 passing"
+    # the same through the run-wide reason (the group was unavailable for one take only is not a thing, but the order must not matter)
+    assert _sel([full, blind]).winner == "b.wav"
+    # every passing take has an unchecked gate: a person decides, on the best of them
+    blind2 = apply_scores(_c("c.wav", utmos=4.0, dur_ratio=1.0, spk_sim=0.9), CFG, 0.3, False)
+    blind2.notes = ["cer failed: the ASR heard no words in this take"]
+    s = _sel([blind2, blind])
+    assert s.status == "review" and s.winner == "a.wav" and "gate not checked" in s.reason and "cer" in s.reason
+    # two fully checked takes: the composite decides, as before
+    better = apply_scores(_c("d.wav", utmos=4.4, cer=0.0, dur_ratio=1.0, spk_sim=0.8), CFG, 0.3, False)
+    assert _sel([full, better, blind]).winner == "d.wav"
+
+
+def test_select_goes_to_review_when_no_gate_could_be_evaluated():
+    only_emotion = apply_scores(_c("a.wav", emo_sim=0.5), CFG, 0.3, False)  # every gate group unavailable, no reference audio
+    assert only_emotion.gates == {} and not only_emotion.passed
+    s = _sel([only_emotion])  # (a regen round of takes that cannot be judged either would be wasted)
+    assert s.status == "review" and s.winner == "a.wav" and "no gate could be evaluated" in s.reason
+    s = select(
+        "l1", [only_emotion], {"a.wav": SynthSidecar(line_id="l1", backend="x", route="A", k=0, created="2026-01-01T00:00:00")}, [], 2,
+        {"mos": "no weights", "cer": "VRAM", "speaker": "no embedder"},
+    )
+    assert s.status == "review" and "no gate could be evaluated" in s.reason and "metrics unavailable" in s.reason and "VRAM" in s.reason
+    # one gate that ran and failed keeps the regen round
+    failing = apply_scores(_c("b.wav", utmos=2.0, emo_sim=0.5), CFG, 0.3, False)
+    assert failing.gates == {"utmos": False}
+    assert _sel([failing]).status == "regen"
+    # a person's decision is still a decision
+    acc = OverrideRecord(line_id="l1", action="accept", payload={"candidate": "a.wav"}, ts="2025-12-31T00:00:00")
+    assert _sel([only_emotion], [acc]).status == "override"
+
+
+def test_the_summary_counts_a_line_with_nothing_to_judge_by_as_unchecked(synthed):
+    from tests.p3_helpers import watch_models
+    from vndub.gpu import VramBudgetExceeded
+
+    ctx = synthed
+    gone = {n: VramBudgetExceeded(n, "an orphan process holds the card") for n in ("utmos22", "ecapa", "whisper_tiny")}
+    ctx.cfg.score.aesthetics = ""
+    watch_models(ctx, unavailable=gone)
+    summary = score.run(ctx)
+    sel = read_jsonl(ctx.paths.selection, SelectionRecord)
+    assert sel and all(s.status == "review" for s in sel)
+    assert summary["lines_with_unchecked_gates"] == len(sel)
+    assert not any(s.status == "regen" for s in sel)  # not a single new take is synthesized for what cannot be judged
+
+
+def test_a_take_with_no_reference_voice_to_compare_with_is_an_unchecked_speaker_gate(synthed, monkeypatch):
+    ctx = synthed
+    real = gu.embed_paths
+    # every reference embedding (voicebank clips, performer clips, the original line) failed: only the takes were embedded
+    monkeypatch.setattr(gu, "embed_paths", lambda c, b, jobs: {k: v for k, v in real(c, b, jobs).items() if k.startswith("cand|")})
+    summary = score.run(ctx)
+    sel = read_jsonl(ctx.paths.selection, SelectionRecord)
+    assert sel and all(s.status == "review" and "gate not checked" in s.reason and "speaker similarity" in s.reason for s in sel)
+    assert all("no reference voice to compare with" in s.reason for s in sel)
+    assert summary["lines_with_unchecked_gates"] == len(sel)
+    rows = read_jsonl(ctx.paths.scores(sel[0].line_id), CandidateScore)
+    assert rows and all(r.metrics.get("spk_sim") is None and "speaker failed: no reference voice to compare with" in r.notes for r in rows)
+    # the references are back: the same takes are measured and accepted (the stale note is not kept)
+    monkeypatch.setattr(gu, "embed_paths", real)
+    score.run(ctx)
+    assert all(s.status != "review" or "gate not checked" not in s.reason for s in read_jsonl(ctx.paths.selection, SelectionRecord))
+    rows = read_jsonl(ctx.paths.scores(sel[0].line_id), CandidateScore)
+    assert all(r.metrics.get("spk_sim") is not None and not any(n.startswith("speaker failed") for n in r.notes) for r in rows)
+
+
+def test_a_reference_clip_that_is_gone_does_not_end_the_stage(make_ctx, tmp_path):
+    """``embed_paths`` stats the wav even when the cached .npy exists; a clip deleted after the first run must not raise."""
+    from vndub.stages import voicebank
+
+    ctx = make_ctx(tmp_path / "game")
+    build(ctx, n_per=2)
+    voicebank.run(ctx)
+    synth.run(ctx)
+    score.run(ctx)
+    gone = 0
+    for sid in {l.speaker_id for l in ctx.voiced_lines()}:
+        for r in gu.load_refs(ctx, sid):
+            ctx.paths.abs(r.path).unlink()
+            gone += 1
+    assert gone
+    ctx.force = True  # every metric is computed again, the speaker group included
+    score.run(ctx)
+    rows = read_jsonl(ctx.paths.scores(ctx.voiced_lines()[0].line_id), CandidateScore)
+    assert rows and all(r.metrics.get("spk_sim") is not None for r in rows)  # measured against the original line instead
+
+
+def test_force_recomputes_every_metric_and_reweight_still_asks_no_model(scored):
+    from tests.p3_helpers import watch_models
+
+    ctx, _ = scored
+    counts = watch_models(ctx)
+    score.run(ctx)
+    assert counts["mos"] == 0 and counts["transcribe"] == 0 and counts["embed"] == 0  # nothing changed: the stored records are reused
+    ctx.force = True
+    score.run(ctx)
+    assert counts["mos"] > 0 and counts["transcribe"] > 0  # (the embedding files on disk are keyed by the audio's mtime: still reused)
+    # --reweight never looks at a model, force or not
+    before = dict(counts)
+    ctx.extra["reweight"] = True
+    score.run(ctx)
+    assert dict(counts) == before

@@ -340,6 +340,29 @@ def test_synth_progress_counts_every_unit_and_never_shrinks(proj):
     assert events[0] == (n_jobs, n_jobs) and set(events) == {(n_jobs, n_jobs)}
 
 
+class _Cancelled(Exception):
+    pass
+
+
+def test_a_cancel_after_a_chunk_keeps_every_take_of_that_chunk(proj):
+    """The app's cancel is raised by the progress report: it must come after the chunk's takes are on disk and in the cache."""
+    ctx = proj
+
+    def cancel_on_the_first_unit(stage, done, total, item):
+        if item is not None:  # (the opening report has no item)
+            raise _Cancelled()
+
+    ctx.extra["progress_cb"] = cancel_on_the_first_unit
+    with pytest.raises(_Cancelled):
+        run_stage("synth", ctx)  # saves the caches on the way out, like a cancelled app job
+    wavs = [p for p in _cands_of(ctx) if not p.name.startswith("orig")]
+    assert len(wavs) > 2, "the project must have more takes than the one that was reported before the cancel"
+    assert all(p.with_suffix(".json").exists() for p in wavs)
+    del ctx.extra["progress_cb"]
+    s = synth.run(ctx)  # the resume finds them all: nothing is generated again
+    assert s["generated"] == 0 and s["cached"] == len(wavs)
+
+
 def test_synth_progress_class_units():
     seen: list[tuple[int, int]] = []
 

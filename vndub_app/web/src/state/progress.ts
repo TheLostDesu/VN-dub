@@ -233,14 +233,20 @@ export function useJobLog(id: string | null | undefined, initial?: string[]): st
   return id ? s.logs[id] ?? [] : [];
 }
 
-/** The most recent job that is still queued, running or paused (optionally of given kinds). */
-export function useActiveJob(kinds?: string[]): JobInfo | null {
+/**
+ * The most recent job that is still queued, running or paused (optionally of given kinds). With `project` (`null` = jobs
+ * without a project) only the jobs of that project count: a run of another game is not this screen's job.
+ */
+export function useActiveJob(kinds?: readonly string[], project?: string | null): JobInfo | null {
   const s = useProgressState();
+  const kindsKey = kinds ? kinds.join("|") : null; // callers pass a new array on every render
   return useMemo(() => {
-    const act = Object.values(s.jobs).filter((j) => ACTIVE_STATES.includes(j.state) && (!kinds || kinds.includes(j.kind)));
+    const act = Object.values(s.jobs).filter(
+      (j) => ACTIVE_STATES.includes(j.state) && (kindsKey === null || kindsKey.split("|").includes(j.kind)) && (project === undefined || (j.project ?? null) === project),
+    );
     act.sort((a, b) => (a.created < b.created ? 1 : -1));
     return act[0] ?? null;
-  }, [s.jobs, kinds]);
+  }, [s.jobs, kindsKey, project]);
 }
 
 /** GPU memory reading, or null when no `gpu` event arrived recently (no NVIDIA GPU, or no GPU job running). */

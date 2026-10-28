@@ -486,6 +486,22 @@ export interface ReviewDetail {
   text_tts: string;
   refs: ReviewRef[];
   tuning_override: Partial<Tuning> | null;
+  /** the full tuning of the line's speaker: a line's own tuning replaces it as a whole, so the line panel starts from it (absent on an older server) */
+  character_tuning?: Tuning;
+}
+
+/** `GET /api/review/lines`: `touched_count` is every touched line of the project, whatever the filters hide (absent on an older server). */
+export interface ReviewLinesResponse {
+  items: ReviewLine[];
+  facets: ReviewFacets;
+  touched_count?: number;
+}
+
+/** `POST /api/review/lines/{id}/action`: `touched` lists every touched line of the project. */
+export interface ReviewActionResult {
+  ok: boolean;
+  touched: string[];
+  touched_count: number;
 }
 
 export interface ReviewFacets {
@@ -506,7 +522,8 @@ export interface DoctorRow {
 
 export interface DoctorReport {
   summary: "ok" | "warn" | "fail";
-  gpu: { name: string; vram_gb: number; driver: string; cuda: string } | null;
+  /** `vram_gb` is null when the driver does not tell the memory (nvidia-smi prints "[N/A]") */
+  gpu: { name: string; vram_gb: number | null; driver: string; cuda: string } | null;
   rows: DoctorRow[];
   data_dir?: string;
   mock?: boolean;
@@ -517,17 +534,20 @@ export interface ToolRow {
   version: string;
   present: boolean;
   required_for: string[];
-  size_mb: number;
-  url: string;
-  filename: string;
-  sha256: string;
+  /** null when the size of some file of the entry is not known */
+  size_mb: number | null;
+  /** null for an entry without a download address */
+  url: string | null;
+  filename: string | null;
+  sha256: string | null;
   manual: boolean;
 }
 
 export interface EnvRow {
   name: string;
   present: boolean;
-  size_gb: number;
+  /** null while the environment is missing (or its size was not measured) */
+  size_gb: number | null;
   torch: "cuda" | "cpu" | null;
 }
 
@@ -616,7 +636,8 @@ export interface ModelsReport {
  * What the built patch covers (`coverage` of manifest_patch.json, API.md section 3 "patch coverage"): `dub_lines` lines are
  * dubbed, `installed` of them have a file in the patch (`provisional` of those from a take that failed the checks), `left_out`
  * have none and stay silent in the game (`left_out_reasons`: review | regen | no_winner | not_mastered | not_scored -> count),
- * `narration` lines are never dubbed.
+ * `narration` lines are never dubbed, `own_voice` (Ren'Py) lines cannot be installed because the script gives them a `voice`
+ * statement of their own whose file is missing or computed at run time (config.auto_voice is never asked for them).
  */
 export interface PatchCoverage {
   dub_lines: number;
@@ -627,7 +648,21 @@ export interface PatchCoverage {
   left_out: number;
   left_out_reasons: Record<string, number>;
   narration: number;
+  own_voice: number;
   include_review_lines: string;
+}
+
+/** A line of the plan's `notes`: an i18n key (`install.note.*`) and its parameters. */
+export interface InstallNote {
+  key: string;
+  params: Record<string, unknown>;
+}
+
+/** A file the install needs next to the game (KiriKiri: `version.dll`): where the app found it and whether the game already has it. */
+export interface InstallHelper {
+  name: string;
+  tool_path: string | null;
+  in_game: boolean;
 }
 
 export interface InstallPlan {
@@ -635,7 +670,15 @@ export interface InstallPlan {
   auto_possible: boolean;
   manual_reason_key: string | null;
   install_md: string;
-  files: { target: string; source: string; exists: boolean }[];
+  /** the first files only (the server sends at most 300): `file_count` is how many the patch really has */
+  files: { target: string; source: string; exists: boolean; size?: number }[];
+  files_truncated?: boolean;
+  file_count?: number;
+  replace_count?: number;
+  add_count?: number;
+  total_mb?: number;
+  notes?: InstallNote[];
+  helpers?: InstallHelper[];
   patch_dir: string;
   backups: { id: string; created: string; files: number | unknown[] }[];
   /** summary of manifest_patch.json; `coverage` is null for a patch built by an older version */

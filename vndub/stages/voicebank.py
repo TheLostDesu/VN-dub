@@ -147,11 +147,24 @@ def select_refs(
     return chosen, relaxed
 
 
+def _forget_vectors(ctx: Any, sid: str, *globs: tuple[str, str]) -> None:
+    """Delete cached embeddings / F0 of clips that are about to be replaced. They are keyed by file stem
+    (``neutral_01``), so a new clip under an old name would otherwise be scored with the old clip's vector."""
+    root = ctx.paths.vb(sid)
+    for sub, pattern in globs:
+        for p in (root / sub).glob(pattern):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
 def _write_refs(ctx: Any, sid: str, chosen: list[dict[str, Any]]) -> list[RefClip]:
     d = ctx.paths.vb_refs(sid)
     if d.exists():
         shutil.rmtree(d)
     d.mkdir(parents=True, exist_ok=True)
+    _forget_vectors(ctx, sid, ("emb", "ref_*.npy"), ("feat", "*.f0.npy"))  # the clips below are different audio under the same names
     refs: list[RefClip] = []
     n_by: dict[str, int] = {}
     for c in chosen:
@@ -159,7 +172,7 @@ def _write_refs(ctx: Any, sid: str, chosen: list[dict[str, Any]]) -> list[RefCli
         n_by[c["emotion"]] = n_by.get(c["emotion"], 0) + 1
         dst = d / f"{c['emotion']}_{n_by[c['emotion']]:02d}.wav"
         src = ctx.paths.abs(l.src_wav)
-        shutil.copy2(src, dst)
+        shutil.copyfile(src, dst)  # not copy2: that keeps the source's older mtime and the embedding cache (npy newer than wav) would be reused
         refs.append(
             RefClip(
                 path=ctx.paths.rel(dst),
@@ -177,15 +190,26 @@ def _write_refs(ctx: Any, sid: str, chosen: list[dict[str, Any]]) -> list[RefCli
     return refs
 
 
+def _passport_inputs(p: dict[str, Any] | None) -> list[Any]:
+    """Everything :func:`select_refs` and :func:`_write_refs` read from a passport (all of it is part of the refs cache key:
+    after analyze is run again, e.g. with the ADV model newly available, refs.json must not keep the old emotion or ``arousal: null``)."""
+    p = p or {}
+    adv = (p.get("emotion") or {}).get("adv") or {}
+    return [p.get("snr_db"), p.get("duration_s"), bool(p.get("bgm")), _emotion_of(p) if p else None, adv.get("arousal"), adv.get("valence")]
+
+
 def _ensure_refs(ctx: Any, cache: Any, sid: str, ls: list[LineRecord], passports: dict[str, dict[str, Any]], chars: dict[str, Character]) -> list[RefClip]:
-    """Reference clips of one character (cached by the clips, their SNR and the refs config)."""
+    """Reference clips of one character (cached by the clips, their passport inputs and the refs config)."""
     vb = ctx.cfg.voicebank
     # the effective source text is part of the key: refs.json carries it (timbre_ref_text), and a set_src_text
     # override / ASR-recovered text changes it without touching any audio
-    key = cache.key("refs", [(l.line_id, l.src_wav) for l in ls], [passports.get(l.line_id, {}).get("snr_db") for l in ls], vb.refs.model_dump(), [l.text_src for l in ls])
+    key = cache.key("refs", [(l.line_id, l.src_wav) for l in ls], [_passport_inputs(passports.get(l.line_id)) for l in ls], vb.refs.model_dump(), [l.text_src for l in ls])
     if cache.fresh(f"refs:{sid}", key, [ctx.paths.vb_refs_json(sid)]):
         refs = gu.load_refs(ctx, sid)
     else:
+        # a line without a passport (analyze not run, or run on a subset) is still a candidate by its length: select_refs
+        # skips lines it knows nothing about, which left no refs at all while the log said "refs use durations only"
+        passports = {**{l.line_id: {"duration_s": gu.src_duration(ctx, l)} for l in ls if l.line_id not in passports}, **passports}
         chosen, relaxed = select_refs(
             ls, passports,
             min_snr_db=vb.refs.min_snr_db, min_sec=vb.refs.min_sec, max_sec=vb.refs.max_sec,
@@ -554,16 +578,17 @@ def _write_performer(ctx: Any, sid: str, d: dict[str, Any], chars: dict[str, Cha
     pdir.mkdir(parents=True, exist_ok=True)
     for p in pdir.glob("*.wav"):  # the previous design's clips and emotion variants
         p.unlink()
+    _forget_vectors(ctx, sid, ("emb", "perf_*.npy"))  # keyed by stem too: the new neutral_01 is another voice
     refs = []
     for i, clip in enumerate(dz.performer_clips(ctx, d)):
         dst = pdir / f"neutral_{i + 1:02d}.wav"
-        shutil.copy2(clip["src"], dst)
+        shutil.copyfile(clip["src"], dst)  # fresh mtime (see _write_refs)
         refs.append({"path": ctx.paths.rel(dst), "emotion": clip.get("emotion", "neutral"), "text": clip["text"]})
     for v in d.get("variants") or []:
         src = ctx.paths.abs(v["wav"])
         if src.exists():
             dst = pdir / f"{v['emotion']}_01.wav"
-            shutil.copy2(src, dst)
+            shutil.copyfile(src, dst)
             refs.append({"path": ctx.paths.rel(dst), "emotion": v["emotion"], "text": v.get("text", "")})
     f0, sim, delta = d.get("f0_median_hz"), d.get("spk_sim"), d.get("f0_delta_st")
     max_delta = ctx.cfg.voicebank.performer.max_f0_delta_semitones
@@ -644,6 +669,7 @@ def run(ctx: Any) -> dict[str, Any]:
     if not voiced and not any(not l.has_voice for l in dub):
         raise StageError("no voiced lines: run parse/extract (and analyze) first")
     chars = ctx.characters()
+    chars_at_start = gu.snapshot_characters(chars)  # the final save changes only what this run changed (training takes hours)
     by_spk: dict[str, list[LineRecord]] = {}
     for l in voiced:
         if l.speaker_id == "narrator":
@@ -656,10 +682,9 @@ def run(ctx: Any) -> dict[str, Any]:
                 unvoiced_raw.setdefault(l.speaker_id, l.speaker_raw or l.speaker_id)
     if ctx.only:
         sel = {s for s in by_spk if s in ctx.only}
-        if sel:
-            by_spk = {s: by_spk[s] for s in sel}
         only_u = {s for s in unvoiced_raw if s in ctx.only}
-        if only_u or sel:
+        if sel or only_u:  # `--only <a speaker with unvoiced lines only>` used to leave every voiced speaker in
+            by_spk = {s: by_spk[s] for s in sel}
             unvoiced_raw = {s: r for s, r in unvoiced_raw.items() if s in only_u}
     passports: dict[str, dict[str, Any]] = {}
     for spk_lines in by_spk.values():
@@ -802,6 +827,8 @@ def run(ctx: Any) -> dict[str, Any]:
             )
         allds = [*kept[sid], *ds]
         if not allds:
+            if dz.load_designs(ctx, sid):  # the stage designs removed above must not stay listed with their files gone
+                dz.save_designs(ctx, sid, [])
             tick(sid)
             continue
         dz.save_designs(ctx, sid, allds)
@@ -837,8 +864,10 @@ def run(ctx: Any) -> dict[str, Any]:
         sentence0 = dz.TEST_SENTENCES.get(lang, dz.TEST_SENTENCES["en"])[0]
         for sid in variant_ids:
             best = picked[sid]
-            best["variants"] = []
-            if not can_vary or not design_backend_name:
+            if not design_backend_name:
+                continue  # no design backend now: leave the variants undecided ("variants_done" false) so that a later run tries again
+            best["variants"] = []  # a backend that takes no style instructions: no variants is the final answer
+            if not can_vary:
                 continue
             emos = [e for e in dict.fromkeys(r.emotion for r in refs.get(sid, [])) if e not in ("neutral", "other", "unknown")]
             vdir = dz.design_dir(ctx, sid, best["design_id"]) / "variants"
@@ -865,7 +894,11 @@ def run(ctx: Any) -> dict[str, Any]:
                         ctx.log.warning("performer variant %s failed: %s", r["id"], r["error"])
             except BackendUnavailable as e:
                 ctx.log.warning("performer emotion variants skipped: %s", e)
+                for sid in variant_ids:
+                    picked[sid].pop("variants", None)  # not rendered: not "done" either
         for sid in variant_ids:  # persist the variants on the design entries
+            if "variants" not in picked[sid]:
+                continue
             allds = dz.load_designs(ctx, sid)
             for d in allds:
                 if d["design_id"] == picked[sid]["design_id"]:
@@ -899,7 +932,7 @@ def run(ctx: Any) -> dict[str, Any]:
         summary["lora"] = _train_lora(ctx, cache, eligible, chars, summary)
 
     cache.save()
-    save_characters(ctx.paths.characters, chars)
+    gu.save_characters_merged(ctx, chars, chars_at_start)
     summary["minutes"] = {s: round(m, 2) for s, m in minutes.items()}
     if not summary["skipped"]:
         summary.pop("skipped")
@@ -1153,7 +1186,10 @@ def _train_lora(ctx: Any, cache: Any, eligible: dict[str, list[LineRecord]], cha
         out_dir = ctx.paths.vb_lora(sid)
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
-            res = backend.call("train_lora", None, job={"speaker_id": sid, "pairs": recs, "out_dir": str(out_dir)}) or {}
+            # hours, like the RVC training above: without timeout_s the per-item default (120 s + 300 s) killed a
+            # VoxCPM LoRA run that takes hours, and its training subprocess lived on holding the VRAM
+            timeout_s = float((getattr(backend, "options", None) or {}).get("timeout_train_s", 6 * 3600))
+            res = backend.call("train_lora", None, job={"speaker_id": sid, "pairs": recs, "out_dir": str(out_dir)}, timeout_s=timeout_s) or {}
         except NotImplementedError:
             reasons[sid] = f"backend {backend.spec.name} has no train_lora op"
             continue
@@ -1418,11 +1454,18 @@ def auto_cast(ctx: Any) -> dict[str, str]:
     """Choose the top-ranked design for every character that has designs; returns ``{speaker_id: design_id}``.
 
     The ``clone`` design is only taken when it is the character's only design (its similarity is high by
-    construction, but it is route A with the accent risk). Route: ``B`` for characters with original audio,
-    ``P`` without, ``A`` for a clone. No model is loaded.
+    construction, but it is route A with the accent risk). Route: ``B`` for characters with original audio
+    (enough of it for ``voicebank.min_minutes_for_voicebank``: below that no RVC model is ever trained), ``P`` without
+    or with too little, ``A`` for a clone. No model is loaded.
     """
     _enter(ctx)
-    voiced = {l.speaker_id for l in ctx.voiced_lines(apply_only=False)}
+    voiced_lines = ctx.voiced_lines(apply_only=False)
+    voiced = {l.speaker_id for l in voiced_lines}
+    min_minutes = ctx.cfg.voicebank.min_minutes_for_voicebank
+    audio = gu.load_audio_index(ctx)
+    seconds: dict[str, float] = {}
+    for l in voiced_lines:
+        seconds[l.speaker_id] = seconds.get(l.speaker_id, 0.0) + gu.src_duration(ctx, l, gu.load_passport(ctx, l.line_id), audio.get(l.audio_id or ""))
     out: dict[str, str] = {}
     for sid in ctx.characters():
         if sid == "narrator":
@@ -1433,6 +1476,10 @@ def auto_cast(ctx: Any) -> dict[str, str]:
             continue
         d = pool[0]
         route = "A" if d["kind"] == "clone" else ("B" if sid in voiced else "P")
+        if route == "B" and seconds.get(sid, 0.0) / 60.0 + 1e-9 < min_minutes:
+            # voice conversion needs the character's RVC model (or refs), which the stage only builds from enough audio
+            ctx.log.info("%s: %.1f min of original audio < %s min (voicebank.min_minutes_for_voicebank): route P instead of B", sid, seconds.get(sid, 0.0) / 60.0, min_minutes)
+            route = "P"
         choose_design(ctx, sid, d["design_id"], route)
         out[sid] = d["design_id"]
     return out
@@ -1461,6 +1508,7 @@ def train_rvc(ctx: Any, speaker_id: str) -> dict[str, Any]:
     _enter(ctx)
     rv = ctx.cfg.voicebank.rvc
     chars, char = _character(ctx, speaker_id)
+    chars_at_start = gu.snapshot_characters(chars)
 
     def result(state: str, code: str = "none", reason: str = "", cached: bool = False) -> dict[str, Any]:
         return {"speaker_id": speaker_id, "state": state, "reason_code": code, "reason": reason, "cached": cached, "meta": dict(char.rvc) if char.rvc else None}
@@ -1486,6 +1534,8 @@ def train_rvc(ctx: Any, speaker_id: str) -> dict[str, Any]:
         raise BackendUnavailable(rv.backend, holder["unavailable"])
     if outcome == "failed":
         return result("failed", "training_failed", reasons.get(speaker_id, ""))
-    save_characters(ctx.paths.characters, chars)
+    # training took hours: characters.yaml is read again and only this character's `rvc` is written onto it, so a casting
+    # edit made meanwhile (a chosen design, tuning, a name) is not reverted by the snapshot loaded before the training
+    gu.save_characters_merged(ctx, chars, chars_at_start)
     ctx.progress(3, 3, speaker_id)
     return {"speaker_id": speaker_id, "state": "done", "reason_code": "none", "reason": "", "cached": outcome == "cached", "meta": dict(chars[speaker_id].rvc)}

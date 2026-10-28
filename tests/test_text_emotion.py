@@ -605,7 +605,6 @@ def test_garbage_delivery_never_triggers_a_retry(make_ctx, tmp_path, monkeypatch
 
 def test_delivery_request_shape(make_ctx, tmp_path, monkeypatch):
     ctx = _project(make_ctx, tmp_path, **{"translate.include_unvoiced": "on", "text_emotion.llm_context_lines": 2})
-    fake = FakeLLM()
     msgs: list[Any] = []
 
     class Spy(FakeLLM):
@@ -907,6 +906,19 @@ def test_english_laughter_gives_event_kind_emotion_and_note(text, kind, emotion,
 def test_laughter_kind_in_every_script(text, tgt, lang, kind):
     r = dl.rule_pass(text, tgt, src_lang=lang)
     assert "laugh" in r.events and r.laughter["kind"] == kind, (text, r)
+
+
+@pytest.mark.parametrize(
+    "text,kind,only",
+    [("[laughs]", "hearty", True), ("[giggles] Oh, come on.", "giggle", False), ("{i}[chuckles]{/i} Fine.", "chuckle", False)],
+)
+def test_bracketed_stage_direction_in_a_latin_source_is_found(text, kind, only):
+    # `[...]` used to be stripped as a KAG tag before the laugh finder ran (the translation was never stripped)
+    r = dl.rule_pass(text, src_lang="en")
+    assert r.events == ["laugh"] and r.laughter["kind"] == kind and r.laughter["stage"] is True and r.laughter["only"] is only
+    assert dl.rule_pass(text, "Ха-ха.", src_lang="en").events == ["laugh"]
+    # a real KAG / engine tag is still stripped and is not a laugh
+    assert dl.rule_pass("[l][r]Hello[wait time=3]", src_lang="en").events == []
 
 
 def test_source_language_limits_what_counts_as_the_source_laugh():

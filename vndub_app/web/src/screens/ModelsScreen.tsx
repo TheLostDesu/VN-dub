@@ -417,7 +417,7 @@ function ToolsTab() {
             {manual.map((x) => (
               <div key={x.name}>
                 <h4>{tOr(`tools.${x.name}.name`, x.name)}</h4>
-                <ManualDownloadCard url={x.url} filename={x.filename} />
+                {x.url ? <ManualDownloadCard url={x.url} filename={x.filename ?? x.url} /> : null}
               </div>
             ))}
           </Collapsible>

@@ -23,9 +23,9 @@ import type {
   ProjectInfo,
   ProjectLite,
   ProjectSummary,
+  ReviewActionResult,
   ReviewDetail,
-  ReviewFacets,
-  ReviewLine,
+  ReviewLinesResponse,
   Settings,
   ToolRow,
   Tuning,
@@ -135,13 +135,13 @@ export const api = {
 
   // ---- review (Step 6) --------------------------------------------------------------------------
   reviewLines: (q: { speaker?: string; scene?: string; status?: string; q?: string; min?: number; max?: number }) =>
-    http.get<{ items: ReviewLine[]; facets: ReviewFacets }>("/api/review/lines", q),
+    http.get<ReviewLinesResponse>("/api/review/lines", q),
   reviewLine: (id: string) => http.get<ReviewDetail>(`/api/review/lines/${encodeURIComponent(id)}`),
   // Payload shapes (API.md fixes only set_src_text and tuning; the others follow vndub_app/reviewdata.py):
   // accept / reject {candidate: <candidate.id>}, regen {text?, style_prompt?}, set_text {text, style_prompt?},
   // set_ref {ref: <refs[].path>}, keep_original {}, set_src_text {text}, tuning {Tuning fields}.
   reviewAction: (id: string, action: ReviewActionName, payload: JsonObject = {}) =>
-    http.post<{ ok: boolean; touched: boolean }>(`/api/review/lines/${encodeURIComponent(id)}/action`, { action, payload }),
+    http.post<ReviewActionResult>(`/api/review/lines/${encodeURIComponent(id)}/action`, { action, payload }),
   preferRoute: (route: string, speaker_id?: string) =>
     http.post<{ updated: number }>("/api/review/prefer-route", speaker_id ? { route, speaker_id } : { route }),
   reviewApply: () => http.post<JobInfo>("/api/review/apply"),

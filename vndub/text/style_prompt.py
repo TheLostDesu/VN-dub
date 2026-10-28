@@ -127,6 +127,9 @@ def emotion_vote(
     we = w_e2v if e else 0.0
     wa = w_anime if a else 0.0
     s = we + wa
+    if s <= 0:
+        # the only model(s) that answered have weight 0 (e2v_weight: 0 and no anime-SER result): nothing to vote with
+        return "neutral", {"neutral": 1.0}
     for k, v in e.items():
         if k in combined:
             combined[k] += we / s * v
@@ -546,16 +549,22 @@ def to_emotion_ref(spec: StyleSpec, refs: Iterable[Mapping[str, Any]], usage: st
     pool = [r for r in refs if usage is None or r.get("usage") in (None, usage, "both")]
     if not pool:
         return None
+
+    def num(r: Mapping[str, Any], key: str, default: float) -> float:
+        # refs.json carries ``arousal: null`` / ``snr: null`` when the ADV model is off or the gate is relaxed:
+        # a null is a missing value, not a number (dict.get's default only covers an absent key)
+        v = r.get(key)
+        return default if v is None else float(v)
+
     same = [r for r in pool if r.get("emotion") == spec.emotion]
     if same:
-        return max(same, key=lambda r: (-abs(float(r.get("arousal", spec.intensity)) - spec.intensity), float(r.get("snr", 0))))["path"]
+        return max(same, key=lambda r: (-abs(num(r, "arousal", spec.intensity) - spec.intensity), num(r, "snr", 0.0)))["path"]
     tv = spec.valence if spec.valence is not None else EMOTION_VA.get(spec.emotion, (0.5, 0.5))[0]
     ta = spec.intensity
 
     def dist(r: Mapping[str, Any]) -> float:
-        v = r.get("valence", EMOTION_VA.get(r.get("emotion", "neutral"), (0.5, 0.5))[0])
-        a = r.get("arousal", EMOTION_VA.get(r.get("emotion", "neutral"), (0.5, 0.5))[1])
-        return math.hypot(float(v) - tv, float(a) - ta)
+        va = EMOTION_VA.get(r.get("emotion") or "neutral", (0.5, 0.5))
+        return math.hypot(num(r, "valence", va[0]) - tv, num(r, "arousal", va[1]) - ta)
 
     return min(pool, key=dist)["path"]
 

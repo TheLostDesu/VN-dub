@@ -10,13 +10,15 @@ import { JobProgress } from "../components/JobProgress";
 import { StepFooter } from "../components/StepFooter";
 import { Button, Callout, Card, Checkbox, Chip, Collapsible, LicenseBadge, PageTitle, RadioGroup, SelectField, Spinner, TextField } from "../components/ui";
 import { useI18n } from "../i18n";
-import { useActiveJob, useJobTracker } from "../state/progress";
+import { useJobTracker } from "../state/progress";
 import { useProject } from "../state/project";
+import { useSettings } from "../state/settings";
 import { stageDone } from "../util/format";
 import { useAutosave, type SaveStatus } from "../util/useAutosave";
 
 /** Languages the user can pick as the source language, next to "auto" (the order of the list). */
 const SRC_LANGS = ["ja", "en", "zh", "ko", "ru", "uk", "de", "fr", "es", "it", "pt"] as const;
+const TRANSLATE_JOBS = ["translate"];
 
 function SaveIndicator({ status }: { status: SaveStatus }) {
   const t = useI18n().t;
@@ -31,6 +33,7 @@ export default function TranslateScreen() {
   const { t, langName } = useI18n();
   const nav = useNavigate();
   const { project, reload } = useProject();
+  const { reload: reloadSettings } = useSettings();
   const [tr, setTr] = useState<TranslationSettings | null>(null);
   const [glossary, setGlossary] = useState<Glossary | null>(null);
   const [loadError, setLoadError] = useState<ErrorInfo | null>(null);
@@ -41,20 +44,23 @@ export default function TranslateScreen() {
   const [pickNote, setPickNote] = useState(false);
   const [translatedHere, setTranslatedHere] = useState(false);
 
-  const trSave = useAutosave<TranslationSettings>((v) => api.putTranslation(v));
+  // the license policy is one global setting that this form also writes: the Settings screen must read it again
+  const trSave = useAutosave<TranslationSettings>(async (v) => {
+    const res = await api.putTranslation(v);
+    void reloadSettings();
+    return res;
+  });
   const glSave = useAutosave<Glossary>((v) => api.putGlossary(v));
+  // kinds + project: the job (running, or done with its warnings) is shown again after a visit to another screen
   const job = useJobTracker({
     onDone: () => {
       setTranslatedHere(true);
       setDirty(false);
       void reload();
     },
+    kinds: TRANSLATE_JOBS,
+    project: project?.slug ?? null,
   });
-  const active = useActiveJob(["translate"]);
-  useEffect(() => {
-    if (active && !job.job) job.attach(active);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active?.id]);
 
   const load = useCallback(async () => {
     try {
@@ -296,7 +302,7 @@ export default function TranslateScreen() {
         <GlossaryEditor value={glossary} onChange={updateGlossary} />
       </Card>
 
-      <Collapsible title={t("translate.advanced.title")} testid="translate-advanced-toggle">
+      <Collapsible title={t("translate.advanced.title")} testid="translate-advanced-toggle" keepMounted>
         <div className="advanced-grid" data-testid="translate-advanced">
           <div className="field">
             <label htmlFor="n-cand">{t("translate.advanced.n_candidates")}</label>
@@ -343,7 +349,8 @@ export default function TranslateScreen() {
 
           <Checkbox checked={tr.advanced.asr_check} onChange={(v) => updateAdv({ asr_check: v })} label={t("translate.advanced.asr_check")} hint={t("translate.advanced.asr_check_hint")} testid="advanced-asr-check" />
 
-          <Collapsible title={t("cues.title")} testid="cues-toggle">
+          {/* kept mounted while collapsed (this section and the one around it): the editor holds its unsaved draft in its own state */}
+          <Collapsible title={t("cues.title")} testid="cues-toggle" keepMounted>
             <DeliveryCuesEditor />
           </Collapsible>
         </div>

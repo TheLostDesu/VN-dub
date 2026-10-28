@@ -282,3 +282,22 @@ def test_emotion_ref_nearest_av_fallback_and_usage_filter():
     assert to_emotion_ref(s, REFS) == "d.wav"
     assert to_emotion_ref(s, REFS, usage="emotion") != "d.wav"
     assert to_emotion_ref(StyleSpec(), []) is None
+
+
+def test_emotion_ref_survives_null_arousal_valence_snr():
+    # refs.json carries arousal/valence/snr = null when the ADV model is off or the gate is relaxed
+    nulls = [
+        {"path": "n1.wav", "emotion": "happy", "arousal": None, "valence": None, "snr": None},
+        {"path": "n2.wav", "emotion": "happy", "arousal": None, "valence": None, "snr": 12.0},
+        {"path": "n3.wav", "emotion": "sad", "arousal": None, "valence": None, "snr": None},
+    ]
+    # same emotion class: a null arousal counts as the target intensity, so snr breaks the tie
+    assert to_emotion_ref(StyleSpec(emotion="happy", intensity=0.5), nulls) == "n2.wav"
+    # nearest-by-(valence, arousal) fallback uses the emotion table for a null value
+    assert to_emotion_ref(StyleSpec(emotion="fearful", intensity=0.2, valence=0.2), nulls) in {"n1.wav", "n2.wav", "n3.wav"}
+
+
+def test_vote_zero_weight_only_model_is_neutral_not_a_crash():
+    assert emotion_vote({"happy": 1.0}, None, w_e2v=0.0, w_anime=0.4) == ("neutral", {"neutral": 1.0})
+    assert emotion_vote(None, {"Sad": 1.0}, w_e2v=0.6, w_anime=0.0) == ("neutral", {"neutral": 1.0})
+    assert emotion_vote({"happy": 1.0}, {"Sad": 1.0}, w_e2v=0.0, w_anime=0.0)[0] == "neutral"

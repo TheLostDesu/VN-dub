@@ -405,3 +405,73 @@ def test_analyze_aligns_the_effective_text(make_ctx, tmp_path):
     ctx.models.close()
     p = read_json(ctx.paths.passport("s_01"))
     assert p["prosody"]["morae"] == 1 and [c["c"] for c in p["align"]["chars"]] == ["あ"]
+
+
+# ----------------------------------------------------------------------------
+# release 1.0 review fixes
+# ----------------------------------------------------------------------------
+
+
+def test_an_empty_clip_is_flagged_audio_empty_not_accepted(tmp_path, monkeypatch):
+    import soundfile as sf
+
+    ctx = new_ctx(tmp_path)
+    build_project(ctx, two_speakers(4))
+    forbid_asr(monkeypatch)
+    # sak_0002 is a zero-length file whose index record says 0.0 s
+    for p in (ctx.paths.audio_src / "sak_0002.wav", ctx.paths.audio_src16 / "sak_0002.wav"):
+        sf.write(str(p), np.zeros(0, dtype=np.float32), 16000, subtype="PCM_16")
+    idx = read_jsonl(ctx.paths.audio_index)
+    for r in idx:
+        if r["id"] == "sak_0002":
+            r["duration"] = 0.0
+    from vndub.manifest.io import write_jsonl
+
+    write_jsonl(ctx.paths.audio_index, idx)
+    summary = run_stage("link", ctx)
+    recs = {r.line_id: r for r in read_jsonl(ctx.paths.link, LinkRecord)}
+    empty = recs["s_03"]  # sakura's second line
+    assert empty.audio_id == "sak_0002" and empty.status == "review" and "audio_empty" in empty.reasons
+    assert empty.signals["audio_empty"] is True
+    assert summary["signals"].get("audio_empty") == 1
+    assert all(recs[k].status == "ok" for k in recs if k != "s_03")
+    # an index that merely lacks the length is not an empty clip: the file is asked
+    idx = read_jsonl(ctx.paths.audio_index)
+    for r in idx:
+        r["duration"] = 0.0
+    write_jsonl(ctx.paths.audio_index, idx)
+    run_stage("link", ctx)
+    recs = {r.line_id: r for r in read_jsonl(ctx.paths.link, LinkRecord)}
+    assert [k for k, r in recs.items() if "audio_empty" in r.reasons] == ["s_03"]
+
+
+def test_link_records_of_lines_that_no_longer_exist_are_dropped(tmp_path, monkeypatch):
+    from vndub.manifest.io import load_lines, write_jsonl
+
+    ctx = new_ctx(tmp_path)
+    rows = two_speakers(4)
+    rows[0] = row(1, "sakura", "sak_0001", seconds=0.3)  # a review record that would sit in the queue
+    build_project(ctx, rows)
+    forbid_asr(monkeypatch)
+    run_stage("link", ctx)
+    assert "s_01" in {r.line_id for r in read_jsonl(ctx.paths.link, LinkRecord)}
+    assert "s_01" in {q["line_id"] for q in read_jsonl(ctx.paths.review_queue)}
+    # a re-parse removed the line
+    write_jsonl(ctx.paths.lines, [l for l in load_lines(ctx.paths.lines) if l.line_id != "s_01"])
+    summary = run_stage("link", ctx)
+    recs = {r.line_id: r for r in read_jsonl(ctx.paths.link, LinkRecord)}
+    assert "s_01" not in recs and len(recs) == 7
+    assert "s_01" not in {q["line_id"] for q in read_jsonl(ctx.paths.review_queue)}
+    assert summary["review_queue"] == 0
+
+
+def test_an_unknown_backend_name_is_unavailable_not_a_keyerror(tmp_path):
+    ctx = new_ctx(tmp_path, {"link.speaker_embedder": "ecapa_typo"})
+    build_project(ctx, two_speakers(2))
+    summary = run_stage("link", ctx)  # used to end the stage with KeyError: unknown backend 'ecapa_typo'
+    assert summary["embedder"].startswith("unavailable") and "ecapa_typo" in summary["embedder"]
+    # the same for the ASR names: every line goes to review with the reason
+    ctx2 = _make_ctx(tmp_path / "b", tmp_path / "b", sets={"link.mode": "asr", "link.asr": "whisper_typo", "link.asr_fallback": ""})
+    build_project(ctx2, two_speakers(2))
+    s2 = run_stage("link", ctx2)
+    assert s2["review"] == 4 and "whisper_typo" in s2["asr"]

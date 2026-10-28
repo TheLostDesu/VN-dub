@@ -75,7 +75,9 @@ export default function DoctorScreen() {
   };
 
   const gpu = report?.gpu ?? null;
-  const gpuProblem = report ? (gpu === null ? "none" : gpu.vram_gb < MIN_VRAM_GB ? "low" : null) : null;
+  // nvidia-smi can print "[N/A]" for the memory: unknown is not "low", the card is just named
+  const vram = gpu?.vram_gb ?? null;
+  const gpuProblem = report ? (gpu === null ? "none" : vram !== null && vram < MIN_VRAM_GB ? "low" : null) : null;
   const fail = report?.summary === "fail";
 
   return (
@@ -92,14 +94,14 @@ export default function DoctorScreen() {
             {gpu ? (
               <span className="muted">
                 {" "}
-                {gpu.name}, {gpu.vram_gb.toFixed(1)} GB
+                {gpu.name}, {vram !== null ? `${vram.toFixed(1)} GB` : t("doctor.gpu_vram_unknown")}
               </span>
             ) : null}
           </Callout>
 
           {gpuProblem ? (
             <Callout tone="warn" title={t(`doctor.gpu_warning.${gpuProblem}.title`)} testid="doctor-gpu-warning">
-              <p>{t(`doctor.gpu_warning.${gpuProblem}.text`, { vram: gpu ? gpu.vram_gb.toFixed(1) : "0" })}</p>
+              <p>{t(`doctor.gpu_warning.${gpuProblem}.text`, { vram: vram !== null ? vram.toFixed(1) : "0" })}</p>
             </Callout>
           ) : null}
 

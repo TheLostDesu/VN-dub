@@ -178,12 +178,12 @@ def test_stale_import_is_reported_until_the_import_runs_again(proj: P) -> None:
     status_path = proj.work / "stage_status.json"
     status = json.loads(status_path.read_text(encoding="utf-8"))
     now = status["parse"]["version"]
-    assert now == "3" and proj.client.get("/api/project").json()["stale"] == []
+    assert now == "4" and proj.client.get("/api/project").json()["stale"] == []
 
     status["parse"]["version"] = "2"  # a project imported before the Ren'Py identifiers were computed as Ren'Py does
     status_path.write_text(json.dumps(status), encoding="utf-8")
     stale = proj.client.get("/api/project").json()["stale"]
-    assert stale == [{"stage": "parse", "ran": "2", "now": "3"}]
+    assert stale == [{"stage": "parse", "ran": "2", "now": "4"}]
 
     del status["parse"]["version"]  # no record of a version: nothing to compare
     status_path.write_text(json.dumps(status), encoding="utf-8")
@@ -193,14 +193,14 @@ def test_stale_import_is_reported_until_the_import_runs_again(proj: P) -> None:
 
     run_job(proj.client, proj.client.post("/api/project/import"), 300)  # the app re-runs the import
     assert proj.client.get("/api/project").json()["stale"] == []
-    assert json.loads(status_path.read_text(encoding="utf-8"))["parse"]["version"] == "3"
+    assert json.loads(status_path.read_text(encoding="utf-8"))["parse"]["version"] == "4"
 
 
 def test_stale_stages_unit() -> None:
     assert pipeline.stale_stages({}) == []
-    assert pipeline.stale_stages({"parse": {"version": "3"}}) == []
+    assert pipeline.stale_stages({"parse": {"version": "4"}}) == []
     assert pipeline.stale_stages({"parse": {}}) == []
-    assert pipeline.stale_stages({"parse": {"version": "1"}, "synth": {"version": "0"}}) == [{"stage": "parse", "ran": "1", "now": "3"}]  # only the watched stages
+    assert pipeline.stale_stages({"parse": {"version": "1"}, "synth": {"version": "0"}}) == [{"stage": "parse", "ran": "1", "now": "4"}]  # only the watched stages
 
 
 # ----------------------------------------------------------------------------
@@ -215,7 +215,7 @@ def test_run_coverage_reads_the_manifest_of_the_pack_summary(tmp_path: Path) -> 
     manifest.write_text(json.dumps({"engine": "renpy", "coverage": cov, "files": []}), encoding="utf-8")
     got = pipeline.run_coverage({"pack": {"manifest": str(manifest), "files": 4}})
     assert got == {"dub_lines": 5, "installed": 4, "provisional": 2, "provisional_review": 1, "provisional_regen": 1, "left_out": 1,
-                   "left_out_reasons": {"no_winner": 1}, "narration": 3, "include_review_lines": "provisional"}
+                   "left_out_reasons": {"no_winner": 1}, "narration": 3, "own_voice": 0, "include_review_lines": "provisional"}
     assert pipeline.run_coverage({}) is None  # pack did not run
     assert pipeline.run_coverage({"pack": {"manifest": str(tmp_path / "gone.json")}}) is None
     manifest.write_text(json.dumps({"engine": "renpy", "files": []}), encoding="utf-8")  # a manifest without the block

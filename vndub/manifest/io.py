@@ -12,8 +12,10 @@ Manifests are the source of truth. Rules:
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Literal, Type, TypeVar
 
@@ -22,6 +24,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 T = TypeVar("T", bound=BaseModel)
+
+log = logging.getLogger(__name__)
 
 
 class Record(BaseModel):
@@ -244,7 +248,16 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        for attempt in range(10):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                # Windows: the app (or a report) is reading the target right now; the rename is refused while the
+                # reader holds it. The handle goes away within milliseconds, so a few short waits beat a 500/stage error.
+                if attempt == 9:
+                    raise
+                time.sleep(0.03)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -292,18 +305,28 @@ def write_jsonl(path: Path, records: Iterable[Any]) -> int:
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
+    """Records of a JSONL file. A malformed LAST line is a write the process did not finish (a hard kill during
+    ``append_jsonl``): it is skipped with a warning, so the reports and overrides that read the file keep working. A malformed
+    line with more records after it is a damaged file and raises."""
     path = Path(path)
     if not path.exists():
         return
+    bad: tuple[int, Exception] | None = None
     with open(path, "rb") as f:
         for n, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
+            if bad is not None:
+                raise ValueError(f"{path}:{bad[0]}: invalid JSON: {bad[1]}") from bad[1]
             try:
-                yield orjson.loads(line)
+                rec = orjson.loads(line)
             except orjson.JSONDecodeError as e:
-                raise ValueError(f"{path}:{n}: invalid JSON: {e}") from e
+                bad = (n, e)
+                continue
+            yield rec
+    if bad is not None:
+        log.warning("%s:%d: skipped an incomplete last line (%s); the process that wrote it was probably killed", path, bad[0], bad[1])
 
 
 def read_jsonl(path: Path, model: Type[T] | None = None) -> list[Any]:
@@ -313,11 +336,35 @@ def read_jsonl(path: Path, model: Type[T] | None = None) -> list[Any]:
     return [model.model_validate(r) for r in rows]
 
 
+def _heal_tail(f: Any, path: Path) -> None:
+    """``f`` is open for appending ("ab+"). A file that does not end with a newline was cut off in the middle of a record
+    (a hard kill): writing on would glue the next record to the fragment and damage a line that is no longer the last. A
+    fragment that is not JSON is cut off; a whole record that only lacks its newline gets one."""
+    f.seek(0, os.SEEK_END)
+    size = f.tell()
+    if size == 0:
+        return
+    f.seek(size - 1)
+    if f.read(1) == b"\n":
+        return
+    f.seek(0)
+    data = f.read()
+    cut = data.rfind(b"\n") + 1
+    try:
+        orjson.loads(data[cut:])
+    except orjson.JSONDecodeError:
+        log.warning("%s: dropped an incomplete last line (%d bytes) before appending", path, size - cut)
+        f.truncate(cut)
+    else:
+        f.write(b"\n")
+
+
 def append_jsonl(path: Path, record: Any) -> None:
-    """Append one record (not atomic across records, but each line is whole)."""
+    """Append one record (not atomic across records, but each line is whole and flushed when this returns)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "ab") as f:
+    with open(path, "ab+") as f:
+        _heal_tail(f, path)
         f.write(dumps(record) + b"\n")
         f.flush()
 

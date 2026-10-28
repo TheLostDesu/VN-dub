@@ -17,6 +17,12 @@ const APPLY_JOBS = ["install_apply"];
 const ROLLBACK_JOBS = ["install_rollback"];
 const ZIP_JOBS = ["install_zip"];
 
+/** `result.unrecoverable` of a rollback: files the patch replaced without a backup, which therefore could not be restored. */
+function unrecoverableOf(result: Record<string, unknown> | undefined): number {
+  const n = Number(result?.unrecoverable ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
 export default function InstallScreen() {
   const { t, tOr, has, lang } = useI18n();
   const toast = useToast();
@@ -49,10 +55,22 @@ export default function InstallScreen() {
 
   // kinds + project: the jobs keep running when the screen is left; each tracker picks up its job of this project again
   const apply = useJobTracker({ onDone: () => void load(), kinds: APPLY_JOBS, project: slug });
-  const rollback = useJobTracker({ onDone: () => { toast.show(t("install.rollback_done")); void load(); }, kinds: ROLLBACK_JOBS, project: slug });
+  // files replaced without a backup cannot come back: the rollback is "done" but not complete, and must not say it was
+  const rollback = useJobTracker({
+    onDone: (j) => {
+      toast.show(unrecoverableOf(j.result) > 0 ? t("install.rollback_partial", { n: unrecoverableOf(j.result) }) : t("install.rollback_done"));
+      void load();
+    },
+    kinds: ROLLBACK_JOBS,
+    project: slug,
+  });
   const zip = useJobTracker({ kinds: ZIP_JOBS, project: slug });
 
   const zipPath = typeof zip.job?.result?.path === "string" ? (zip.job.result.path as string) : "";
+  const lostFiles = rollback.job?.state === "done" ? unrecoverableOf(rollback.job.result) : 0;
+  const fileCount = plan?.file_count ?? plan?.files.length ?? 0;
+  const notes = (plan?.notes ?? []).filter((n) => has(n.key));
+  const helpers = plan?.helpers ?? [];
   const installed = apply.job?.state === "done";
   const busy = apply.busy || rollback.busy;
 
@@ -86,8 +104,29 @@ export default function InstallScreen() {
               <p className="hint">{t("install.no_md")}</p>
             )}
             {plan.manifest?.coverage ? <CoverageCounts coverage={plan.manifest.coverage} /> : null}
+            {notes.length > 0 || helpers.length > 0 ? (
+              <Callout tone="info" title={t("install.notes.title")} testid="install-notes">
+                <ul>
+                  {notes.map((n) => (
+                    <li key={n.key} data-testid={`install-note-${n.key.replace(/^install\.note\./, "")}`}>
+                      {t(n.key, n.params)}
+                    </li>
+                  ))}
+                  {helpers.map((h) => (
+                    <li key={h.name} data-testid={`install-helper-${h.name}`} data-in-game={h.in_game}>
+                      {t(h.in_game ? "install.helper.in_game" : h.tool_path ? "install.helper.available" : "install.helper.missing", { name: h.name, path: h.tool_path ?? "" })}
+                    </li>
+                  ))}
+                </ul>
+              </Callout>
+            ) : null}
             {plan.files.length > 0 ? (
-              <Collapsible title={t("install.files.title", { n: plan.files.length })} testid="install-files-toggle">
+              <Collapsible title={t("install.files.title", { n: fileCount })} testid="install-files-toggle">
+                {plan.files_truncated || fileCount > plan.files.length ? (
+                  <p className="hint" data-testid="install-files-truncated">
+                    {t("install.files.truncated", { shown: plan.files.length, n: fileCount })}
+                  </p>
+                ) : null}
                 <ul className="file-list" data-testid="install-files">
                   {plan.files.slice(0, 500).map((f) => (
                     <li key={f.target}>
@@ -149,6 +188,11 @@ export default function InstallScreen() {
               </p>
             )}
             {rollback.job ? <JobProgress job={rollback.job} testid="install-rollback-job" /> : null}
+            {lostFiles > 0 ? (
+              <Callout tone="warn" testid="install-rollback-partial" role="status">
+                {t("install.rollback_partial", { n: lostFiles })}
+              </Callout>
+            ) : null}
             {rollback.error && !rollback.job ? <ErrorPanel error={rollback.error} /> : null}
 
             <hr />

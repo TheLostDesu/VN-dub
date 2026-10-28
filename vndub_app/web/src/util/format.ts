@@ -153,8 +153,10 @@ export function normalizeFiles(files: unknown): FileProgress[] {
     const done = pickNum(o, ["done", "downloaded", "bytes_done", "done_bytes", "current"]);
     const total = pickNum(o, ["total", "size", "bytes_total", "total_bytes"]);
     let fraction = pickNum(o, ["progress", "fraction", "ratio"]);
-    if (fraction === null && done !== null && total) fraction = done / total;
+    // a field named like a fraction may hold a percent (0..100)
     if (fraction !== null && fraction > 1) fraction = fraction / 100;
+    // done / total is only an estimate that can overshoot (a file bigger than announced): that is "all", not 1 %
+    if (fraction === null && done !== null && total) fraction = done / total;
     const skipped = o.skipped === true;
     const state = String(o.state ?? o.status ?? (skipped ? "done" : fraction !== null && fraction >= 1 ? "done" : "pending"));
     return {

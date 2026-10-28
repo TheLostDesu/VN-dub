@@ -169,6 +169,18 @@ def _prep(text: str) -> str:
     return unicodedata.normalize("NFKC", t).strip()
 
 
+_BRACKET_TAG = re.compile(r"\[[^\]\n]*\]")
+_BRACE_TAG = re.compile(r"\{[^}\n]*\}")
+
+
+def _prep_spoken(text: str) -> str:
+    """:func:`_prep` for the laughter finder: a bracketed stage direction (``[laughs]``, ``[giggles]``) is kept, because
+    stripping ``[...]`` as a KAG tag made the laugh invisible in a Latin-script source (the translation was never stripped)."""
+    t = ja.strip_ruby(text or "")
+    t = _BRACKET_TAG.sub(lambda m: m.group(0) if any(l.stage for l in find_laughs(m.group(0))) else "", t)
+    return unicodedata.normalize("NFKC", _BRACE_TAG.sub("", t)).strip()
+
+
 _WC = "ぁ-んァ-ヶ一-龥々A-Za-z0-9"
 _B = rf"(?<![{_WC}ー])"
 _E = rf"(?![{_WC}])"
@@ -392,8 +404,8 @@ def rule_pass(text_src: str, text_tgt: str = "", lexicon: Mapping[str, str] | No
     sigs: dict[str, _Sig] = {}
     _signals_ja(text_src, sigs)
     tgt = (text_tgt or "").strip()
-    laughs = find_laughs(_prep(text_src), src_lang or "auto")
-    spoken_text = _prep(text_src)
+    spoken_text = _prep_spoken(text_src)
+    laughs = find_laughs(spoken_text, src_lang or "auto")
     if tgt:
         _signals_ru(tgt, sigs)
         tgt_norm = unicodedata.normalize("NFKC", tgt)
@@ -408,7 +420,7 @@ def rule_pass(text_src: str, text_tgt: str = "", lexicon: Mapping[str, str] | No
         laughs += find_laughs(mapped, "ru")
     lsig = _laugh_signal(laughs, bool(laughs) and is_laughter_only(spoken_text))
     if lsig is not None:
-        if lsig.laugh and lsig.laugh["stage"] and any(_is_bare_stage(t) for t in (_prep(text_src), spoken_text)):
+        if lsig.laugh and lsig.laugh["stage"] and any(_is_bare_stage(t) for t in (_prep_spoken(text_src), spoken_text)):
             sigs.pop("inner", None)  # a line that is only "(笑)" / "(giggles)" is a stage direction, not an inner voice
         _add(sigs, lsig)
     if not sigs:

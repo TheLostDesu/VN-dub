@@ -189,17 +189,31 @@ def _q(rel: str) -> str:
     return "/".join(quote(p, safe="") for p in rel.split("/") if p)
 
 
-def audio_url(slug: str, rel: str | None) -> str | None:
-    """URL of a work-relative file (posix path)."""
-    if not rel:
+def file_version(path: Path | str) -> int | None:
+    """Modification time of ``path`` in milliseconds (``None`` when it cannot be read): the ``?v=`` of an audio URL. A file that
+    is regenerated under the same name (``final/<line>.wav``, a take of a regen round, a tuning sample) must not play from the
+    browser's cache, and a player that compares URLs must see a new one."""
+    try:
+        return Path(path).stat().st_mtime_ns // 1_000_000
+    except OSError:
         return None
-    return f"/api/audio/{quote(slug, safe='')}/{_q(rel.replace(chr(92), '/'))}"
 
 
-def out_url(slug: str, rel: str | None) -> str | None:
+def _versioned(url: str, version: int | None) -> str:
+    return url if version is None else f"{url}?v={version}"
+
+
+def audio_url(slug: str, rel: str | None, version: int | None = None) -> str | None:
+    """URL of a work-relative file (posix path); ``version`` is :func:`file_version` of the file."""
     if not rel:
         return None
-    return f"/api/audio/{quote(slug, safe='')}/_out/{_q(rel.replace(chr(92), '/'))}"
+    return _versioned(f"/api/audio/{quote(slug, safe='')}/{_q(rel.replace(chr(92), '/'))}", version)
+
+
+def out_url(slug: str, rel: str | None, version: int | None = None) -> str | None:
+    if not rel:
+        return None
+    return _versioned(f"/api/audio/{quote(slug, safe='')}/_out/{_q(rel.replace(chr(92), '/'))}", version)
 
 
 def work_url(h: appdirs.ProjectHandle, p: str | Path | None) -> str | None:
@@ -214,7 +228,7 @@ def work_url(h: appdirs.ProjectHandle, p: str | Path | None) -> str | None:
             return None
     else:
         rel = path.as_posix()
-    return audio_url(h.slug, rel)
+    return audio_url(h.slug, rel, file_version(h.work / rel))
 
 
 def resolve_audio(slug: str, rel: str) -> Path:

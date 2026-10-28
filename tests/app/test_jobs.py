@@ -1004,3 +1004,234 @@ def test_job_records_from_before_log_path_still_load(tmp_path: Path) -> None:
     state.write_text(json.dumps([old]), encoding="utf-8")
     rec = JobRunner(state, None).get("old1")
     assert rec.log_path is None and rec.info()["log_path"] is None
+
+
+# ----------------------------------------------------------------------------
+# release 1.0 hardening: the worker survives, bookkeeping never fails a job, saves land in order
+# ----------------------------------------------------------------------------
+
+BAD = "bad \udc80 name \ud800"  # lone surrogates: what an undecodable NTFS file name becomes
+
+
+def test_a_lone_surrogate_in_a_log_line_or_result_does_not_kill_the_worker(tmp_path: Path) -> None:
+    r = JobRunner(tmp_path / "jobs.json", None, log_dir=tmp_path / "logs")
+
+    def odd(ctx: jobs.JobContext) -> dict:
+        ctx.log(f"found {BAD}")
+        ctx.set_result(files=[BAD], nested={"k": [BAD]})
+        ctx.message("x", name=BAD)
+        return {"last": BAD}
+
+    first = r.submit("stage", odd, project="demo")
+    r.wait(first.id, 10)
+    second = r.submit("stage", lambda ctx: {"n": 2}, project="demo")  # on the same GPU worker: it must still run
+    r.wait(second.id, 10)
+    assert first.state == "done" and second.state == "done" and second.result == {"n": 2}
+    assert "?" in first.log_tail[0] and "\udc80" not in first.log_tail[0]  # the line was cleaned before it went anywhere
+    assert first.result["files"] == ["bad ? name ?"] and first.result["last"] == "bad ? name ?"
+    json.dumps(first.info(with_log=True), ensure_ascii=False).encode("utf-8")  # the API answer can be encoded
+    saved = {j["id"]: j for j in json.loads((tmp_path / "jobs.json").read_text(encoding="utf-8"))}
+    assert saved[first.id]["state"] == "done" and saved[second.id]["state"] == "done"
+    assert "found bad ? name ?" in Path(first.log_path).read_text(encoding="utf-8")  # type: ignore[arg-type]
+    r.shutdown()
+
+
+def test_saving_survives_what_json_cannot_encode_and_the_worker_goes_on(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    state = tmp_path / "jobs.json"
+    r = JobRunner(state, None)
+    bad = r.submit("stage", lambda ctx: ctx.set_result(thing=object()), project="demo")  # not JSON: the save raises TypeError
+    r.wait(bad.id, 10)
+    good = r.submit("stage", lambda ctx: None, project="demo")
+    r.wait(good.id, 10)
+    assert bad.state == "done" and good.state == "done"  # bookkeeping failed, the jobs did not
+    assert any("cannot save jobs" in rec.getMessage() for rec in caplog.records)
+    r.shutdown()
+
+
+def test_a_lone_surrogate_in_the_saved_state_is_kept_losslessly(tmp_path: Path) -> None:
+    from vndub_app import appdirs
+
+    f = tmp_path / "x.json"
+    appdirs.write_json_atomic(f, {"p": BAD})  # ensure_ascii=False cannot be encoded as UTF-8: the write falls back to escapes
+    assert appdirs.read_json(f)["p"] == BAD
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_the_worker_survives_a_runner_failure_and_the_job_is_marked_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    r = JobRunner(None, None)
+    real = r._execute  # noqa: SLF001
+    calls: list[str] = []
+
+    def flaky(job_id: str) -> None:
+        calls.append(job_id)
+        if len(calls) == 1:
+            raise RuntimeError("bookkeeping broke")
+        real(job_id)
+
+    monkeypatch.setattr(r, "_execute", flaky)
+    a = r.submit("stage", lambda ctx: None)
+    r.wait(a.id, 10)
+    b = r.submit("stage", lambda ctx: {"ok": True})
+    r.wait(b.id, 10)
+    assert a.state == "failed" and a.error and a.error["code"] == "internal" and a.finished
+    assert b.state == "done" and b.result == {"ok": True}  # the worker thread is alive
+    r.shutdown()
+
+
+def test_a_throughput_write_error_does_not_fail_a_finished_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    from vndub_app import appdirs
+
+    def locked(path: Path, data: object) -> None:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(appdirs, "write_json_atomic", locked)
+    ts = ThroughputStore(tmp_path / "throughput_v3.json")
+    ts.record("synth", 2.0)  # does not raise ...
+    assert ts.get("synth") == 2.0  # ... and the number is kept in memory
+    assert any("cannot save the throughput" in rec.getMessage() for rec in caplog.records)
+    r = JobRunner(None, tmp_path / "t2.json")
+    _run_stage_job(r, 12, [("pack", 3, 9.0)])  # the job whose stage is recorded ends "done"
+    assert r.throughput.get("pack") is not None
+    r.shutdown()
+
+
+def test_the_done_event_comes_after_the_final_save(tmp_path: Path) -> None:
+    """``wait()`` and ``shell.stop_jobs`` wake on the event: an older snapshot written after it would undo what they saved."""
+    r = JobRunner(tmp_path / "jobs.json", None)
+    seen: list[bool] = []
+    real_save = r._save  # noqa: SLF001
+
+    def spy(force: bool = False) -> None:
+        if threading.current_thread().name == "vndub-gpu-jobs" and force:
+            ev = next(iter(r._done_events.values()))  # noqa: SLF001
+            seen.append(ev.is_set())
+        real_save(force)
+
+    r._save = spy  # type: ignore[method-assign]
+    job = r.submit("stage", lambda ctx: None)
+    r.wait(job.id, 10)
+    assert seen and seen[-1] is False  # the last forced save of the job thread happened before the event was set
+    r.shutdown()
+
+
+def test_two_savers_cannot_land_in_the_wrong_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One save holds an old snapshot and is slow; another thread changes the record and saves: the file keeps the newer one."""
+    from vndub_app import appdirs
+
+    r = JobRunner(tmp_path / "jobs.json", None)
+    job = r.submit("stage", lambda ctx: None)
+    r.wait(job.id, 10)
+    real = appdirs.write_json_atomic
+    started = threading.Event()
+
+    def slow(path: Path, data: object) -> None:
+        started.set()
+        time.sleep(0.3)  # the first writer is slow after it took its snapshot
+        real(path, data)
+
+    monkeypatch.setattr(appdirs, "write_json_atomic", slow)
+    t = threading.Thread(target=lambda: r._save(force=True))  # noqa: SLF001
+    t.start()
+    started.wait(5)
+    job.state = "interrupted"  # what stop_jobs does while the other save is still writing
+    monkeypatch.setattr(appdirs, "write_json_atomic", real)
+    r._save(force=True)  # noqa: SLF001
+    t.join(10)
+    assert json.loads((tmp_path / "jobs.json").read_text(encoding="utf-8"))[0]["state"] == "interrupted"
+    r.shutdown()
+
+
+def test_active_and_interrupted_records_are_never_pruned(tmp_path: Path) -> None:
+    state = tmp_path / "jobs.json"
+    r = JobRunner(state, None)
+    block = threading.Event()
+    running = r.submit("full", lambda ctx: block.wait(10) and None, project="demo")
+    wait_until(lambda: running.state == "running")
+    with r._lock:  # noqa: SLF001
+        old = jobs.JobRecord(id="old_int", kind="full", title_key="jobs.full", project="demo", state="interrupted", created="2020-01-01T00:00:00+00:00")
+        r._jobs[old.id] = old  # noqa: SLF001
+        for i in range(120):  # a hundred and twenty finished listen jobs, all newer than the interrupted one
+            rec = jobs.JobRecord(id=f"l{i:03d}", kind="listen", title_key="jobs.listen", project="demo", state="done", created=f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}+00:00")
+            r._jobs[rec.id] = rec  # noqa: SLF001
+    r._save(force=True)  # noqa: SLF001
+    ids = [j["id"] for j in json.loads(state.read_text(encoding="utf-8"))]
+    assert "old_int" in ids and running.id in ids  # the one to continue and the active one survive
+    assert sum(1 for i in ids if i.startswith("l")) == jobs.JOBS_KEEP and "l119" in ids and "l000" not in ids  # finished ones: the newest hundred
+    block.set()
+    r.shutdown()
+
+
+def test_a_finished_job_supersedes_older_interrupted_records_of_its_kind_in_its_project(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    state = tmp_path / "jobs.json"
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")  # fresh enough not to expire at load
+    old = [
+        jobs.JobRecord(id="a", kind="full", title_key="jobs.full", project="demo", state="interrupted", created=yesterday),
+        jobs.JobRecord(id="b", kind="full", title_key="jobs.full", project="other", state="interrupted", created=yesterday),
+        jobs.JobRecord(id="c", kind="preview", title_key="jobs.preview", project="demo", state="interrupted", created=yesterday),
+    ]
+    state.write_text(json.dumps([o.info(with_log=True) for o in old]), encoding="utf-8")
+    r = JobRunner(state, None)
+    assert {j.id for j in r.interrupted()} == {"a", "b", "c"}
+    failed = r.submit("full", lambda ctx: 1 / 0, project="demo")  # only a job that is DONE counts
+    r.wait(failed.id, 10)
+    assert {j.id for j in r.interrupted()} == {"a", "b", "c"}
+    ran_by_hand = r.submit("full", lambda ctx: None, project="demo")
+    r.wait(ran_by_hand.id, 10)
+    assert {j.id for j in r.interrupted()} == {"b", "c"}  # the same kind in the same project is no longer offered
+    assert {j["id"] for j in json.loads(state.read_text(encoding="utf-8"))} == {"b", "c", failed.id, ran_by_hand.id}  # and it is persisted
+    r.shutdown()
+
+
+def test_submit_guard_refuses_or_hands_back_under_the_lock() -> None:
+    r = JobRunner(None, None)
+    gate = threading.Event()
+    first = r.submit("full", lambda ctx: gate.wait(10) and None, project="demo")
+    seen: list[list[str]] = []
+
+    def refuse(active: list[jobs.JobRecord]) -> None:
+        seen.append([j.id for j in active])
+        raise AppError("job_busy", params={"job_id": active[0].id}, status=409)
+
+    with pytest.raises(AppError) as e:
+        r.submit("full", lambda ctx: None, project="demo", guard=refuse)
+    assert e.value.code == "job_busy" and seen == [[first.id]]
+    assert [j.id for j in r.list()] == [first.id]  # a refused job leaves no record behind
+    assert r.submit("full", lambda ctx: None, project="demo", guard=lambda active: active[0]) is first  # handed back, nothing queued
+    assert len(r.list()) == 1
+    gate.set()
+    r.shutdown()
+
+
+def test_info_while_the_result_changes_never_raises() -> None:
+    r = JobRunner(None, None)
+    job = r.submit("stage", lambda ctx: None)
+    r.wait(job.id, 10)
+    ctx = r._ctx[job.id]  # noqa: SLF001
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def writer() -> None:
+        i = 0
+        while not stop.is_set():
+            ctx.set_result(**{f"k{i % 400}": [i] * 50})
+            ctx.add_warnings([{"kind": "x", "n": str(i % 50)}])
+            i += 1
+
+    t = threading.Thread(target=writer)
+    t.start()
+    try:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 1.5:
+            try:
+                job.info()
+                job.info(with_log=True)
+            except BaseException as e:  # noqa: BLE001  ("dictionary changed size during iteration")
+                errors.append(e)
+                break
+    finally:
+        stop.set()
+        t.join(10)
+    assert errors == []
+    r.shutdown()

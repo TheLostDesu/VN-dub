@@ -161,3 +161,65 @@ def test_part_that_fell_back_and_a_part_out_of_vram_are_recorded(make_ctx, tmp_p
     assert summary["backends"]["vad"] == "energy_vad" and "e2v" in summary["unavailable"]
     assert "e2v" in read_json(ctx.paths.passport("s_03"))["missing"]
     ctx.models.close()
+
+
+# ----------------------------------------------------------------------------
+# release 1.0 review fixes
+# ----------------------------------------------------------------------------
+
+EN_LINE = "I got a perfect score on the test, you know!"
+
+
+def test_non_japanese_script_gets_a_rate_and_a_tempo(make_ctx, tmp_path):
+    # ja.count_morae was used for every language: an English / Russian script had morae == 0, no rate, never a tempo
+    ctx = make_ctx(tmp_path)
+    rows = [dict(line_id=f"s_{i}", speaker_id="sakura", text=EN_LINE, f0=260, seconds=s, audio_id=f"sak_{i}") for i, s in enumerate([1.6, 1.6, 1.6, 4.5], 1)]
+    build_project(ctx, rows)
+    run_stage("analyze", ctx)
+    assert ctx.src_lang == "en"
+    p1, p4 = (read_json(ctx.paths.passport(f"s_{i}")) for i in (1, 4))
+    assert p1["prosody"]["morae"] > 10 and p1["prosody"]["rate_mora_per_s"] > 5
+    assert p1["style"]["tempo"] == "normal"
+    assert p4["prosody"]["rate_mora_per_s"] < p1["prosody"]["rate_mora_per_s"] / 2 and p4["style"]["tempo"] == "slow"
+    assert load_characters(ctx.paths.characters)["sakura"].stats.rate_median > 0
+
+
+def test_an_empty_clip_has_no_speaking_rate(make_ctx, tmp_path):
+    ctx = make_ctx(tmp_path)
+    build_project(ctx, ROWS[:2])
+    for p in (ctx.paths.audio_src / "sak_02.wav", ctx.paths.audio_src16 / "sak_02.wav"):
+        sf.write(str(p), np.zeros(0, dtype=np.float32), 16000, subtype="PCM_16")
+    run_stage("analyze", ctx)  # speech_s = max(0.1, ...) used to make this 14 mora in 0.1 s
+    empty = read_json(ctx.paths.passport("s_02"))
+    assert empty["duration_s"] == 0.0 and empty["prosody"]["morae"] > 0 and empty["prosody"]["rate_mora_per_s"] is None
+    assert read_json(ctx.paths.passport("s_01"))["prosody"]["rate_mora_per_s"] > 0
+
+
+def test_sensevoice_is_not_forced_to_japanese_for_other_voices(make_ctx, tmp_path, monkeypatch):
+    def run_with(rows, name):
+        ctx = make_ctx(tmp_path / name)
+        build_project(ctx, rows)
+        calls = []
+        orig = ctx.models.acquire
+
+        def spy(n, options=None, **kw):
+            calls.append((n, dict(options or {})))
+            return orig(n, options, **kw)
+
+        monkeypatch.setattr(ctx.models, "acquire", spy)
+        run_stage("analyze", ctx)
+        return [o for n, o in calls if "events" in n or "sensevoice" in n]
+
+    assert run_with(ROWS, "ja") == [{}]  # Japanese voices keep the backend's own options (language ja)
+    en_rows = [dict(line_id="s_01", speaker_id="sakura", text=EN_LINE, f0=260, seconds=1.6, audio_id="sak_01")]
+    assert run_with(en_rows, "en") == [{"language": "auto"}]
+
+
+def test_unknown_backend_names_are_reported_not_a_keyerror(make_ctx, tmp_path):
+    # `librosa` / `energy` were the names the config comment listed; the registry has librosa_f0 / energy_vad
+    ctx = make_ctx(tmp_path, sets={"analyze.f0": "librosa", "analyze.vad": "energy", "analyze.events": "sensevoice_typo"})
+    build_project(ctx, ROWS)
+    summary = run_stage("analyze", ctx)
+    assert summary["backends"]["f0"] == "librosa_f0" and summary["backends"]["vad"] == "energy_vad"  # the fallback name of the list
+    assert "sensevoice_typo" in summary["unavailable"]["events"] and "unknown backend" in summary["unavailable"]["events"]
+    assert summary["lines"] == 3

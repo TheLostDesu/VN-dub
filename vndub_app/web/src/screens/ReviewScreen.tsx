@@ -10,9 +10,11 @@ import { VirtualList } from "../components/VirtualList";
 import { Button, Callout, Card, Chip, PageTitle, SelectField, Spinner, useToast } from "../components/ui";
 import { useI18n } from "../i18n";
 import { useJobTracker } from "../state/progress";
+import { useProject } from "../state/project";
 import { fmtNumber, normalizeFacets } from "../util/format";
 
 const ROW_H = 64;
+const APPLY_JOBS = ["review_apply"];
 
 function isTextTarget(el: EventTarget | null): boolean {
   if (!(el instanceof HTMLElement)) return false;
@@ -27,6 +29,7 @@ function isActivatable(el: EventTarget | null): boolean {
 export default function ReviewScreen() {
   const { t } = useI18n();
   const toast = useToast();
+  const { project } = useProject();
   const [speaker, setSpeaker] = useState("");
   const [scene, setScene] = useState("");
   const [status, setStatus] = useState<"" | ReviewStatus>("");
@@ -38,7 +41,10 @@ export default function ReviewScreen() {
   const [facets, setFacets] = useState<ReviewFacets>({ speakers: [], scenes: [] });
   const [error, setError] = useState<ErrorInfo | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [applyResult, setApplyResult] = useState<{ changed: number; lines: number } | null>(null);
+  // every touched line of the project (the list shows only what the filters let through)
+  const [touchedTotal, setTouchedTotal] = useState<number | null>(null);
+  // bumped when Apply finishes: the open line was re-synthesized, its detail (candidates, audio) must be read again
+  const [detailEpoch, setDetailEpoch] = useState(0);
   const [bulkBusy, setBulkBusy] = useState(false);
   const detail = useRef<ReviewDetailHandle>(null);
   const reqId = useRef(0);
@@ -66,6 +72,7 @@ export default function ReviewScreen() {
       if (id !== reqId.current) return;
       setItems(res.items ?? []);
       setFacets(res.facets ?? { speakers: [], scenes: [] });
+      setTouchedTotal(typeof res.touched_count === "number" ? res.touched_count : null);
       setError(null);
       const cur = selectedRef.current;
       if (!cur || !(res.items ?? []).some((i) => i.line_id === cur)) setSelected((res.items ?? [])[0]?.line_id ?? null);
@@ -78,34 +85,46 @@ export default function ReviewScreen() {
     void load();
   }, [load]);
 
+  // kinds + project: a running Apply is still shown (and still blocks a second one) after a visit to another screen
   const apply = useJobTracker({
-    onDone: (j) => {
-      const changed = Number(j.result?.changed ?? 0);
-      const raw = j.result?.lines;
-      const lines = Array.isArray(raw) ? raw.length : Number(raw ?? 0) || 0;
-      setApplyResult({ changed, lines });
+    onDone: () => {
       void load();
+      setDetailEpoch((n) => n + 1);
     },
+    kinds: APPLY_JOBS,
+    project: project?.slug ?? null,
   });
+  // read from the job itself, so a finished Apply keeps its result when the screen is opened again
+  const applyResult = useMemo(() => {
+    const j = apply.job;
+    if (!j || j.state !== "done") return null;
+    const raw = j.result?.lines;
+    return { changed: Number(j.result?.changed ?? 0), lines: Array.isArray(raw) ? raw.length : Number(raw ?? 0) || 0 };
+  }, [apply.job]);
 
   const index = useMemo(() => (items ?? []).findIndex((i) => i.line_id === selected), [items, selected]);
-  const touchedCount = (items ?? []).filter((i) => i.touched).length;
+  const touchedCount = touchedTotal ?? (items ?? []).filter((i) => i.touched).length;
   const speakers = normalizeFacets(facets.speakers);
   const scenes = normalizeFacets(facets.scenes);
 
-  const move = useCallback((delta: number) => {
+  /** Select the line `delta` rows away; false when that is the line already selected (the end of the list). */
+  const move = useCallback((delta: number): boolean => {
     const list = itemsRef.current ?? [];
-    if (list.length === 0) return;
+    if (list.length === 0) return false;
     const cur = list.findIndex((i) => i.line_id === selectedRef.current);
     const next = Math.max(0, Math.min(list.length - 1, (cur < 0 ? 0 : cur) + delta));
-    setSelected((list[next] as ReviewLine).line_id);
+    const id = (list[next] as ReviewLine).line_id;
+    setSelected(id);
+    return id !== selectedRef.current;
   }, []);
 
   // After accept / reject / keep original: go to the next line of the current list, refresh in the background.
+  // The answer tells the detail view whether it was replaced (another line) or stays and has to reload itself.
   const onChanged = useCallback(
-    (_action: string, advance: boolean) => {
-      if (advance) move(1);
+    (_action: string, advance: boolean): boolean => {
+      const moved = advance ? move(1) : false;
       void load();
+      return moved;
     },
     [move, load],
   );
@@ -295,7 +314,7 @@ export default function ReviewScreen() {
           </section>
 
           <section className="review-detail-pane" aria-label={t("review.detail")}>
-            {selected ? <ReviewDetailView key={selected} ref={detail} lineId={selected} onChanged={onChanged} /> : <p className="hint">{t("review.select_line")}</p>}
+            {selected ? <ReviewDetailView key={`${selected}:${detailEpoch}`} ref={detail} lineId={selected} onChanged={onChanged} /> : <p className="hint">{t("review.select_line")}</p>}
             <details className="keys-help">
               <summary>{t("review.keys.title")}</summary>
               <ul>

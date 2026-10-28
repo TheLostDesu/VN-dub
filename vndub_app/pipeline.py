@@ -31,7 +31,7 @@ from typing import Any, Callable, Iterator
 from vndub.util import now_iso
 from vndub_app import appdirs, jobs, session, viewdata
 from vndub_app.errors import AppError
-from vndub_app.jobs import JobContext, JobRecord
+from vndub_app.jobs import JobCancelled, JobContext, JobRecord
 
 log = logging.getLogger("vndub_app.pipeline")
 
@@ -77,18 +77,19 @@ def submit(kind: str, slug: str | None, params: dict[str, Any] | None = None) ->
         raise AppError("bad_request", params={"field": "kind", "value": kind}, status=422)
     params = dict(params or {})
     runner = jobs.runner()
+    guard = None
     if fl.project and slug:
-        active = runner.list(slug, active_only=True)
-        if fl.heavy:
-            busy = next((j for j in active if FLOWS.get(j.kind) and FLOWS[j.kind].heavy), None)
-            if busy is not None:
-                raise AppError("job_busy", params={"job_id": busy.id, "kind": busy.kind}, action="none", status=409)
-        else:
-            dup = next((j for j in active if j.kind == kind and _same_params(j.params, params)), None)
-            if dup is not None:
-                return dup
+        def guard(active_all: list[JobRecord]) -> JobRecord | None:
+            # runs under the runner's lock, right before the record is added: a double click cannot queue two heavy jobs
+            active = [j for j in active_all if j.project == slug]
+            if fl.heavy:
+                busy = next((j for j in active if FLOWS.get(j.kind) and FLOWS[j.kind].heavy), None)
+                if busy is not None:
+                    raise AppError("job_busy", params={"job_id": busy.id, "kind": busy.kind}, action="none", status=409)
+                return None
+            return next((j for j in active if j.kind == kind and _same_params(j.params, params)), None)
     fn = fl.build(slug or "", params)
-    return runner.submit(kind, fn, params=params, project=slug if fl.project else None, gpu=fl.gpu, settings=_snapshot(slug if fl.project else None))
+    return runner.submit(kind, fn, params=params, project=slug if fl.project else None, gpu=fl.gpu, settings=_snapshot(slug if fl.project else None), guard=guard)
 
 
 def _snapshot(slug: str | None) -> dict[str, Any]:
@@ -129,6 +130,7 @@ def resume_interrupted(slug: str, *, keep_shutdown: bool = False) -> JobRecord:
     if old is None:
         raise AppError("nothing_to_resume", action="none", status=404)
     params = dict(old.params)
+    params.pop("force", None)  # a forced job cleared its caches; the continuation exists to keep the work that was done
     if not keep_shutdown:
         params.pop("shutdown_when_done", None)
     new = submit(old.kind, slug, params)
@@ -612,6 +614,8 @@ def _build_review_apply(slug: str, p: dict[str, Any]) -> FlowFn:
         try:
             with pipeline_ctx(h, job) as ctx2:
                 run_stages(ctx2, job, available_stages(["pack"]))
+        except JobCancelled:  # Cancel (or the app closing) during the pack step is a cancel, not a stale patch to report
+            raise
         except Exception as e:  # the review work is done; report that the patch is stale
             from vndub_app.errors import error_from_exception
 

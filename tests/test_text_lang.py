@@ -54,6 +54,21 @@ def test_markup_names_and_short_samples():
     assert detect_language([]).lang == ""
 
 
+AR = ["لقد حصلت على الدرجة الكاملة في الاختبار!", "ما الخطب يا ساكورا؟", "نعم!", "خرج الثلاثة من بوابة المدرسة معا."]
+TH = ["ฉันได้คะแนนเต็มในการสอบ!", "เกิดอะไรขึ้นหรือซากุระ?", "ใช่!", "ทั้งสามคนเดินออกจากประตูโรงเรียนด้วยกัน"]
+EL = ["Πήρα άριστα στο διαγώνισμα!", "Τι συμβαίνει, Σακούρα;", "Ναι!", "Οι τρεις βγήκαν μαζί από την πύλη του σχολείου."]
+HI = ["मुझे परीक्षा में पूरे अंक मिले!", "क्या हुआ, सकुरा?", "हाँ!", "तीनों साथ में स्कूल के गेट से बाहर निकले।"]
+
+
+def test_unlisted_scripts_are_unknown_not_russian():
+    # zero Latin and zero Cyrillic letters used to tie-break to "ru" with confidence 0.0
+    for texts in (AR, TH, EL, HI):
+        g = detect_language(texts * 3)
+        assert g.lang == "", (texts[0], g)
+    assert detect_language(AR + EN[:1]).lang == ""  # one Latin line among Arabic does not make it English
+    assert detect_language(EN * 3 + AR[:1]).lang == "en"  # and one Arabic line does not unmake English
+
+
 def test_units_and_names():
     assert speech_units(JA[0], "ja") == ja.count_morae(JA[0])
     assert speech_units(JA[0], "auto") == ja.count_morae(JA[0])
@@ -99,6 +114,22 @@ def test_context_detects_and_persists_the_language(make_ctx, tmp_path):
     proj.audio_lang = "ja"
     save_project_yaml(ctx.paths.project_yaml, proj)
     assert ctx.audio_lang == "ja" and ctx.src_lang == "en"
+
+
+def test_unknown_script_keeps_the_configured_language(make_ctx, tmp_path):
+    ctx = make_ctx(tmp_path, sets={"project.src_lang": "auto"})
+    save_project_yaml(ctx.paths.project_yaml, ProjectYaml(game_dir=str(tmp_path), engine="renpy"))
+    build_project(ctx, rows(AR * 3))
+    # nothing detected: the legacy default comes back and project.yaml is not rewritten with a wrong code
+    assert ctx.src_lang == "ja"
+    proj = load_project_yaml(ctx.paths.project_yaml)
+    assert proj.src_lang == "auto" and not proj.src_lang_detected
+    # an earlier detection survives a re-parse of a script the detector cannot read
+    build_project(ctx, rows(EN))
+    assert ctx.src_lang == "en"
+    build_project(ctx, rows(TH * 3))
+    assert resolve_src_lang(ctx, redetect=True) == "en"
+    assert load_project_yaml(ctx.paths.project_yaml).src_lang == "en"
 
 
 def test_translate_english_script(make_ctx, tmp_path):

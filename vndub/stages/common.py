@@ -41,6 +41,11 @@ STAGES = [
 
 console = Console(stderr=False, highlight=False)
 
+# Ren'Py asks config.auto_voice for a say statement only when it has no voice statement of its own, so a line flagged with one
+# of these (parse: a ``voice`` whose file the game does not have, or whose name is computed when the game runs) cannot be given a
+# voice by a patch that works through auto_voice
+OWN_VOICE_FLAGS = frozenset({"voice_expression", "voice_missing"})
+
 
 class StageError(RuntimeError):
     """A stage cannot proceed (missing prerequisite, bad config). Message is user-facing."""
@@ -209,28 +214,57 @@ class StageContext:
         continuation (the head line's voice already covers it), not a menu record, and has text.
         Narration is never dubbed. Such lines come back with ``has_voice=False`` and no audio fields,
         in script order, interleaved with the voiced ones; ``--only`` / ``--limit`` apply to the result.
+
+        Ren'Py: a line with a ``voice`` statement of its own that has no usable file (``voice_missing``,
+        ``voice_expression``) is left out, see :meth:`own_voice_lines`.
         """
         if not self.cfg.synth.voice_unvoiced:
             return self.voiced_lines(apply_only=apply_only)
         voiced = {l.line_id: l for l in self.voiced_lines(apply_only=False)}
+        own_voice = self._own_voice_applies()
         out: list[LineRecord] = []
         for l in self.lines():
             v = voiced.get(l.line_id)
             if v is not None:
                 out.append(v)
                 continue
-            if l.speaker_id == "narrator" or not (l.text_src or "").strip():
+            if not _unvoiced_speaker_line(l):
                 continue
-            if {"voice_sustain", "menu"} & set(l.flags):
+            if own_voice and OWN_VOICE_FLAGS & set(l.flags):
                 continue
             l.has_voice, l.audio_id, l.src_wav, l.src_wav16, l.voice_file = False, None, None, None, None
             out.append(l)
         return self.select(out, voiced_only=False) if apply_only else out
 
+    def _own_voice_applies(self) -> bool:
+        proj = self.project
+        return proj is not None and proj.engine == "renpy"
+
+    def own_voice_lines(self) -> list[LineRecord]:
+        """Ren'Py speaker lines :meth:`dub_lines` leaves out because they are NOT INSTALLABLE: the line has a ``voice`` statement of
+        its own, but its file is not in the game (``voice_missing``) or its name is computed at run time (``voice_expression``).
+        ``config.auto_voice``, the only way a patch gives a voice to a line that has none, is never asked for a line with a voice
+        statement, so a dub of it would be generated, counted as installed, and never play. Empty for other engines and when
+        ``synth.voice_unvoiced`` is off."""
+        if not (self.cfg.synth.voice_unvoiced and self._own_voice_applies()):
+            return []
+        voiced = {l.line_id for l in self.voiced_lines(apply_only=False)}
+        return [l for l in self.lines() if l.line_id not in voiced and _unvoiced_speaker_line(l) and OWN_VOICE_FLAGS & set(l.flags)]
+
+
+def _unvoiced_speaker_line(l: LineRecord) -> bool:
+    """A line without original audio that is dubbed under ``synth.voice_unvoiced``: a speaker (narration is never dubbed) with
+    text, not a ``voice sustain`` continuation (the head line's voice covers it) and not a menu record."""
+    return not (l.speaker_id == "narrator" or not (l.text_src or "").strip() or {"voice_sustain", "menu"} & set(l.flags))
+
 
 # ----------------------------------------------------------------------------
 # source-text patches (mode C recovery, user edits)
 # ----------------------------------------------------------------------------
+
+
+#: a detection below this confidence is not written into project.yaml (it is a handful of letters at most)
+_MIN_DETECT_CONFIDENCE = 0.05
 
 
 def resolve_src_lang(ctx: StageContext, lines: list[LineRecord] | None = None, redetect: bool = False) -> str:
@@ -241,7 +275,8 @@ def resolve_src_lang(ctx: StageContext, lines: list[LineRecord] | None = None, r
     detection record (``src_lang_detected``), so every later stage reads the same code. ``redetect`` repeats
     the detection for a value that came from an earlier detection (parse does that over the new lines); a code
     the user set is never replaced. Without lines (nothing parsed yet) the legacy default ``ja`` is returned
-    and nothing is written.
+    and nothing is written; so it is for a text the detector cannot tell (a script it does not know, a handful of
+    letters): the earlier detection or the configured code stays and a warning says so.
     """
     from vndub.text.lang import AUTO, detect_language, language_name
 
@@ -256,9 +291,15 @@ def resolve_src_lang(ctx: StageContext, lines: list[LineRecord] | None = None, r
             return fallback
         lines = ctx.lines(edits=False)
     guess = detect_language(l.text_src for l in lines)
-    if not guess.lang:
-        ctx.log.warning("source language: the script text has no letters, keeping %s", fallback)
-        return fallback
+    if not guess.lang or guess.confidence < _MIN_DETECT_CONFIDENCE:
+        # no letters, a script the detector does not know, or a sample too small to say: keep what was configured
+        # (or detected before) rather than persist a guess that would turn into a wrong source == target
+        keep = code if was_detected and code and code != AUTO else fallback
+        ctx.log.warning(
+            "source language: could not tell it from the script text (%s, confidence %.2f), keeping %s",
+            guess.lang or "unknown", guess.confidence, keep,
+        )
+        return keep
     if proj is not None:
         proj.src_lang = guess.lang
         proj.src_lang_detected = guess.as_dict()

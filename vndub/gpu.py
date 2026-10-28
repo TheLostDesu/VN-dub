@@ -169,6 +169,7 @@ class ModelRegistry:
         self.heavy: Resident | None = None
         self.light: dict[str, Resident] = {}
         self.substitutions: list[Substitution] = []
+        self._loading: tuple[str, Backend] | None = None  # what acquire() is loading right now: a cancel must reach it too
         self.unavailable: list[Unavailable] = []
         self.events: list[dict[str, Any]] = []
         self.log = get_logger("gpu", (self.log_dir / "gpu.log") if self.log_dir else None)
@@ -226,9 +227,6 @@ class ModelRegistry:
         for res in ([self.heavy] if self.heavy else []) + list(self.light.values()):
             if res.name == spec.name and res.options_key == key:
                 return res.backend
-        if sub is not None:
-            self.substitutions.append(sub)
-            self.log.warning("backend substitution: %s -> %s (%s)", sub.requested, sub.used, sub.reason)
         device = "cpu"
         need = estimate_vram_gb(spec, options)
         if spec.heavy:
@@ -242,6 +240,9 @@ class ModelRegistry:
             self.release(spec.name)
         backend = self._make(spec, options, device)
         t0 = time.perf_counter()
+        # A load can take minutes (the RPC allows 30): until it returns the backend is resident nowhere, yet its process
+        # already holds VRAM. abort_all (Cancel, app exit) looks here so the wait ends at once instead of at the timeout.
+        self._loading = (spec.name, backend)
         try:
             info = backend.load() or {}
         except BaseException:
@@ -250,8 +251,13 @@ class ModelRegistry:
             except Exception:
                 pass
             raise
+        finally:
+            self._loading = None
         load_s = time.perf_counter() - t0
         self._check_device(spec, backend, device, info)
+        if sub is not None:  # recorded once the replacement is up: a fallback that failed to load was never used
+            self.substitutions.append(sub)
+            self.log.warning("backend substitution: %s -> %s (%s)", sub.requested, sub.used, sub.reason)
         res = Resident(spec.name, spec, backend, key, time.time(), load_s, sub.requested if sub else None, need if device.startswith("cuda") else 0.0)
         if spec.heavy:
             self.heavy = res
@@ -402,13 +408,17 @@ class ModelRegistry:
     def abort_all(self) -> None:
         """Kill the processes of every resident backend now (a job was cancelled); ``close()`` tidies up after."""
         residents = ([self.heavy] if self.heavy else []) + list(self.light.values())
-        for res in residents:
-            fn = getattr(res.backend, "abort", None)
+        targets = [(res.name, res.backend) for res in residents]
+        loading = self._loading
+        if loading is not None:  # still inside load(): not resident yet, but its process is up (and the job thread waits on it)
+            targets.append(loading)
+        for name, backend in targets:
+            fn = getattr(backend, "abort", None)
             if fn is not None:
                 try:
                     fn()
                 except Exception as e:
-                    self.log.warning("abort %s failed: %s", res.name, e)
+                    self.log.warning("abort %s failed: %s", name, e)
 
     @contextmanager
     def use(self, name: str, options: dict[str, Any] | None = None) -> Iterator[Backend]:

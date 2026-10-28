@@ -5,8 +5,11 @@ line_id, backend, route, status) next to the patch.
 
 Both say what the patch covers (:func:`patch_coverage`): how many of the dubbed lines have a file, how many of those
 are ``provisional`` (no take passed the quality gates, the best one is installed: ``master.include_review_lines``),
-how many were LEFT OUT and why (a line without a file is silent in the game), and how many narration lines are never
-dubbed.
+how many were LEFT OUT and why (a line without a file is silent in the game), how many narration lines are never
+dubbed, and (Ren'Py) how many lines are not installable because they have a ``voice`` statement of their own.
+
+A full pack (not ``--only``) also removes what an earlier pack left in ``out/<engine>`` that this one does not hold
+(:func:`_remove_stale`): the installer ships the folder whole, so a file the manifest does not list would be installed anyway.
 
 Lines that had no original voice (``synth.voice_unvoiced``; ``FinalIndexRecord.unvoiced``) have no
 file name in the game to take over, so they are placed apart from the engine's normal layout:
@@ -23,11 +26,11 @@ from __future__ import annotations
 
 import re
 import shutil
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from vndub.engines.base import write_install
-from vndub.manifest.io import FinalIndexRecord, SelectionRecord, read_jsonl, write_json
+from vndub.engines.base import BaseEngine, write_install
+from vndub.manifest.io import FinalIndexRecord, SelectionRecord, read_json, read_jsonl, write_json
 from vndub.stages.common import StageContext, StageError
 from vndub.util import hash_file
 
@@ -38,6 +41,10 @@ CONFIG_SECTIONS = ("pack",)
 RENPY_RPY = "vndub_auto_voice.rpy"
 RENPY_DEFAULT_DIR = "voice_dub"
 LEFT_OUT_LISTED = 300  # lines named one by one in manifest_patch.json (the counts are always complete)
+AUDIO_SUFFIXES = {".ogg", ".wav", ".mp3", ".opus", ".flac", ".m4a", ".aac", ".mp2"}
+# the folder under out/<engine>/ that an engine copies <voice_file> into ("" = out/<engine> itself). An engine that builds an
+# archive or a script (kirikiri, unity, catsystem2) writes a new one every time and is not listed
+_LOOSE_ROOT = {"renpy": "game", "nscripter": "", "tyrano": "data", "siglus": "koe_dump", "artemis": "files"}
 
 
 def _is_unvoiced(f: FinalIndexRecord) -> bool:
@@ -69,17 +76,22 @@ def patch_coverage(ctx: StageContext, finals: list[FinalIndexRecord], sel: dict[
     * ``left_out``: dubbed lines without a file (silent in the game) with ``left_out_reasons`` by category and
       ``left_out_lines`` (the first :data:`LEFT_OUT_LISTED`) as ``{line_id, status, reason}``
     * ``narration``: narration lines without original voice, which are never dubbed
+    * ``own_voice`` (Ren'Py): speaker lines that are NOT INSTALLABLE because they have a ``voice`` statement of their own
+      whose file is missing or computed at run time: ``config.auto_voice`` is never asked for them, so they are not dubbed;
+      ``own_voice_lines`` names the first :data:`LEFT_OUT_LISTED`
     """
     if sel is None:
         sel = {s.line_id: s for s in read_jsonl(ctx.paths.selection, SelectionRecord)} if ctx.paths.selection.exists() else {}
     have = {f.line_id: f for f in finals}
     dub: list[Any] = []
     others: list[Any] = []
+    own: list[Any] = []
     if ctx.paths.lines.exists():
         try:
             dub = ctx.dub_lines(apply_only=False)
             dub_ids = {l.line_id for l in dub}
             others = [l for l in ctx.lines() if l.line_id not in dub_ids]
+            own = ctx.own_voice_lines()
         except Exception as e:  # a half-built project must not stop the pack
             ctx.log.warning("patch coverage: cannot read the lines (%s)", e)
     n_prov = {"review": 0, "regen": 0}
@@ -106,6 +118,8 @@ def patch_coverage(ctx: StageContext, finals: list[FinalIndexRecord], sel: dict[
         "left_out_reasons": reasons,
         "left_out_lines": left[:LEFT_OUT_LISTED],
         "narration": narration,
+        "own_voice": len(own),
+        "own_voice_lines": [l.line_id for l in own[:LEFT_OUT_LISTED]],
         "include_review_lines": ctx.cfg.master.include_review_lines,
     }
 
@@ -134,6 +148,12 @@ def _coverage_notes(cov: dict[str, Any]) -> list[str]:
         )
     if cov["narration"]:
         notes.append(f"- {cov['narration']} narration line(s) (no speaker) are never dubbed and stay silent in the game.")
+    if cov.get("own_voice"):
+        notes.append(
+            f"- {cov['own_voice']} line(s) are NOT INSTALLABLE: own voice statement. The script gives each of them a `voice` statement whose file is not in the game "
+            "(or whose name is computed while the game runs), and Ren'Py never asks `config.auto_voice` for a line with a voice statement, so a dub could not play. "
+            "They are not dubbed and stay as they are in the game; they are listed under `coverage.own_voice_lines` in `manifest_patch.json`."
+        )
     return notes
 
 
@@ -224,6 +244,79 @@ def _pack_unvoiced_renpy(ctx: StageContext, unvoiced: list[FinalIndexRecord]) ->
     return placed, info
 
 
+def _loose_root(eng: Any, out: Path) -> Path | None:
+    """The folder under ``out`` that ``eng.pack`` copies ``<voice_file>`` into, None for an engine that builds an archive or a script."""
+    if eng.name in _LOOSE_ROOT:
+        return out / _LOOSE_ROOT[eng.name]
+    return out if type(eng).pack is BaseEngine.pack else None
+
+
+def _remove_stale(ctx: StageContext, eng: Any, out: Path, regular: list[FinalIndexRecord], placed: dict[str, str], uinfo: dict[str, Any]) -> int:
+    """After a full pack: delete what an earlier pack left in ``out`` and this one does not hold. The installer ships the whole folder,
+    so a file the new ``manifest_patch.json`` does not list would be installed all the same (a rejected line, ``include_review_lines``
+    switched to ``skip``, an import under another parse version that renamed the Ren'Py ids ...). Touched are only the files the previous
+    ``manifest_patch.json`` listed, the audio files next to files of the patch (the engine's voice folders), and the ``vndub_auto_voice.rpy``
+    this stage generated when it is no longer needed; nothing else. Returns the number of files removed."""
+    root = _loose_root(eng, out)
+    if root is None:
+        return 0
+    keep = {root / f.voice_file for f in regular} | {out / rel for rel in placed.values()}
+    old: set[Path] = set()
+    try:
+        prev = read_json(out / "manifest_patch.json", {})
+    except (OSError, ValueError):
+        prev = {}
+    for e in (prev.get("files") or []) if isinstance(prev, dict) else []:
+        if not isinstance(e, dict):
+            continue
+        unvoiced = bool(e.get("unvoiced"))  # packed_as of those is relative to out/<engine>, the others' file is relative to the engine's root
+        rel = e.get("packed_as") if unvoiced else e.get("file")
+        if isinstance(rel, str) and rel:
+            old.add((out if unvoiced else root) / rel)
+    base = out.resolve()
+
+    def inside(p: Path) -> bool:
+        try:
+            p.resolve().relative_to(base)
+            return True
+        except (ValueError, OSError):
+            return False
+
+    dirs = {p.parent for p in keep | old if inside(p)}
+    if eng.name == "renpy":
+        dirs.add(root / str(ctx.cfg.pack.renpy.get("unvoiced_dir") or RENPY_DEFAULT_DIR).strip("/"))
+    stale = {p for p in old if p not in keep and inside(p)}
+    for d in dirs:
+        if d.is_dir():
+            stale |= {p for p in d.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_SUFFIXES and p not in keep}
+    n = 0
+    for p in sorted(stale):
+        try:
+            p.unlink()
+            n += 1
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            ctx.log.warning("pack: cannot remove the stale file %s (%s)", p, e)
+    if eng.name == "renpy" and "rpy" not in uinfo:  # the generated auto_voice script of an earlier pack
+        rpy = root / RENPY_RPY
+        try:
+            if rpy.is_file() and rpy.read_text(encoding="utf-8").startswith("# Generated by vndub"):
+                rpy.unlink()
+                n += 1
+        except OSError as e:
+            ctx.log.warning("pack: cannot remove the stale %s (%s)", rpy, e)
+    for d in sorted(dirs, key=lambda x: len(x.parts), reverse=True):  # folders the removal emptied
+        try:
+            if d not in (root, out) and d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+    if n:
+        ctx.log.info("pack: removed %d file(s) an earlier pack left in %s that this patch does not hold", n, out)
+    return n
+
+
 def _install_notes(engine: str, n: int, info: dict[str, Any]) -> list[str]:
     if engine == "renpy":
         if info.get("auto_voice"):
@@ -295,6 +388,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
                 placed[f.line_id] = f.voice_file
         with open(out / "INSTALL.md", "a", encoding="utf-8") as fh:
             fh.write("\n".join(_install_notes(eng.name, len(unvoiced), uinfo)) + "\n")
+    removed = 0 if ctx.only else _remove_stale(ctx, eng, out, regular, placed, uinfo)  # a partial pack (--only) leaves the rest of the folder alone
     entries = []
     for i, f in enumerate(present):
         ctx.progress(i, len(present), f.line_id)
@@ -330,6 +424,13 @@ def run(ctx: StageContext) -> dict[str, Any]:
             summary["unnamed"] = uinfo["unnamed"]
     if cov["provisional"]:
         summary["provisional"] = cov["provisional"]
+    if removed:
+        summary["removed_stale"] = removed
+    if cov["own_voice"]:
+        summary["own_voice"] = cov["own_voice"]
+        ctx.log.warning(
+            "pack: %d line(s) have a voice statement of their own with no usable file; Ren'Py never asks config.auto_voice for them, so they are not dubbed", cov["own_voice"]
+        )
     if cov["left_out"]:
         summary["left_out"] = cov["left_out"]
         ctx.log.warning("pack: %d dubbed line(s) have no file in the patch and stay silent in the game: %s", cov["left_out"], cov["left_out_reasons"])

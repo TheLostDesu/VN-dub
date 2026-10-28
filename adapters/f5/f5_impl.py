@@ -5,6 +5,8 @@
 * ``+`` stress marks (ruaccent ``plus`` format) pass through to the model.
 * F5 needs the reference transcript (``timbre_ref_text``); without it F5 would
   run its own Whisper, which is not available offline, so the item fails clearly.
+* The Vocos vocoder (``charactr/vocos-mel-24khz``) is a weight of the spec and is loaded from its local directory
+  (``vocoder_local_path``); f5-tts would otherwise download it at load time, which the offline adapter env forbids.
 """
 
 from __future__ import annotations
@@ -13,9 +15,10 @@ import fnmatch
 from pathlib import Path
 from typing import Any
 
-from adapters.common.rpc import TTSImpl, WeightsMissingError, load_audio, weight_dir
+from adapters.common.rpc import TTSImpl, WeightsMissingError, find_weight, load_audio, weight_dir
 
 MAX_TOTAL_S = 30.0
+VOCODER_DIR = "vocos-mel-24khz"  # weight dir of charactr/vocos-mel-24khz (second weight of the f5_ru spec)
 
 
 def _find(root: Path, pattern: str) -> Path | None:
@@ -35,8 +38,14 @@ class F5Russian(TTSImpl):
         vocab = _find(d, self.options.get("vocab_glob", "F5TTS_v1_Base/vocab.txt"))
         if ckpt is None or vocab is None:
             raise WeightsMissingError(self.name, f"checkpoint/vocab not found under {d}")
-        self.model = F5TTS(model=self.options.get("arch", "F5TTS_v1_Base"), ckpt_file=str(ckpt), vocab_file=str(vocab), device=self.device)
-        return {"ckpt": str(ckpt), "vocab": str(vocab)}
+        # f5-tts 1.1.9 reads <dir>/config.yaml + <dir>/pytorch_model.bin when vocoder_local_path is set; without it
+        # load_vocoder calls hf_hub_download("charactr/vocos-mel-24khz"), which cannot work with HF_HUB_OFFLINE=1
+        vocoder = find_weight(self.params, VOCODER_DIR)
+        self.model = F5TTS(
+            model=self.options.get("arch", "F5TTS_v1_Base"), ckpt_file=str(ckpt), vocab_file=str(vocab),
+            vocoder_local_path=str(vocoder), device=self.device,
+        )
+        return {"ckpt": str(ckpt), "vocab": str(vocab), "vocoder": str(vocoder)}
 
     def generate(self, item: dict[str, Any]):
         ref = item.get("timbre_ref")

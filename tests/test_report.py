@@ -62,3 +62,25 @@ def test_report_says_what_the_patch_holds_and_leaves_out(make_ctx, tmp_path):
             assert (s["provisional"], s["left_out"]) == (0, 1) and "| left out |" in row
             assert "left out 1 (review 1)" in md and "master.include_review_lines" in md and "no candidate passes the gates" in html
         assert len(sel) == len(data["lines"])
+
+
+def test_report_match_median_ignores_records_without_asr(make_ctx, tmp_path):
+    # no_asr records keep the default match_score 0.0; they must not drag "median match" to 0
+    from vndub.manifest.io import LinkRecord, write_jsonl
+
+    ctx = make_ctx(tmp_path / "game")
+    build(ctx, n_per=2)
+    write_jsonl(ctx.paths.link, [
+        LinkRecord(line_id="a", audio_id="x", status="ok"),
+        LinkRecord(line_id="b", audio_id="y", status="review", reasons=["order_gap"]),
+        LinkRecord(line_id="c", audio_id="z", asr_text="テスト", match_score=0.9, status="ok"),
+        LinkRecord(line_id="d", audio_id="w", asr_text="テスト", match_score=0.7, status="ok"),
+    ])
+    data = report.collect(ctx)
+    assert data["link"]["match"]["n"] == 2 and data["link"]["match"]["median"] == 0.8
+    assert data["link"]["total"] == 4
+    # an all-no_asr project: no match statistics, and the report still renders ("–" instead of 0)
+    write_jsonl(ctx.paths.link, [LinkRecord(line_id="a", audio_id="x", status="ok")])
+    assert report.collect(ctx)["link"]["match"] == {"n": 0}
+    html, md = report.render(report.collect(ctx))
+    assert "median match –" in md and "median match 0" not in md

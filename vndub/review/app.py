@@ -1,13 +1,14 @@
 """Review UI (Gradio): listen to the original vs candidates, override the automatic choice.
 
 Everything the UI decides is appended to ``work/overrides.jsonl`` via
-:func:`write_override`; ``vndub synth --only ... && vndub score --only ...``
+:func:`write_override`; ``vndub synth --only ...`` then ``vndub score --only ...``
 applies regen / set_text / set_ref, and ``score`` honours accept / reject /
 keep_original immediately.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -36,13 +37,13 @@ def load_rows(ctx: Any) -> list[dict[str, Any]]:
     from vndub.stages import genutil as gu
 
     p = ctx.paths
-    lines = ctx.lines() if p.lines.exists() else []
+    # the lines synth / score work on: the link rebindings applied (a relinked line shows its new voice) and, with
+    # synth.voice_unvoiced, the route-P lines that have no original audio (the raw has_voice hid them)
+    lines = ctx.dub_lines(apply_only=False) if p.lines.exists() else []
     sel = gu.load_selection(ctx)
     trs = gu.load_translations(ctx)
     rows = []
     for l in lines:
-        if not l.has_voice:
-            continue
         s = sel.get(l.line_id)
         tr = trs.get(l.line_id)
         rows.append(
@@ -109,10 +110,22 @@ def batch_accept(ctx: Any, threshold: float) -> int:
     return n
 
 
+def _quote(arg: Any) -> str:
+    """Double quotes when needed: valid in cmd.exe, PowerShell and POSIX shells (a project folder with a space broke the line)."""
+    s = str(arg)
+    # (a backslash path is quoted too: bash would eat the backslashes outside quotes)
+    return s if re.fullmatch(r"[A-Za-z0-9_./:,=+@%-]+", s) else '"' + s.replace('"', '\\"') + '"'
+
+
+def score_command(ctx: Any, line_ids: list[str]) -> str:
+    return f"uv run vndub score --project {_quote(ctx.project_dir)} --only {_quote(','.join(line_ids))}"
+
+
 def rerun_command(ctx: Any, line_ids: list[str]) -> str:
-    ids = ",".join(line_ids)
-    proj = ctx.project_dir
-    return f"uv run vndub synth --project {proj} --only {ids} && uv run vndub score --project {proj} --only {ids}"
+    """The synth + score commands for ``line_ids``, one per line: ``&&`` is not a statement separator of cmd.exe or
+    Windows PowerShell 5, so the two are run one after the other."""
+    proj, ids = _quote(ctx.project_dir), _quote(",".join(line_ids))
+    return f"uv run vndub synth --project {proj} --only {ids}\nuv run vndub score --project {proj} --only {ids}"
 
 
 # ----------------------------------------------------------------------------
@@ -138,7 +151,7 @@ def build_app(ctx: Any):
 
     def show(line_id: str):
         line_id = (line_id or "").strip()
-        lines = {l.line_id: l for l in ctx.lines()} if ctx.paths.lines.exists() else {}
+        lines = {l.line_id: l for l in ctx.dub_lines(apply_only=False)} if ctx.paths.lines.exists() else {}
         l = lines.get(line_id)
         if l is None:
             return ("unknown line", None, gr.update(choices=[], value=None), gr.update(choices=[], value=None), None, None, "", "", gr.update(choices=[], value=None))
@@ -195,9 +208,9 @@ def build_app(ctx: Any):
             touched.append(line_id)
         msg = f"{action} recorded for {line_id}."
         if action in ("regen", "set_ref"):
-            msg += f"\n\nRe-run: `{rerun_command(ctx, touched)}`"
+            msg += f"\n\nRe-run (one command after the other):\n\n```\n{rerun_command(ctx, touched)}\n```"
         else:
-            msg += f"\n\nApply: `uv run vndub score --project {ctx.project_dir} --only {','.join(touched)}`"
+            msg += f"\n\nApply:\n\n```\n{score_command(ctx, touched)}\n```"
         return msg
 
     def do_batch(th: float) -> str:

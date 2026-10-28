@@ -29,11 +29,12 @@ def preview_run(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, 
     ids = pipeline.first_scene_ids(h) if mode == "first_scene" else pipeline.first_n_ids(h, n)
     if not ids:
         raise AppError("import_required", action="choose_game_dir", status=400)
+    job = pipeline.submit("preview", h.slug, {"mode": mode, "n": n, "line_ids": ids})  # may refuse (409): nothing is remembered then
     with session.STATE_LOCK:
         st = appdirs.read_app_state(h)
         st["preview"] = {**(st.get("preview") or {}), "mode": mode, "n": n, "line_ids": ids}
         appdirs.write_app_state(h, st)
-    return pipeline.submit("preview", h.slug, {"mode": mode, "n": n, "line_ids": ids}).info()
+    return job.info()
 
 
 @router.get("/preview/items")
@@ -72,11 +73,12 @@ def preview_items() -> dict[str, Any]:
 def run_full(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     h = session.current_handle()
     shutdown = bool(body.get("shutdown_when_done"))
+    job = pipeline.submit("full", h.slug, {"shutdown_when_done": shutdown})  # may refuse (409): the setting is not touched then
     s = appdirs.load_settings()
     if s.shutdown_when_done != shutdown:
         s.shutdown_when_done = shutdown
         appdirs.save_settings(s)
-    return pipeline.submit("full", h.slug, {"shutdown_when_done": shutdown}).info()
+    return job.info()
 
 
 @router.get("/gpu")

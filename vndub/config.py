@@ -100,8 +100,10 @@ class RenpyOpts(_Section):
     # Overrides config.auto_voice detected in the scripts, e.g. "voice/{id}.ogg".
     auto_voice: str = ""
     # Ren'Py >= 8.5.1 config.tlid_only_considers_say (default True in 8.6): voice
-    # statements do not enter the dialogue identifier
-    tlid_only_considers_say: bool = False
+    # statements do not enter the dialogue identifier. None = by the Ren'Py version
+    # the game ships (renpy/vc_version.py, renpy/__init__.py): True from 8.6, False
+    # when older or when the version cannot be read; true / false force it.
+    tlid_only_considers_say: bool | None = None
 
 
 class TyranoOpts(_Section):
@@ -176,8 +178,8 @@ class AnalyzeSection(_Section):
     events: str = "sensevoice"
     aligner: str = "qwen3_aligner"
     aligner_fallback: str = "whisperx_ja"
-    f0: str = "rmvpe"  # rmvpe | torchcrepe | librosa
-    vad: str = "silero"  # silero | energy
+    f0: str = "rmvpe"  # rmvpe | torchcrepe | librosa_f0 (registry names; an unknown name is reported as an unavailable backend)
+    vad: str = "silero"  # silero | energy_vad
     caption: bool = False
     caption_backend: str = "qwen2_audio"
     ref_candidates_per_emotion: int = 2

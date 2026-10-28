@@ -79,45 +79,58 @@ def configured_log_level() -> int:
         return logging.INFO
 
 
+_LOG_NAMES = ("vndub_app", "vndub", "uvicorn.error")
+
+
+def _file_handlers() -> list[logging.Handler]:
+    """The app.log handlers that are attached to our loggers (the same handler once, however many loggers carry it)."""
+    seen: list[logging.Handler] = []
+    for name in _LOG_NAMES:
+        for h in logging.getLogger(name).handlers:
+            if getattr(h, _FILE_HANDLER_MARK, False) and h not in seen:
+                seen.append(h)
+    return seen
+
+
 def setup_logging(level: int | None = None) -> Path:
     """Rotating ``<data>/logs/app.log`` for the app, the pipeline loggers and uvicorn (idempotent).
 
     ``level`` defaults to :func:`configured_log_level` (``Settings.debug_log``). Calling it again with another level
-    changes the level of the handlers that are already there instead of adding new ones.
+    changes the level of the handler that is already there instead of adding a new one. All three loggers share ONE
+    handler: with a handler each, a rollover could not rename ``app.log`` (the other handlers keep it open, WinError 32)
+    and every record after the first 2 MB was dropped.
     """
     if level is None:
         level = configured_log_level()
     path = appdirs.logs_dir() / "app.log"
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
-    for name in ("vndub_app", "vndub", "uvicorn.error"):
+    shared: logging.Handler | None = None
+    for h in _file_handlers():
+        if shared is None and Path(getattr(h, "baseFilename", "")) == path:
+            shared = h  # already there (a repeated call, or the data folder did not change)
+        else:  # another data folder's app.log, or a second handler on the same file (the old per-logger layout)
+            for name in _LOG_NAMES:
+                logging.getLogger(name).removeHandler(h)
+            h.close()
+    if shared is None:
+        shared = RotatingFileHandler(path, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+        shared.setFormatter(fmt)
+        setattr(shared, _FILE_HANDLER_MARK, True)
+    shared.setLevel(level)
+    for name in _LOG_NAMES:
         lg = logging.getLogger(name)
-        have = False
-        for h in list(lg.handlers):
-            if getattr(h, _FILE_HANDLER_MARK, False):
-                if Path(getattr(h, "baseFilename", "")) == path:
-                    have = True
-                    h.setLevel(level)
-                else:
-                    lg.removeHandler(h)
-                    h.close()
-        if not have:
-            fh = RotatingFileHandler(path, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
-            fh.setFormatter(fmt)
-            fh.setLevel(level)
-            setattr(fh, _FILE_HANDLER_MARK, True)
-            lg.addHandler(fh)
+        if shared not in lg.handlers:
+            lg.addHandler(shared)
         lg.setLevel(level)  # these loggers are ours (for uvicorn.error: uvicorn applies its own level before the lifespan starts)
     return path
 
 
 def close_logging() -> None:
-    """Close the app.log handlers (tests on Windows must release the file before the folder is removed)."""
-    for name in ("vndub_app", "vndub", "uvicorn.error"):
-        lg = logging.getLogger(name)
-        for h in list(lg.handlers):
-            if getattr(h, _FILE_HANDLER_MARK, False):
-                lg.removeHandler(h)
-                h.close()
+    """Close the app.log handler (tests on Windows must release the file before the folder is removed)."""
+    for h in _file_handlers():
+        for name in _LOG_NAMES:
+            logging.getLogger(name).removeHandler(h)
+        h.close()
 
 
 # ----------------------------------------------------------------------------
@@ -201,6 +214,29 @@ def _spa_response(rel: str) -> Any:
     return FileResponse(index, media_type="text/html", headers={"Cache-Control": "no-cache"})
 
 
+#: pictures of the in-app help: ``docs/APP.md`` writes ``![..](img/app/00-doctor.png)``, the SPA renders ``<img src="img/app/..">``
+#: and the page lives at ``/`` (HashRouter: ``/#/help/app`` is still the document ``/``), so the browser asks for ``/img/app/...``.
+HELP_IMAGE_PREFIX = "img"
+HELP_IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}  # no SVG: it can carry scripts
+
+
+def _help_image(rel: str) -> Any:
+    """A picture of the bundled ``docs/img`` folder (read-only). Anything else (``..``, a drive, another type, a missing file) is a 404."""
+    parts = rel.replace("\\", "/").split("/")
+    suffix = Path(parts[-1]).suffix.lower()
+    if not rel or ".." in parts or "" in parts or ":" in rel or suffix not in HELP_IMAGE_TYPES:
+        raise AppError("file_not_found", params={"path": f"/{HELP_IMAGE_PREFIX}/{rel}"}, status=404)
+    base = appdirs.resource("docs", "img").resolve()
+    try:
+        cand = base.joinpath(*parts).resolve()
+        cand.relative_to(base)
+        if cand.is_file():
+            return FileResponse(cand, media_type=HELP_IMAGE_TYPES[suffix], headers={"Cache-Control": "no-cache"})
+    except (OSError, ValueError):
+        pass
+    raise AppError("file_not_found", params={"path": f"/{HELP_IMAGE_PREFIX}/{rel}"}, status=404)
+
+
 # ----------------------------------------------------------------------------
 # app
 # ----------------------------------------------------------------------------
@@ -271,6 +307,10 @@ def create_app() -> FastAPI:
     @app.get("/api/progress/sse", include_in_schema=False)
     async def progress_sse(request: Request) -> StreamingResponse:
         return await _progress_sse(request)
+
+    @app.get("/" + HELP_IMAGE_PREFIX + "/{rel:path}", include_in_schema=False)
+    def help_image(rel: str) -> Any:
+        return _help_image(rel)
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa(full_path: str) -> Any:

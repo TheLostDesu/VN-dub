@@ -40,6 +40,7 @@ export function CoverageCallout({ coverage, onReview, testid = "run-coverage" }:
         ) : null}
         {coverage.left_out > 0 ? <li data-testid={`${testid}-left-out`}>{t("coverage.left_out", { n: coverage.left_out, reasons })}</li> : null}
         {coverage.narration > 0 ? <li data-testid={`${testid}-narration`}>{t("coverage.narration", { n: coverage.narration })}</li> : null}
+        {coverage.own_voice > 0 ? <li data-testid={`${testid}-own-voice`}>{t("coverage.own_voice", { n: coverage.own_voice })}</li> : null}
       </ul>
     </Callout>
   );

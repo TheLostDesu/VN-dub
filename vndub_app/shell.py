@@ -549,6 +549,7 @@ def _startup_housekeeping() -> None:
 
 _SWEPT_AT: float | None = None
 SWEEP_ONCE_S = 5.0  # a second _final_sweep within this time (main's, then _hard_exit's) is skipped
+SWEEP_JOIN_S = 5.0  # _hard_exit waits at most this long for its sweep: a stuck one must not keep the process alive
 
 
 def _log_nonblocking(level: int, msg: str, *args: Any) -> None:
@@ -596,10 +597,16 @@ def _hard_exit(code: int) -> None:
     through. Before it, :func:`_final_sweep` makes sure nothing the app started is left, Job Object or not: the Job Object
     only covers a process that really ends and only when it could be installed, and it cannot reach an orphan whose
     parent died earlier.
+
+    The sweep runs in a daemon thread that is waited for at most ``SWEEP_JOIN_S``: the watchdog calls this when the cleanup is
+    stuck, and the sweep can be stuck the same way (``winproc._SWEEP_LOCK`` held by the cleanup's own sweep, a logging lock);
+    waiting for it would make the last resort wait for the thing it is there to cut short.
     """
     from vndub_app import winproc
 
-    _final_sweep()
+    sweep = threading.Thread(target=_final_sweep, name="vndub-exit-sweep", daemon=True)
+    sweep.start()
+    sweep.join(SWEEP_JOIN_S)
     winproc.end_process(code)
 
 

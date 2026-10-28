@@ -8,9 +8,11 @@ import { StepFooter } from "../components/StepFooter";
 import { ABPlayer } from "../components/WavePlayer";
 import { Button, Callout, Card, Chip, PageTitle, RadioGroup, Spinner } from "../components/ui";
 import { useI18n } from "../i18n";
-import { useActiveJob, useJobTracker } from "../state/progress";
+import { useJobTracker } from "../state/progress";
 import { useProject } from "../state/project";
 import { useWizard } from "../state/wizard";
+
+const PREVIEW_JOBS = ["preview"];
 
 export default function PreviewScreen() {
   const { t, has } = useI18n();
@@ -33,12 +35,8 @@ export default function PreviewScreen() {
     }
   }, []);
 
-  const job = useJobTracker({ onDone: () => void loadItems() });
-  const active = useActiveJob(["preview"]);
-  useEffect(() => {
-    if (active && !job.job) job.attach(active);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active?.id]);
+  // kinds + project: the job (running, or done with its warnings) is shown again after a visit to another screen
+  const job = useJobTracker({ onDone: () => void loadItems(), kinds: PREVIEW_JOBS, project: project?.slug ?? null });
 
   useEffect(() => {
     void loadItems();

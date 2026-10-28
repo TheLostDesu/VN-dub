@@ -204,7 +204,7 @@ def _rel_target(game_dir: Path, base: Path, rel: Path) -> str:
     return PurePosixPath((base / rel).relative_to(game_dir).as_posix()).as_posix()
 
 
-COVERAGE_COUNTS = ("dub_lines", "installed", "provisional", "provisional_review", "provisional_regen", "left_out", "narration")
+COVERAGE_COUNTS = ("dub_lines", "installed", "provisional", "provisional_review", "provisional_regen", "left_out", "narration", "own_voice")
 
 
 def _count(v: Any) -> int:

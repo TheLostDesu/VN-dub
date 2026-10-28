@@ -159,6 +159,10 @@ export function Dialog({
   const ref = useRef<HTMLDivElement>(null);
   const titleId = useId();
   const returnFocus = useRef<HTMLElement | null>(null);
+  // callers pass a new closure on every render: depending on it would run the effect again and pull the focus back to the
+  // first button each time the parent re-renders (a job tick, a keystroke in a field of the dialog)
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
@@ -169,7 +173,7 @@ export function Dialog({
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (e.key !== "Tab" || !node) return;
@@ -190,7 +194,7 @@ export function Dialog({
       document.removeEventListener("keydown", onKey, true);
       returnFocus.current?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
   return (

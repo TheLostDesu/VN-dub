@@ -20,10 +20,10 @@ Backend environments (each heavy model family is isolated in `.venvs/<env>`):
 
 ```bash
 powershell -ExecutionPolicy Bypass -File scripts/make_envs.ps1 -Env all        # CUDA 12 torch
-powershell -ExecutionPolicy Bypass -File scripts/make_envs.ps1 -Env asr -Cpu   # CPU torch (no GPU)
+powershell -ExecutionPolicy Bypass -File scripts/make_envs.ps1 -Env main -Cpu  # CPU torch (no GPU)
 ```
 
-Linux/macOS: `scripts/make_envs.sh all` (or `scripts/make_envs.sh asr --cpu`).
+Linux/macOS: `scripts/make_envs.sh all` (or `scripts/make_envs.sh main --cpu`).
 
 ## 3. Download models (once; the pipeline then runs offline)
 

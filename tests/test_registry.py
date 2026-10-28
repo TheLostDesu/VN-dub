@@ -165,3 +165,26 @@ def test_models_selftest_reports_missing_pieces_cleanly(tmp_path: Path, monkeypa
     res = models.selftest(cfg, "voxcpm2")
     assert res["ok"] is False and "env 'main' not created" in res["error"] and "make_envs" in res["hint"]
     assert models.selftest(cfg, "no_such_backend")["ok"] is False
+
+
+def test_f5_ru_pulls_the_vocoder_it_loads_offline() -> None:
+    """f5-tts 1.1.9 downloads charactr/vocos-mel-24khz unless ``vocoder_local_path`` is given, and the adapter env is offline."""
+    from vndub.backends.weights import local_dir
+
+    vocos = [w for w in SPECS["f5_ru"].weights if w.repo == "charactr/vocos-mel-24khz"]
+    assert len(vocos) == 1 and vocos[0].kind == "hf"
+    assert set(vocos[0].allow) == {"config.yaml", "pytorch_model.bin"} and 0 < vocos[0].size_gb < 0.2  # load_vocoder reads exactly these
+    assert local_dir(Path("m"), vocos[0], "f5_ru").name == "vocos-mel-24khz"  # the name adapters/f5/f5_impl.py looks the weight up by
+
+
+def test_chatterbox_pulls_only_the_checkpoint_chatterbox_tts_loads() -> None:
+    """chatterbox-tts 0.1.7 ``from_local(ckpt_dir, device)`` loads t3_mtl23ls_v2 (no ``t3_model`` argument): the 2.1 GB v3 file stays out."""
+    (w,) = SPECS["chatterbox_ml"].weights
+    assert "t3_mtl23ls_v2.safetensors" in w.allow and not any("v3" in p for p in w.allow)
+    assert 3.1 <= w.size_gb <= 3.3  # the allowed files sum to 3.21 GB on the hub
+
+
+def test_disk_and_vram_estimates_match_the_measured_footprints() -> None:
+    (cosy,) = SPECS["cosyvoice3"].weights
+    assert cosy.allow == () and 9.5 <= cosy.size_gb <= 10.0  # the whole snapshot is 9.75 GB (it was 3.4)
+    assert SPECS["moss_tts"].vram_estimate_gb >= 14.1 * 1.0  # q4_k CUDA cloning peak, audio.cpp docs/models/moss_tts_v15.md

@@ -6,7 +6,6 @@ import json
 import os
 import sys
 import time
-import zipfile
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -698,3 +697,55 @@ def test_tools_python_writes_utf8_to_pipes(tmp_path: Path) -> None:
     r = subprocess.run([str(py), "-c", "print('ファイル名 日本語'); import sys; print('ошибка', file=sys.stderr)"], capture_output=True, env=env, timeout=60)
     assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
     assert r.stdout.decode("utf-8").strip() == "ファイル名 日本語" and r.stderr.decode("utf-8").strip() == "ошибка"
+
+
+# ---- release 1.0 hardening ----------------------------------------------------------------------------------------------------
+
+
+def test_tools_python_writes_utf8_even_when_its_folder_cannot_be_written_in_the_console_code_page(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The site-packages path of a user with Japanese letters in the folder name: the child that prints it used to die with
+    UnicodeEncodeError under a cp1251 / cp1252 code page, and the sitecustomize was silently never installed."""
+    import venv
+
+    env_dir = tmp_path / "ユーザー環境" / "pytools"
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(env_dir)
+    py = installer._venv_python(env_dir)
+    f = installer.ensure_utf8_output(py)
+    assert f is not None and f.name == "sitecustomize.py" and "ユーザー環境" in str(f)
+    assert f.read_text(encoding="utf-8") == installer.UTF8_SITECUSTOMIZE
+    caplog.clear()
+    assert installer.ensure_utf8_output(tmp_path / "no" / "such" / "python.exe") is None
+    assert any("no UTF-8 sitecustomize" in r.getMessage() and "python.exe" in r.getMessage() for r in caplog.records)  # and it says so
+
+
+def test_an_install_is_refused_while_the_installer_is_busy(o_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    from vndub_app import jobs
+
+    use_manifest(tmp_path, rubberband_entry("http://127.0.0.1:1/x"))
+    gate = threading.Event()
+    monkeypatch.setattr(installer, "install_tools", lambda names, ctx: gate.wait(20) and None)
+    monkeypatch.setattr(installer, "install_envs", lambda envs, torch, ctx: gate.wait(20) and None)
+    c = client_for(installer)
+    runner = jobs.runner()
+    try:
+        # an unrelated running job (a model download, a dub): a tools download may go on beside it, an environments install may not
+        other = runner.submit("full", lambda ctx: gate.wait(20) and None, project="demo")
+        busy = c.post("/api/envs/install", json={"envs": ["main"]})
+        assert busy.status_code == 409 and busy.json()["error"]["code"] == "job_busy" and busy.json()["error"]["params"]["job_id"] == other.id
+        assert [j.kind for j in runner.list()] == ["full"]  # nothing was queued
+        first = c.post("/api/tools/install", json={"names": ["rubberband"]})
+        assert first.status_code == 200
+        # the same kind again, and the other install kind, are refused as long as one install runs
+        for url, body in (("/api/tools/install", {"names": ["rubberband"]}), ("/api/envs/install", {"envs": ["main"]})):
+            r = c.post(url, json=body)
+            assert r.status_code == 409 and r.json()["error"]["code"] == "job_busy", url
+        assert sorted(j.kind for j in runner.list()) == ["full", "tools_install"]
+    finally:
+        gate.set()
+    runner.wait(first.json()["id"], 10)
+    runner.wait(other.id, 10)
+    ok = c.post("/api/envs/install", json={"envs": ["main"]})  # nothing runs any more
+    assert ok.status_code == 200
+    assert wait_job(ok.json()["id"])["state"] == "done"

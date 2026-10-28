@@ -312,19 +312,31 @@ def _regen_loop(ctx: StageContext, on_round: Callable[[int, int, int], None] | N
     from vndub.manifest.io import SelectionRecord, read_jsonl
 
     total = ctx.cfg.score.regen_rounds
-    for rnd in range(1, total + 1):
-        sel = read_jsonl(ctx.paths.selection, SelectionRecord)
-        todo = [s.line_id for s in sel if s.status == "regen"]
-        if not todo:
-            break
-        console.print(f"[cyan]regen round {rnd}/{total}: {len(todo)} line(s)[/cyan]")
-        ctx.log.info("regen round %d/%d: %d line(s) have no candidate passing the gates, new takes are synthesized for them", rnd, total, len(todo))
-        if on_round is not None:
-            on_round(rnd, total, len(todo))
-        ctx.extra["regen"] = True
-        ctx.extra["regen_round"] = rnd
-        run_stage("synth", ctx)
-        run_stage("score", ctx)
+    # --only / --limit: the rounds work on the lines of this run, not on everything selection.jsonl holds (a preview of a few
+    # lines must not report, or run, a round for the other regen lines of the project)
+    scope: set[str] | None = None
+    if getattr(ctx, "only", None) or getattr(ctx, "limit", None) is not None:
+        scope = {l.line_id for l in ctx.dub_lines()}
+    # --force is for the first pass only: every round builds new stage caches, and with force on each one would clear the
+    # synth cache and keep just the regen lines, so the next run would synthesize everything again
+    force = getattr(ctx, "force", False)
+    ctx.force = False
+    try:
+        for rnd in range(1, total + 1):
+            sel = read_jsonl(ctx.paths.selection, SelectionRecord)
+            todo = [s.line_id for s in sel if s.status == "regen" and (scope is None or s.line_id in scope)]
+            if not todo:
+                break
+            console.print(f"[cyan]regen round {rnd}/{total}: {len(todo)} line(s)[/cyan]")
+            ctx.log.info("regen round %d/%d: %d line(s) have no candidate passing the gates, new takes are synthesized for them", rnd, total, len(todo))
+            if on_round is not None:
+                on_round(rnd, total, len(todo))
+            ctx.extra["regen"] = True
+            ctx.extra["regen_round"] = rnd
+            run_stage("synth", ctx)
+            run_stage("score", ctx)
+    finally:
+        ctx.force = force
     ctx.extra["regen"] = False
     if total > 0 and ctx.paths.selection.exists():
         # score turns "regen" into "review" once a line has a take of the last round; a line whose round produced no take

@@ -151,17 +151,22 @@ def _no_window() -> int:
 
 
 def server_help(binary: Path) -> str:
-    """``llama-server --help`` (cached per binary; ``""`` when it cannot run): which flags this build knows."""
+    """``llama-server --help`` (cached per binary; ``""`` when it cannot run): which flags this build knows.
+
+    Only a real answer is cached: a timeout or an OSError once (a busy machine, a scanner holding the exe) must not leave
+    ``--fit off`` out of every later command line of the process, which makes the next model fail the offload check."""
     key = str(binary)
-    if key not in _help_cache:
+    if key in _help_cache:
+        return _help_cache[key]
+    text = ""
+    try:
+        r = subprocess.run([str(binary), "--help"], capture_output=True, timeout=30, creationflags=_no_window(), check=False)
+        text = (r.stdout or b"").decode("utf-8", "replace") + (r.stderr or b"").decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
         text = ""
-        try:
-            r = subprocess.run([str(binary), "--help"], capture_output=True, timeout=30, creationflags=_no_window(), check=False)
-            text = (r.stdout or b"").decode("utf-8", "replace") + (r.stderr or b"").decode("utf-8", "replace")
-        except (OSError, subprocess.SubprocessError):
-            text = ""
+    if text.strip():
         _help_cache[key] = text
-    return _help_cache[key]
+    return text
 
 
 def build_args(binary: Path, gguf: Path, port: int, options: dict[str, Any], help_text: str = "") -> list[str]:

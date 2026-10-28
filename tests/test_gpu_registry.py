@@ -282,6 +282,35 @@ def test_stage_level_substitution_is_recorded(tmp_path: Path, fake_specs) -> Non
     assert ev[-1]["substituted_for"] == "huge" and ev[-1]["device_actual"] == "cuda:0"
 
 
+class FailingLoadBackend(FakeBackend):
+    def load(self) -> dict[str, Any]:
+        raise RuntimeError("out of memory while loading")
+
+
+def test_substitution_is_not_recorded_when_the_fallback_fails_to_load(tmp_path: Path, fake_specs) -> None:
+    """A fallback that never came up was not used: the report, gpu_events and the app must not announce ``huge -> big_b``."""
+    log: list = []
+    reg = ModelRegistry(
+        cuda=FakeCuda(), check_usable=False, factory=lambda s, o, d: FailingLoadBackend(s, o, d, None, log),
+        models_dir=tmp_path / "m", log_dir=tmp_path / "l", vram_retry_s=0.0,
+    )
+    with pytest.raises(RuntimeError, match="out of memory"):
+        reg.acquire("big_b", substituted_for="huge", reason="huge: needs ~7.9 GB > budget")
+    assert reg.substitutions == [] and reg.resident == []
+    assert ("unload", "big_b", "cuda:0") in log  # the failed load was cleaned up
+
+
+def test_substitution_is_not_recorded_when_the_fallback_is_refused_for_vram(tmp_path: Path, fake_specs) -> None:
+    reg, _log = make_reg(tmp_path, FakeCuda(total_gb=8.0, other_gb=5.0))  # another app holds 5 GB: big_b (3.8) does not fit
+    with pytest.raises(VramBudgetExceeded):
+        reg.acquire("big_b", substituted_for="huge", reason="huge: needs ~7.9 GB > budget")
+    assert reg.substitutions == []
+    # the next, successful use of the fallback is the one that gets announced
+    reg2, _ = make_reg(tmp_path, FakeCuda())
+    reg2.acquire("big_b", substituted_for="huge", reason="huge: needs ~7.9 GB > budget")
+    assert [(s.requested, s.used) for s in reg2.substitutions] == [("huge", "big_b")]
+
+
 # -- would_fit: the answer acquire will give, without loading (2026-10-22, round 8) ----------------------------
 
 
@@ -408,3 +437,60 @@ def test_retry_default_and_from_config(tmp_path: Path) -> None:
     paths = WorkPaths.create(tmp_path / "work", tmp_path / "out")
     reg = from_config(cfg, paths, Tools.load(cfg.resolve(cfg.tools_file), cfg.tools), cuda=NoCuda())
     assert reg.vram_retry_s == 3.0
+
+
+# -- abort_all reaches a backend that is still loading (2026-10-28, release 1.0.0) --------------------------------------
+
+
+class BlockingLoadBackend(FakeBackend):
+    """A load that waits (a real model takes minutes) until ``abort`` kills it, like RemoteBackend does."""
+
+    def __init__(self, *a: Any) -> None:
+        super().__init__(*a)
+        import threading
+
+        self.killed = threading.Event()
+
+    def load(self) -> dict[str, Any]:
+        self.log.append(("loading", self.spec.name))
+        if not self.killed.wait(timeout=10):
+            raise AssertionError("abort never came")
+        raise RuntimeError("adapter was aborted (job cancelled) during 'load'")
+
+    def abort(self) -> None:
+        self.log.append(("abort", self.spec.name))
+        self.killed.set()
+
+
+def test_abort_all_reaches_a_backend_that_is_still_loading(tmp_path: Path, fake_specs) -> None:
+    """Cancel during a model load used to wait for the whole load (up to the 1800 s RPC timeout): the backend was not
+    resident yet, so abort_all did not know about it."""
+    import threading
+
+    log: list = []
+    reg = ModelRegistry(
+        cuda=FakeCuda(), check_usable=False, factory=lambda s, o, d: BlockingLoadBackend(s, o, d, None, log),
+        models_dir=tmp_path / "m", log_dir=tmp_path / "l", vram_retry_s=0.0,
+    )
+    errors: list[BaseException] = []
+
+    def job() -> None:
+        try:
+            reg.acquire("big_a")
+        except BaseException as e:  # noqa: BLE001 - the test records whatever the cancelled load raised
+            errors.append(e)
+
+    t = threading.Thread(target=job)
+    t.start()
+    for _ in range(200):  # until the job thread is inside load()
+        if ("loading", "big_a") in log:
+            break
+        threading.Event().wait(0.01)
+    assert reg._loading is not None and reg.resident == []
+    reg.abort_all()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert ("abort", "big_a") in log and ("unload", "big_a", "cuda:0") in log
+    assert len(errors) == 1 and "aborted" in str(errors[0])
+    assert reg._loading is None and reg.resident == [] and reg.substitutions == []
+    reg.abort_all()  # nothing loading, nothing resident: a no-op

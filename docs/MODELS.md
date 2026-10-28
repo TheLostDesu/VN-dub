@@ -65,7 +65,7 @@ backend whose "Commercial" column is "no" (falling back or marking lines for rev
 | energy_vad | vad | - | core | 0.0 | MIT | yes | - | default,test | core (always available) |
 | [silero](https://github.com/snakers4/silero-vad) | vad | bundled with the pip package | main | 0.0 | MIT | yes | energy_vad | default | **selftest OK on CPU** (load 10.71 s, 2 s clip 0.22 s) |
 | mock_stress | stress | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [ruaccent](https://github.com/Den4ikAI/ruaccent) | stress | downloaded by the env (`models pull`) | main | 0.0 | MIT | yes | - | default,test | **selftest OK on CPU** (load 56.25 s, 2 s clip 0.28 s) |
+| [ruaccent](https://github.com/Den4ikAI/ruaccent) | stress | downloaded by the env (`models pull`; the koziev data ruaccent keeps in its package folder is copied to `models/ruaccent/koziev` and restored from there after an env rebuild) | main | 0.0 | MIT | yes | - | default,test | **selftest OK on CPU** (load 56.25 s, 2 s clip 0.28 s) |
 | [ecapa](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb) | embedder | `speechbrain/spkrec-ecapa-voxceleb` | main | 0.4 | Apache-2.0 | yes | - | default,test | **selftest OK on CPU** (load 17.68 s, 2 s clip 1.74 s) |
 | mock_embedder | embedder | - | core | 0.0 | MIT | yes | - | test | core (always available) |
 | [wavlm_sv](https://huggingface.co/microsoft/wavlm-base-plus-sv) | embedder | `microsoft/wavlm-base-plus-sv` | main | 0.8 | MIT | yes | - | optional | not verified: weights missing: run `vndub models pull wavlm_sv` |
@@ -80,11 +80,11 @@ backend whose "Commercial" column is "no" (falling back or marking lines for rev
 | [qwen35_9b](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | llm | `unsloth/Qwen3.5-9B-GGUF` | core | 6.3 | Apache-2.0 | yes | hy_mt15_7b | default | not verified: GGUF not pulled (`vndub models pull qwen35_9b`); also needs `tools.llama_server` |
 | [chatterbox_ml](https://github.com/resemble-ai/chatterbox) | tts | `ResembleAI/chatterbox` | chatterbox | 4.0 | MIT (Perth watermark embedded) | yes | - | default | not verified: env 'chatterbox' not created |
 | [cosyvoice3](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512) | tts | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | funasr | 3.8 | Apache-2.0 | yes | - | default | not verified: weights missing: run `vndub models pull cosyvoice3` |
-| [f5_ru](https://huggingface.co/Misha24-10/F5-TTS_RUSSIAN) | tts | `Misha24-10/F5-TTS_RUSSIAN` | f5 | 3.0 | CC-BY-NC-4.0 (Russian checkpoint) | no | - | optional | not verified: env 'f5' not created |
+| [f5_ru](https://huggingface.co/Misha24-10/F5-TTS_RUSSIAN) | tts | `Misha24-10/F5-TTS_RUSSIAN` + the Vocos vocoder `charactr/vocos-mel-24khz` (f5-tts downloads it at load otherwise, which fails offline) | f5 | 3.0 | CC-BY-NC-4.0 (Russian checkpoint) | no | - | optional | not verified: env 'f5' not created |
 | [fish_s2](https://huggingface.co/fishaudio/s2-pro) | tts | `audio-cpp/audio.cpp-gguf` (`Fish-Audio-S2-Pro-GGUF/fish-audio-s2-pro-q8_0.gguf`) | gguf | 7.5 | Fish Audio Research License (non-commercial) | no | - | optional | not verified: env 'gguf' not created |
 | [higgs_tts3](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b) | tts | `bosonai/higgs-audio-v3-tts-4b` | higgs | 6.0 | Boson Research & Non-Commercial License | no | - | optional | not verified: env 'higgs' not created |
 | mock_tts | tts | - | core | 0.0 | MIT | yes | - | test | core (always available) |
-| [moss_tts](https://github.com/OpenMOSS/MOSS-TTS) | tts | `christopherthompson81/MOSS-TTS-v1.5-GGUF` (`moss_tts_v15_q4_k_codec_f16.gguf`) | gguf | 9.5 | Apache-2.0 | yes | - | optional | not verified: env 'gguf' not created |
+| [moss_tts](https://github.com/OpenMOSS/MOSS-TTS) | tts | `christopherthompson81/MOSS-TTS-v1.5-GGUF` (`moss_tts_v15_q4_k_codec_f16.gguf`) | gguf | 14.5 | Apache-2.0 | yes | - | optional | not verified: env 'gguf' not created |
 | [qwen3_tts](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`, `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | main | 4.5 | Apache-2.0 | yes | - | default | not verified: env 'main' not created |
 | [qwen3_tts_06b](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | main | 2.5 | Apache-2.0 | yes | - | optional | not verified: env 'main' not created |
 | [qwen3_tts_voicedesign](https://github.com/QwenLM/Qwen3-TTS) | tts | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | main | 4.5 | Apache-2.0 | yes | - | default | not verified: env 'main' not created |
@@ -169,8 +169,13 @@ of a traceback.
 * **Fish S2 / Zonos2 / MOSS-TTS**: command lines are UNVERIFIED (not run on the build machine); they are
   templates in `options.args` (see `adapters/gguf/cli_impl.py`) so the flags can be fixed from `pipeline.yaml`.
   Fish S2 and MOSS-TTS carry the command lines from the audio.cpp docs (`--task clon --family fish_audio` /
-  `moss_tts_v15`); Zonos2 still uses the adapter's generic template (the real CLI is
-  `zonos2-cli <model.gguf> --tts <text> <out.wav> --dac dac.gguf [--spk <ref>]`).
+  `moss_tts_v15`); Zonos2 carries the one of zonos2.cpp's `src/main.cpp` (checked 2026-10-28:
+  `zonos2-cli <model.gguf> --tts "<text>" <out.wav> [--clone <ref.wav>] [--emotion happy=1,...]
+  [--emotion-valence/-arousal/-strength X] [--emotion-dir <dir>] [--seed N] [--gpu|--cpu]`; the CLI exits 1 on any
+  other flag, needs ffmpeg for `--clone`, which the adapter hands over as `ZONOS2_FFMPEG`, and refuses emotion flags
+  without a reference clip). The shipped binaries are `audiocpp_cli.exe` and `zonos2-cli.exe`; `tools.yaml` keys stay
+  `audiocpp` / `zonos2_cli`. A flag whose value renders empty is dropped together with the flag. MOSS-TTS q4_k peaks at
+  about 14 GiB of VRAM when cloning (audio.cpp docs), so it is listed with 14.5: not an 8 GB or 12 GB model.
 * **Where the GGUF weights come from (checked on huggingface.co, 2026-10-24).** The first versions of this table
   named two repos that do not exist (`fishaudio/s2-pro-gguf`, `OpenMOSS-Team/MOSS-TTS-v1.5-GGUF`); the app showed
   them as a 404. `uv run pytest tests/test_registry_repos_network.py` (with `VNDUB_NETWORK_TESTS=1`) now checks every

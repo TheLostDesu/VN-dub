@@ -509,8 +509,9 @@ function SummaryView({
 function reasonText(reason: string, t: (k: string, p?: Record<string, unknown>) => string, has: (k: string) => boolean): string {
   const [code, ...rest] = reason.split(":");
   const key = `game.reason.${code}`;
-  const value = rest.join(":");
-  return has(key) ? t(key, { value }) : t("game.reason.unknown", { code: reason });
+  // machine codes of the linker ("spk_outlier:0.31", "prefix_mismatch:se", "audio_missing:...") have a text of their own; the
+  // other reasons are free English sentences ("match 0.45 in review band ...", "asr unavailable: ..."): shown as they are
+  return /^[a-z_]+$/.test(code ?? "") && has(key) ? t(key, { value: rest.join(":") }) : reason;
 }
 
 function CharacterRow({ c }: { c: SummaryCharacter }) {

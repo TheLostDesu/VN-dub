@@ -26,7 +26,7 @@ Modes (``link.mode``):
   plus silence tolerance), and voice-file prefix / index order. A line is ``ok`` when all
   signals agree and ``review`` otherwise, with machine-readable reasons prefixed by the
   signal (``spk_outlier:0.31``, ``spk_cluster:<speaker>``, ``duration_implausible:2.4``,
-  ``order_gap``, ``prefix_mismatch:<prefix>``); ``unmatched`` only when the audio is missing
+  ``order_gap``, ``prefix_mismatch:<prefix>``, ``audio_empty``); ``unmatched`` only when the audio is missing
   (``audio_missing``). Nothing is moved (no auto-repair). The summary gains ``confidence``
   (share of judged lines with all signals ok), ``outliers`` and ``suggest_asr_check``.
 
@@ -50,6 +50,7 @@ from vndub.backends.base import BackendUnavailable
 from vndub.backends.score.speaker_sim import agglomerative, cosine
 from vndub.engines.base import VOICE_OVER, voice_name_parts
 from vndub.manifest.io import AudioIndexRecord, Character, LineRecord, LinkRecord, iter_jsonl, read_jsonl, write_jsonl
+from vndub.stages import genutil as gu
 from vndub.stages._opcache import OpCache
 from vndub.stages.common import StageContext, StageError
 from vndub.text import ja
@@ -97,7 +98,7 @@ def run_asr(
     reasons: list[str] = []
     for name in names:
         try:
-            spec, _ = ctx.models.resolve(name)
+            spec, _ = gu.resolve_backend(ctx, name)
         except BackendUnavailable as e:
             reasons.append(str(e))
             continue
@@ -148,7 +149,7 @@ def run_asr(
 def run_embed(ctx: StageContext, items: list[tuple[str, str]], on_items: ProgressFn | None = None) -> tuple[dict[str, np.ndarray], str, str]:
     name = ctx.cfg.link.speaker_embedder
     try:
-        spec, _ = ctx.models.resolve(name)
+        spec, _ = gu.resolve_backend(ctx, name)
     except BackendUnavailable as e:
         return {}, "", str(e)
     store = OpCache(ctx, f"link_spk_{spec.name}")
@@ -430,6 +431,17 @@ def duration_check(text: str, duration_s: float, rate_min: float, rate_max: floa
     return round(ratio, 2), morae, bool(too_fast or too_slow)
 
 
+def _file_seconds(path: str) -> float:
+    """Length of a wav file in seconds; 0.0 when it holds no samples, and also when it cannot be read (not told apart here:
+    an unreadable voice file is a review reason as well)."""
+    from vndub.audio import features
+
+    try:
+        return features.duration(path)
+    except Exception:
+        return 0.0
+
+
 def order_gaps(lines: list[LineRecord]) -> dict[str, str]:
     """line_id -> voice prefix for voiced lines whose voice index runs backwards inside a scene.
 
@@ -670,10 +682,18 @@ def run(ctx: StageContext) -> dict[str, Any]:
         for l in selected:
             reasons: list[str] = []
             text = texts_all[l.line_id]
-            ratio, morae, implausible = duration_check(text, float(audio[l.audio_id or ""].duration or 0.0), cfg.rate_min, cfg.rate_max, cfg.silence_tolerance_s, src_lang)
+            seconds = float(audio[l.audio_id or ""].duration or 0.0)
+            if seconds <= 0:  # the index may simply not carry the length: ask the file before calling the clip empty
+                seconds = _file_seconds(wav16(l.audio_id or ""))
+            ratio, morae, implausible = duration_check(text, seconds, cfg.rate_min, cfg.rate_max, cfg.silence_tolerance_s, src_lang)
             signals: dict[str, Any] = {"dur_ratio": ratio, "morae": morae}
             if not text.strip():
                 signals["no_text"] = True
+            if seconds <= 0:
+                # duration_check cannot judge an empty clip (it answers "plausible"): without this the mapping was accepted
+                # with no reason although the voice file holds no sound
+                reasons.append("audio_empty")
+                signals["audio_empty"] = True
             if implausible:
                 reasons.append(f"duration_implausible:{ratio}")
             parts = voice_name_parts(l.voice_file)
@@ -710,6 +730,11 @@ def run(ctx: StageContext) -> dict[str, Any]:
     existing = {r.line_id: r for r in read_jsonl(ctx.paths.link, LinkRecord)} if ctx.paths.link.exists() else {}
     existing.update(records)
     order = {l.line_id: i for i, l in enumerate(lines)}
+    gone_lines = [lid for lid in existing if lid not in order]
+    if gone_lines:  # a line that a re-parse removed must not stay in the review queue and the counts
+        ctx.log.info("link: dropping %d record(s) of lines that no longer exist", len(gone_lines))
+        for lid in gone_lines:
+            del existing[lid]
     merged = sorted(existing.values(), key=lambda r: order.get(r.line_id, 1 << 30))
     write_jsonl(ctx.paths.link, merged)
     queue: list[dict[str, Any]] = []

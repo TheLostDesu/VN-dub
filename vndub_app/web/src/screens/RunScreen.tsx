@@ -30,14 +30,10 @@ export default function RunScreen() {
   const { settings, update } = useSettings();
   const gpu = useGpu();
   const shutdown = !!settings.shutdown_when_done;
-  const tracker = useJobTracker();
-  const active = useActiveJob(RUN_KINDS);
+  // kinds + project: the run (running, or done with its warnings) is shown again after a visit to another screen
+  const tracker = useJobTracker({ kinds: RUN_KINDS, project: project?.slug ?? null });
+  const active = useActiveJob(RUN_KINDS, project?.slug ?? null);
   const autostarted = useRef(false);
-
-  useEffect(() => {
-    if (active && !tracker.job) tracker.attach(active);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active?.id]);
 
   const start = () => {
     void tracker.start(() => api.runFull(shutdown));
@@ -46,7 +42,8 @@ export default function RunScreen() {
   // "Мне нравится, запускай всё" on the preview screen arrives here with autostart.
   useEffect(() => {
     const st = loc.state as { autostart?: boolean } | null;
-    if (st?.autostart && !autostarted.current && !active && !tracker.job) {
+    // a finished run that the tracker picked up again must not stop a new one: only a run in progress does
+    if (st?.autostart && !autostarted.current && !active && !tracker.busy) {
       autostarted.current = true;
       start();
       window.history.replaceState({}, "");

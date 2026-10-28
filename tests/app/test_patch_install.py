@@ -82,8 +82,8 @@ COVERAGE = {
 }
 PUBLIC_COVERAGE = {
     "dub_lines": 10, "installed": 7, "provisional": 3, "provisional_review": 2, "provisional_regen": 1, "left_out": 3,
-    "left_out_reasons": {"no_winner": 2, "not_scored": 1}, "narration": 5, "include_review_lines": "provisional",
-}
+    "left_out_reasons": {"no_winner": 2, "not_scored": 1}, "narration": 5, "own_voice": 0, "include_review_lines": "provisional",
+}  # own_voice: 0 for a manifest written before the category existed
 
 
 def write_coverage(patch: Path, coverage: Any) -> None:

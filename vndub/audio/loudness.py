@@ -13,9 +13,13 @@ def lufs(y: np.ndarray, sr: int) -> float | None:
     else:
         data = y
     min_len = int(0.4 * sr) + 1  # BS.1770 gating block
-    if data.shape[0] < min_len:
-        pad = [(0, min_len - data.shape[0])] + ([(0, 0)] if data.ndim == 2 else [])
-        data = np.pad(data, pad)
+    if 0 < data.shape[0] < min_len:
+        # tile, do not zero-pad: padding adds silence that the gate averages in, so a 0.2 s tone read 3 dB and a
+        # 0.1 s one 6 dB too low (and master then boosted short interjections by that much)
+        reps = -(-min_len // data.shape[0])
+        data = np.tile(data, (reps, 1) if data.ndim == 2 else reps)[:min_len]
+    elif data.shape[0] == 0:
+        return None
     meter = pyln.Meter(sr)
     val = float(meter.integrated_loudness(data))
     return None if not np.isfinite(val) else val
@@ -62,7 +66,7 @@ def limit_true_peak(y: np.ndarray, sr: int, ceiling_dbtp: float = -1.0, release_
     env = np.abs(resample_poly(x, 4, 1))[::4][: x.size]
     if env.size < x.size:
         env = np.pad(env, (0, x.size - env.size), mode="edge")
-    win = max(1, int(release_s * sr))
+    win = min(max(1, int(release_s * sr)), x.size)  # np.convolve(..., "same") returns max(len) samples: a clip shorter than the window would break the shapes
     env = maximum_filter1d(np.maximum(env, np.abs(x)), size=win)
     gain = np.minimum(1.0, ceiling / np.maximum(env, 1e-9))
     # smooth the gain curve (moving average over the release window)
