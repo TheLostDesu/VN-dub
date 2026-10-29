@@ -91,3 +91,23 @@ def test_cli_models_list_and_tools_check() -> None:
     assert "qwen3_tts" in r.output and "chatterbox_ml" in r.output
     r = CliRunner().invoke(app, ["tools", "check", "--config", str(REPO / "configs" / "pipeline.yaml")])
     assert "ffmpeg" in r.output
+
+
+def test_resolve_finds_the_bundled_tables_from_any_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A relative ``configs/...`` default resolves under the checkout (the bundle folder in the packaged app) when the
+    project config's own folder has no such file: the packaged app runs from its exe folder, where the old cwd fallback
+    found nothing (``laughter table E:/.../VNDub/configs/laughter.yaml not found`` on every synth)."""
+    proj = tmp_path / "project"
+    proj.mkdir()
+    (proj / "pipeline.yaml").write_text(f"extends: {(REPO / 'configs' / 'pipeline.yaml').as_posix()}\n", encoding="utf-8")
+    cfg = load_config(proj / "pipeline.yaml")
+    assert cfg.base_dir() == proj.resolve()
+    monkeypatch.chdir(tmp_path)  # neither the project folder nor the cwd has configs/
+    assert cfg.resolve(cfg.synth.laughter.table) == (REPO / "configs" / "laughter.yaml").resolve()
+    assert cfg.resolve("configs/laughter.yaml").is_file()
+    # the project's own file wins, an absolute path is taken as is, an unknown relative one still lands in the cwd
+    (proj / "configs").mkdir()
+    (proj / "configs" / "laughter.yaml").write_text("ru: {hearty: 'ха-ха'}\n", encoding="utf-8")
+    assert cfg.resolve("configs/laughter.yaml") == proj.resolve() / "configs" / "laughter.yaml"
+    assert cfg.resolve(tmp_path / "x.yaml") == tmp_path / "x.yaml"
+    assert cfg.resolve("nowhere/else.yaml") == tmp_path / "nowhere" / "else.yaml"

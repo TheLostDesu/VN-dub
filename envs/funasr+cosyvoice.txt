@@ -23,3 +23,7 @@ gdown==5.1.0
 wget==3.2
 tiktoken==0.8.0
 matplotlib==3.7.5
+# uv creates venvs without setuptools and setuptools 82 (2026-02) removed pkg_resources, which lightning 2.2 (through the
+# Matcha-TTS submodule) imports at module level: CosyVoice 3 then fails with "No module named 'pkg_resources'".
+# 80.10.2 is the last line that ships it; adapters/common/pkg_resources_compat.py covers an env built without it.
+setuptools==80.10.2

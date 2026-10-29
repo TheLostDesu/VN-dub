@@ -17,7 +17,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from vndub.util import hash_obj
+from vndub.util import hash_obj, repo_root
 
 
 class _Section(BaseModel):
@@ -479,12 +479,16 @@ class PipelineConfig(_Section):
         return Path.cwd()
 
     def resolve(self, rel: str | Path) -> Path:
+        """``rel`` as an absolute path: as given when absolute; else the first that exists under :meth:`base_dir` or
+        under the vndub checkout (the bundle folder in the packaged app, where the ``configs/`` defaults such as
+        ``configs/laughter.yaml`` live); else under the cwd."""
         p = Path(rel)
         if p.is_absolute():
             return p
-        cand = self.base_dir() / p
-        if cand.exists():
-            return cand
+        for root in (self.base_dir(), repo_root()):
+            cand = root / p
+            if cand.exists():
+                return cand
         return Path.cwd() / p
 
 

@@ -492,8 +492,9 @@ def write_project_config(h: ProjectHandle, settings: Settings | None = None) -> 
             "interjections": str(root / "configs" / "interjections.yaml"),
         },
         "text_emotion": {"cues": str(root / "configs" / "delivery_cues.yaml")},
-        # mode B: the app dubs speaker lines without original audio too (route P)
-        "synth": {"voice_unvoiced": True},
+        # mode B: the app dubs speaker lines without original audio too (route P); the laughter table like the other bundled
+        # tables (the packaged app runs from its exe folder, where a relative configs/ path finds nothing)
+        "synth": {"voice_unvoiced": True, "laughter": {"table": str(root / "configs" / "laughter.yaml")}},
     }
     tr = st.get("translation", {})
     if tr.get("source") == "import" and tr.get("import_path"):

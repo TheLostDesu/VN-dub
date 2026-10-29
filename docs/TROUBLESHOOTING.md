@@ -12,6 +12,12 @@ marked complete. Since 1.0.0 the pull keeps a copy in `models/ruaccent/koziev` a
 package copy from it; an installation pulled by an older version has no such copy yet: run
 `uv run vndub models pull ruaccent` once more (the app: Models -> ruaccent -> download again).
 
+**`cosyvoice3: ErrorDuringImport: problem in cosyvoice.flow.flow_matching - ModuleNotFoundError: No module named 'pkg_resources'`** —
+the `funasr` environment has no setuptools (uv creates environments without it) or one newer than 81 (setuptools 82 removed
+`pkg_resources`), and lightning 2.2, which CosyVoice's Matcha-TTS imports, needs the module at import time. Since 1.0.1 the
+adapter registers a stand-in when the module is missing and the `+cosyvoice` extra pins setuptools 80.10.2; on an older
+version install it by hand: `uv pip install --python <envs>/funasr/Scripts/python.exe setuptools==80.10.2`.
+
 **`weights missing: run vndub models pull <name>`** — download once:
 `uv run vndub models pull <name>` (or `--profile default`). At run time adapters are
 offline (`HF_HUB_OFFLINE=1`), so nothing is fetched implicitly.

@@ -110,7 +110,7 @@ Environments created with `scripts/make_envs.ps1 -Cpu`:
 |---|---|---|---|
 | asr | 2.8.0+cpu | a few minutes (not cleanly timed: the first runs exposed script bugs that were fixed) | `ctranslate2` must be >= 4.7 (4.6.0 imports the removed `pkg_resources`) |
 | score | 2.8.0+cpu | 11.1 min | incl. the `+utmosv2` extra (UTMOSv2 from git, timm, audiobox_aesthetics) |
-| funasr | 2.3.1+cpu | 2.3 min base + 1.1 min `+cosyvoice` extra | CosyVoice repo cloned at the pinned commit; `openai-whisper` needs `envs/build.constraints.txt` (setuptools<70) |
+| funasr | 2.3.1+cpu | 2.3 min base + 1.1 min `+cosyvoice` extra | CosyVoice repo cloned at the pinned commit; `openai-whisper` needs `envs/build.constraints.txt` (setuptools<70); setuptools 80.10.2 in the env itself for `pkg_resources` (lightning 2.2 imports it) |
 
 Selftests that passed (2 s synthetic clip; CPU). First runs used librosa's `soxr_hq` resampler,
 which took ~1.2 s per clip on this machine; after switching to scipy polyphase resampling the

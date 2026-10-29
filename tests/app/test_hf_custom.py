@@ -836,3 +836,21 @@ def test_downloads_fetch_sends_extra_headers(monkeypatch: pytest.MonkeyPatch, tm
     with RangeServer({"f.bin": b"z" * 100}) as srv:
         downloads.fetch(srv.url("f.bin"), tmp_path / "f.bin", headers={"Authorization": "Bearer t"})
     assert seen and seen[0]["authorization"] == "Bearer t" and seen[0]["accept-encoding"] == "identity"
+
+
+def test_bundled_tables_are_written_as_absolute_paths(env: Path, tmp_path: Path) -> None:
+    """The packaged app runs from its exe folder, so every bundled table the profile names relatively is written absolute.
+    The laughter table was missed in 0.7.0 (`laughter table <exe folder>/configs/laughter.yaml not found` on every synth:
+    laughs went to the voices as written)."""
+    from vndub.config import load_config
+
+    h = make_project(tmp_path)
+    appdirs.write_project_config(h)
+    raw = yaml.safe_load(h.config_file.read_text(encoding="utf-8"))
+    root = appdirs.resource_root()
+    assert raw["synth"]["laughter"]["table"] == str(root / "configs" / "laughter.yaml")
+    assert raw["translate"]["interjections"] == str(root / "configs" / "interjections.yaml")
+    assert raw["text_emotion"]["cues"] == str(root / "configs" / "delivery_cues.yaml")
+    cfg = load_config(h.config_file)
+    assert Path(cfg.synth.laughter.table).is_file() and cfg.resolve(cfg.synth.laughter.table).is_file()
+    assert cfg.synth.voice_unvoiced is True  # the other synth key of the generated config is kept

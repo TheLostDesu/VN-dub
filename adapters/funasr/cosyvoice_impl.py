@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+from adapters.common.pkg_resources_compat import ensure_pkg_resources
 from adapters.common.rpc import TTSImpl, UnavailableError, env_src_dir, weight_dir
 from adapters.common.yamlcompat import ruamel_old_api_compat
 
@@ -43,6 +44,7 @@ class CosyVoice3TTS(TTSImpl):
                 sys.path.insert(0, str(p))
         d = weight_dir(self.params, 0)
         ruamel_old_api_compat()  # the model yaml goes through HyperPyYAML's old ruamel loader
+        ensure_pkg_resources()  # lightning 2.2 (via Matcha-TTS) imports pkg_resources, which uv envs / setuptools >= 82 lack
         try:
             from cosyvoice.cli.cosyvoice import AutoModel
 
