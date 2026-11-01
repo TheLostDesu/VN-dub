@@ -5,8 +5,9 @@ altogether; an environment built either way has no ``pkg_resources``. Some model
 module level: ``lightning`` 2.2 runs ``__import__("pkg_resources").declare_namespace(__name__)`` in
 ``lightning.fabric`` and ``lightning.pytorch``, and Matcha-TTS (the CosyVoice submodule) imports lightning from
 ``matcha.utils``, so ``cosyvoice.flow.flow_matching`` cannot be imported and CosyVoice 3 never loads
-(``ModuleNotFoundError: No module named 'pkg_resources'`` while HyperPyYAML builds the model). ``pyworld``
-(``get_distribution("pyworld").version``) and jieba (``resource_stream``) are other users.
+(``ModuleNotFoundError: No module named 'pkg_resources'`` while HyperPyYAML builds the model). ``resemble-perth`` 1.0.1
+(``resource_filename`` in ``perth.perth_net``) hides the same error and leaves Chatterbox a ``None`` watermarker.
+``pyworld`` (``get_distribution("pyworld").version``) and jieba (``resource_stream``) are other users.
 
 :func:`ensure_pkg_resources` registers this module as ``pkg_resources`` when the real one cannot be imported. It
 covers the calls those libraries make, on top of ``importlib.metadata`` / ``packaging``: ``declare_namespace``
@@ -15,7 +16,7 @@ covers the calls those libraries make, on top of ``importlib.metadata`` / ``pack
 module, as pkg_resources' ``DefaultProvider`` resolves them). Any other attribute raises ``AttributeError``
 naming it, with the way out (setuptools 80.x in the env).
 
-The env pins (``envs/funasr+cosyvoice.txt``) now ask for setuptools 80.10.2, the last line that ships
+The env pins (``envs/funasr+cosyvoice.txt``, ``envs/chatterbox.txt``) now ask for setuptools 80.10.2, the last line that ships
 ``pkg_resources``, so a freshly built environment uses the real module and this one stays unused.
 """
 
@@ -161,5 +162,5 @@ def __getattr__(attr: str) -> Any:
         raise AttributeError(attr)
     raise AttributeError(
         f"pkg_resources.{attr} is not provided by this stand-in (the environment's setuptools has no pkg_resources): "
-        "install setuptools 80.x into the environment (envs/funasr+cosyvoice.txt pins it) to get the real module"
+        "install setuptools 80.x into the environment (envs/funasr+cosyvoice.txt and envs/chatterbox.txt pin it) to get the real module"
     )

@@ -2,6 +2,8 @@
 
 Emotion via ``exaggeration`` (mapped from arousal into [0.3, 1.2]);
 ``cfg_weight=0`` for cross-lingual references (documented accent mitigation).
+Russian comes with ruaccent's stress as U+0301 marks: chatterbox-tts wants them from ``russian_text_stresser``, which it does
+not depend on, and goes without when that is missing (``synth.backends.chatterbox_ml.stress_format: plain`` asks for that).
 Outputs carry the Perth watermark.
 """
 
@@ -33,7 +35,7 @@ SPECS = [
             "tags": "none",
             "knobs": "chatterbox",
             "duration": False,
-            "stress_format": "plain",
+            "stress_format": "acute",
             "needs_ref_text": False,
             "cross_lingual": True,
             "sr": 24000,

@@ -7,9 +7,10 @@ Pipeline for one translated line (``prepare_tts_text``)::
             '+' before the stressed vowel, yo-fication) -> output format
 
 Output formats: ``plus`` keeps ``+`` marks (F5-TTS_RUSSIAN); ``plain`` drops
-marks but keeps the ё restored by ruaccent (every other backend: LLM-based TTS
-handle bare text better than combining accents). ``text_plain`` (the CER
-reference) is the normalized text without stress marks.
+marks but keeps the ё restored by ruaccent (every other backend but Chatterbox:
+LLM-based TTS handle bare text better than combining accents). ``acute``, for
+Chatterbox, is made from the ``plus`` text at synth (:func:`to_acute_format`).
+``text_plain`` (the CER reference) is the normalized text without stress marks.
 """
 
 from __future__ import annotations
@@ -190,6 +191,23 @@ def to_plus_format(text: str) -> str:
     t = acute_to_plus(text or "")
     # drop '+' that is not followed by a vowel (stray marks)
     return re.sub(r"\+(?![" + VOWELS + _LAT_VOWELS + r"])", "", t)
+
+
+_RU_WORD = re.compile(r"(?:\+?[а-яёА-ЯЁ])+")
+
+
+def to_acute_format(text: str) -> str:
+    """'в+ыход' -> 'вы́ход', written as ``russian_text_stresser`` writes it, the stresser chatterbox-tts calls for Russian.
+
+    That one takes its marks from Wiktionary's word forms, which have none on a word with one vowel or on ё: there the stress
+    has nothing to choose. ruaccent marks both ('чт+о', sometimes), so those marks are dropped here.
+    """
+
+    def word(m: re.Match[str]) -> str:
+        w = m.group(0).replace("+ё", "ё").replace("+Ё", "Ё")
+        return w if sum(ch in VOWELS for ch in w) > 1 else w.replace("+", "")
+
+    return plus_to_acute(_RU_WORD.sub(word, text or ""))
 
 
 def deyo(text: str) -> str:

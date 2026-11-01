@@ -103,7 +103,7 @@ def test_tts_specs_declare_caps() -> None:
     for s in SPECS.values():
         if s.role == "tts":
             assert "sr" in s.caps, s.name
-            assert s.caps.get("stress_format", "plain") in ("plain", "plus"), s.name
+            assert s.caps.get("stress_format", "plain") in ("plain", "plus", "acute"), s.name
 
 
 STDLIB = set(getattr(sys, "stdlib_module_names", ())) | {"__future__"}

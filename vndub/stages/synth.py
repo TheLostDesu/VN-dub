@@ -44,6 +44,10 @@ reach the style (``StyleSpec.laughter``: specific instruct phrase, a laughter-on
 the sidecar records ``laughter: {kind, n, mode, only, stage}``. ``text_used`` is the text that was sent; ``text_plain`` (the CER
 reference) is never respelled. A ``set_text`` override is sent as the user wrote it. The setting is not part of the cache hash
 (the spelled text is part of every candidate key), so adding it re-generates only lines that contain a laugh.
+
+Russian stress: a backend whose ``stress_format`` is ``plus`` or ``acute`` (caps; ``synth.backends.<name>.stress_format`` overrides)
+gets the ``text_tts_plus`` variant, ``acute`` turned into U+0301 marks after the laughs are written. A project translated while no
+such backend was enabled has no variant: :func:`_backfill_stress` makes it for this run from translate's stress cache.
 """
 
 from __future__ import annotations
@@ -64,6 +68,7 @@ from vndub.manifest.io import LineRecord, load_overrides, write_json
 from vndub.stages import genutil as gu
 from vndub.stages.common import StageError
 from vndub.text import laughter as lg
+from vndub.text import ru
 from vndub.text.style_prompt import (
     CALM_BELOW,
     StyleSpec,
@@ -83,6 +88,7 @@ from vndub.util import hash_obj
 NAME = "synth"
 VERSION = "1"
 CONFIG_SECTIONS = ("synth", "project")
+STRESSED = ("plus", "acute")  # the stress formats that speak the text_tts_plus variant
 
 
 @dataclass
@@ -202,6 +208,8 @@ def run(ctx: Any) -> dict[str, Any]:
         requested[spec.name] = name
     if not backends:
         raise StageError(f"no usable TTS backend: {unavailable or 'none enabled in synth.backends'}")
+    if tgt == "ru" and any(_stress_format(s, o) in STRESSED for _, s, o in backends):
+        _backfill_stress(ctx, trs, lines)
 
     # ---- per-speaker voicebank info -------------------------------------------
     spk_info: dict[str, dict[str, Any]] = {}
@@ -328,11 +336,13 @@ def run(ctx: Any) -> dict[str, Any]:
                         continue
             for bname, bspec, bopts in route_backends:
                 caps = bspec.caps or {}
-                plus = caps.get("stress_format") == "plus"
-                text, plain = texts(plus)
+                stress = _stress_format(bspec, bopts)
+                text, plain = texts(stress in STRESSED)
                 spec_b, laugh = spec, None
                 if laughter_table is not None and not user_text:
-                    text, spec_b, laugh = _laughter_for(text, tgt, bname, caps, laughter_table, spec, tuning)
+                    text, spec_b, laugh = _laughter_for(lg.unstress_laughs(text), tgt, bname, caps, laughter_table, spec, tuning)
+                if stress == "acute" and tgt == "ru" and not user_text:
+                    text = ru.to_acute_format(text)
                 rendered = render(spec_b, caps, bopts, cross_lingual=(route == "A"), laughter_inline=bool(laugh) and laugh["mode"].startswith(("inline", "tag")))
                 if laugh:
                     rendered["laughter"] = laugh["mode"]
@@ -703,6 +713,32 @@ def _purge_stale(ctx: Any, line_id: str, tkey: dict[str, Any] | None, planned: s
 def _usable(tr: Any) -> bool:
     """A translation synth may speak: present, not failed/missing, non-empty text_tts."""
     return tr is not None and not ({"translate_failed", "translate_missing"} & set(tr.flags)) and bool((tr.text_tts or "").strip())
+
+
+def _stress_format(spec: BackendSpec, options: dict[str, Any]) -> str:
+    return str(options.get("stress_format") or (spec.caps or {}).get("stress_format") or "plain")
+
+
+def _backfill_stress(ctx: Any, trs: dict[str, Any], lines: list[LineRecord]) -> None:
+    """The ``+`` variants translate writes when a backend needs them, for the lines translated while none did.
+
+    They stay in memory: the translation file is translate's output. translate stressed these texts for its plain variant too, so
+    its cache normally has them all and no model loads. Without a stresser the lines keep their plain text, with a warning.
+    """
+    from vndub.stages.translate import make_stresser
+
+    ids = dict.fromkeys(i for l in lines for i in (l.line_id, *((l.model_extra or {}).get("sustain_lines") or [])))
+    recs = [trs[i] for i in ids if _usable(trs.get(i)) and "text_tts_plus" not in (trs[i].model_extra or {})]
+    if not recs:
+        return
+    stresser, _, reason = make_stresser(ctx, [ru.normalize_for_tts(x) for r in recs for x in (r.text_tgt, r.text_tgt_short) if x])
+    if stresser is None:
+        ctx.log.warning("%d line(s) stay without stress marks: %s", len(recs), reason)
+        return
+    yo = ctx.cfg.translate.stress.yo
+    for r in recs:
+        r.text_tts_plus = ru.prepare_tts_text(r.text_tgt, stresser, "plus", yo)[0]
+        r.text_tts_short_plus = ru.prepare_tts_text(r.text_tgt_short or r.text_tgt, stresser, "plus", yo)[0]
 
 
 def join_texts(recs: list[Any], short: bool, plus: bool) -> tuple[str, str]:

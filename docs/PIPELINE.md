@@ -247,7 +247,9 @@ source import|llm:<model>|mock, glossary_hits, flags).
   "Ха-ха!", `(laughs)`) gets `interjection` as well, so it takes the interjection path of synth (`n_candidates_short`,
   the original audio as a candidate, `interjection` text variant) and score (laughter-only lines have no CER gate, see
   score). The summary counts them (`laughter`, `interjections`).
-- Post-processing: ruaccent stress (+ yo), numbers -> words, abbreviations expanded.
+- Post-processing: ruaccent stress (+ yo), numbers -> words, abbreviations expanded. `text_tts` has no marks;
+  `text_tts_plus` / `text_tts_short_plus` keep ruaccent's `+` and are written when an enabled backend asks for stress
+  (`stress_format`: `plus` for F5-TTS_RUSSIAN, `acute` for Chatterbox).
 - `--seed-glossary` writes/extends `configs/glossary.yaml` from `characters.yaml`.
 - **Unvoiced speaker lines** (mode B): `translate.include_unvoiced` (default `auto` = on only when
   `synth.voice_unvoiced` is on, which the desktop app sets, so the CLI keeps translating voiced lines only; `on` =
@@ -431,6 +433,12 @@ elapsed_s, peak_vram_gb, pre_vc_wav, round).
   block per backend name (`mode`, `token` / `tokens`, `only`, `spelling`, `stage`, per-language overrides). The setting is left out
   of the synth cache hash (the spelled text and the laugh phrase are part of every candidate key), so enabling it, or editing the
   table, regenerates only the candidates of lines with a laugh.
+- Russian stress: a backend with `stress_format: plus` is sent `text_tts_plus` as it is; `acute` (Chatterbox) turns it into U+0301
+  marks after the laughs are written, without marks on a word with one vowel or on ё. Laughs lose their marks first, or the
+  laugh patterns would not see them; `text_used` shows what was sent, `text_plain` (the CER reference) never has marks, a `set_text`
+  override goes as written. A project translated while no such backend was enabled has no variant: synth makes it for the run from
+  translate's stress cache (the translation file is not touched; without a stresser the lines stay plain, with a warning).
+  `synth.backends.<name>.stress_format: plain` turns the marks off for one backend.
 - Route A: the character's own (Japanese) emotion-matched reference, `x_vector_only_mode`
   on Qwen3-TTS, `cfg_weight=0` on Chatterbox, explicit target language.
 - Route B: the native performer voice + emotion instruction, then VC into the character

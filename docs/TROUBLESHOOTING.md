@@ -18,6 +18,17 @@ the `funasr` environment has no setuptools (uv creates environments without it) 
 adapter registers a stand-in when the module is missing and the `+cosyvoice` extra pins setuptools 80.10.2; on an older
 version install it by hand: `uv pip install --python <envs>/funasr/Scripts/python.exe setuptools==80.10.2`.
 
+**`chatterbox_ml: TypeError: 'NoneType' object is not callable`** (in the adapter log: `self.watermarker = perth.PerthImplicitWatermarker()`) —
+the same missing `pkg_resources`, in the `chatterbox` environment: resemble-perth 1.0.1 imports it for its watermarker and hides
+the failure (`PerthImplicitWatermarker = None`), so the error appears only after all the weights have loaded. The line
+`from_local() got an unexpected keyword argument 't3_model'` above it in logs before 1.0.2 was not the cause. Since 1.0.2 the
+adapter registers the stand-in and `envs/chatterbox.txt` pins setuptools 80.10.2; on an older version install it by hand:
+`uv pip install --python <envs>/chatterbox/Scripts/python.exe setuptools==80.10.2`.
+
+**Chatterbox's first load downloads `spacy_ontonotes.zip`** (34 MB, from GitHub, to `~/.pkuseg`) —
+`chatterbox-tts` builds its Chinese word segmenter on every load, whatever the language, and that model is not part of
+`vndub models pull`. It happens once per user account. Without network at that moment the load fails, even for Russian.
+
 **`weights missing: run vndub models pull <name>`** — download once:
 `uv run vndub models pull <name>` (or `--profile default`). At run time adapters are
 offline (`HF_HUB_OFFLINE=1`), so nothing is fetched implicitly.

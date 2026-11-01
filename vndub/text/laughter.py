@@ -254,6 +254,24 @@ def find_laughs(text: str, lang: str = "auto") -> list[Laugh]:
     return _dedupe(found)
 
 
+_PLUS_MARK = re.compile(r"\+(?=[аеёиоуыэюяАЕЁИОУЫЭЮЯ])")
+
+
+def unstress_laughs(text: str) -> str:
+    """``text`` without the ``+`` stress marks inside its laughs; every other mark stays.
+
+    A stresser marks a laugh like any word ("Х+а-х+а-х+а!"), and the patterns of :func:`find_laughs` no longer see it then.
+    """
+    t = text or ""
+    marks = [m.start() for m in _PLUS_MARK.finditer(t)]
+    if not marks:
+        return t
+    laughs = find_laughs(_PLUS_MARK.sub("", t))
+    # the i marks before position p are not in the text the laughs were found in
+    drop = {p for i, p in enumerate(marks) if any(l.start <= p - i < l.end for l in laughs)}
+    return "".join(ch for i, ch in enumerate(t) if i not in drop)
+
+
 def has_laughter(text: str, lang: str = "auto") -> bool:
     return bool(find_laughs(text, lang))
 

@@ -190,6 +190,7 @@ synth:
       enabled: true
       exaggeration_range: [0.3, 1.2]
       cfg_weight_cross_lingual: 0.0
+      # stress_format: plain     # Russian without ruaccent's stress marks (default: acute)
     voxcpm2:
       enabled: false             # ~8 GB official: enable after `vndub models selftest voxcpm2`
     fish_s2:

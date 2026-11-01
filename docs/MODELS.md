@@ -78,7 +78,7 @@ backend whose "Commercial" column is "no" (falling back or marking lines for rev
 | [hy_mt15_7b](https://huggingface.co/tencent/HY-MT1.5-7B-GGUF) | llm | `tencent/HY-MT1.5-7B-GGUF` | core | 6.0 | Tencent HY-MT license (see model card) | yes | - | default | not verified: GGUF not pulled (`vndub models pull hy_mt15_7b`); also needs `tools.llama_server` |
 | mock_translator | llm | - | core | 0.0 | MIT | yes | - | test | core (always available) |
 | [qwen35_9b](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | llm | `unsloth/Qwen3.5-9B-GGUF` | core | 6.3 | Apache-2.0 | yes | hy_mt15_7b | default | not verified: GGUF not pulled (`vndub models pull qwen35_9b`); also needs `tools.llama_server` |
-| [chatterbox_ml](https://github.com/resemble-ai/chatterbox) | tts | `ResembleAI/chatterbox` | chatterbox | 4.0 | MIT (Perth watermark embedded) | yes | - | default | not verified: env 'chatterbox' not created |
+| [chatterbox_ml](https://github.com/resemble-ai/chatterbox) | tts | `ResembleAI/chatterbox` | chatterbox | 4.0 | MIT (Perth watermark embedded) | yes | - | default | **selftest OK on CPU** (load 32.15 s, 5.84 s of Russian speech 39.61 s) |
 | [cosyvoice3](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512) | tts | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | funasr | 3.8 | Apache-2.0 | yes | - | default | not verified: weights missing: run `vndub models pull cosyvoice3` |
 | [f5_ru](https://huggingface.co/Misha24-10/F5-TTS_RUSSIAN) | tts | `Misha24-10/F5-TTS_RUSSIAN` + the Vocos vocoder `charactr/vocos-mel-24khz` (f5-tts downloads it at load otherwise, which fails offline) | f5 | 3.0 | CC-BY-NC-4.0 (Russian checkpoint) | no | - | optional | not verified: env 'f5' not created |
 | [fish_s2](https://huggingface.co/fishaudio/s2-pro) | tts | `audio-cpp/audio.cpp-gguf` (`Fish-Audio-S2-Pro-GGUF/fish-audio-s2-pro-q8_0.gguf`) | gguf | 7.5 | Fish Audio Research License (non-commercial) | no | - | optional | not verified: env 'gguf' not created |
@@ -111,6 +111,7 @@ Environments created with `scripts/make_envs.ps1 -Cpu`:
 | asr | 2.8.0+cpu | a few minutes (not cleanly timed: the first runs exposed script bugs that were fixed) | `ctranslate2` must be >= 4.7 (4.6.0 imports the removed `pkg_resources`) |
 | score | 2.8.0+cpu | 11.1 min | incl. the `+utmosv2` extra (UTMOSv2 from git, timm, audiobox_aesthetics) |
 | funasr | 2.3.1+cpu | 2.3 min base + 1.1 min `+cosyvoice` extra | CosyVoice repo cloned at the pinned commit; `openai-whisper` needs `envs/build.constraints.txt` (setuptools<70); setuptools 80.10.2 in the env itself for `pkg_resources` (lightning 2.2 imports it) |
+| chatterbox | 2.6.0+cpu | 1.6 min | setuptools 80.10.2 in the env itself for `pkg_resources` (resemble-perth 1.0.1 imports it and hides the failure) |
 
 Selftests that passed (2 s synthetic clip; CPU). First runs used librosa's `soxr_hq` resampler,
 which took ~1.2 s per clip on this machine; after switching to scipy polyphase resampling the
@@ -141,7 +142,7 @@ Real-speech check through the JSON-RPC path (Windows SAPI voices as the source, 
 | UTMOS22 on SAPI Russian | 2.66 (robotic TTS, as expected) |
 
 Not verified here (no NVIDIA GPU, and multi-GB downloads were out of scope): every GPU backend in
-the hf, chatterbox, rvc, seedvc, f5, gguf and higgs envs, CosyVoice3 inference, the LLMs.
+the hf, rvc, seedvc, f5, gguf and higgs envs, CosyVoice3 inference, the LLMs; Chatterbox on a GPU.
 Their adapters are implemented against the upstream APIs pinned in `envs/*.txt`; `selftest`
 reports a clear "env not created" / "weights missing: run `vndub models pull <name>`" instead
 of a traceback.

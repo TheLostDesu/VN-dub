@@ -4,3 +4,7 @@
 # @cuda cu124
 chatterbox-tts==0.1.7
 soundfile==0.13.1
+# uv creates venvs without setuptools and setuptools 82 (2026-02) removed pkg_resources, which resemble-perth 1.0.1 imports
+# for its watermarker: perth hides the ImportError and Chatterbox fails with "'NoneType' object is not callable".
+# 80.10.2 is the last line that ships it; adapters/common/pkg_resources_compat.py covers an env built without it.
+setuptools==80.10.2

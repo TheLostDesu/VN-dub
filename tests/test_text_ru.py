@@ -41,6 +41,24 @@ def test_stress_conversions():
     assert ru.deyo("ёлка Ёж") == "елка Еж"
 
 
+@pytest.mark.parametrize(
+    ("plus", "acute"),
+    [
+        ("На двер+и вис+ит зам+ок, а вдал+и ст+арый з+амок.", "На двери́ виси́т замо́к, а вдали́ ста́рый за́мок."),
+        ("+Это о́чень", "Э́то о́чень"),  # at the start of a word; a mark that already is an acute stays
+        ("Чт+о т+ы д+елаешь зд+есь?", "Что ты де́лаешь здесь?"),  # a word with one vowel has nothing to choose
+        ("К+ое-что, н+е было", "Ко́е-что, не было"),  # each part of a hyphenated word counts on its own
+        ("т+ёмный вс+ё, Ё+ж, +Ёлка", "тёмный всё, Ёж, Ёлка"),  # ё is always stressed
+        ("2+2 и C+ и а+б", "2+2 и C+ и аб"),  # no stress mark: a plus that is not in a word; a stray one in a word goes
+        ("без меток", "без меток"),
+        ("", ""),
+    ],
+)
+def test_to_acute_format(plus: str, acute: str) -> None:
+    assert ru.to_acute_format(plus) == acute
+    assert ru.strip_stress(ru.to_acute_format(plus)) == ru.strip_stress(acute)
+
+
 def test_count_syllables_and_words():
     assert ru.count_syllables("Привет, как дела?") == 5
     assert ru.count_syllables("в+ыход") == 2

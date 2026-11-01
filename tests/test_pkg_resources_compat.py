@@ -20,6 +20,7 @@ from adapters.common import pkg_resources_compat as compat
 
 REPO = Path(__file__).resolve().parent.parent
 FUNASR_PY = REPO / ".venvs" / "funasr" / ("Scripts/python.exe" if sys.platform.startswith("win") else "bin/python")
+CHATTERBOX_PY = REPO / ".venvs" / "chatterbox" / ("Scripts/python.exe" if sys.platform.startswith("win") else "bin/python")
 
 
 def test_registers_the_stand_in_only_when_the_real_module_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -91,3 +92,17 @@ def test_lightning_and_matcha_import_with_the_stand_in() -> None:
     assert "lightning 2." in r.stdout
     if matcha.is_dir():
         assert "matcha ok" in r.stdout
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not CHATTERBOX_PY.exists(), reason="no chatterbox env on this machine")
+def test_perth_gets_its_watermarker_over_the_stand_in() -> None:
+    """resemble-perth imports pkg_resources inside a try that leaves ``PerthImplicitWatermarker = None``; its bundled weights load."""
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1])\n"
+        "from adapters.common import pkg_resources_compat as c; sys.modules['pkg_resources'] = c\n"
+        "import perth; wm = perth.PerthImplicitWatermarker(); print('watermarker', type(wm).__name__)\n"
+    )
+    r = subprocess.run([str(CHATTERBOX_PY), "-I", "-c", code, str(REPO)], capture_output=True, text=True, timeout=280)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert "watermarker PerthImplicitWatermarker" in r.stdout

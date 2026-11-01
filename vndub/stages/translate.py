@@ -734,7 +734,7 @@ def needs_plus(ctx: StageContext) -> bool:
         return True
     for name in ctx.cfg.enabled_backends():
         try:
-            if registry.get(name).caps.get("stress_format") == "plus":
+            if registry.get(name).caps.get("stress_format") in ("plus", "acute"):  # acute is made from the plus text at synth
                 return True
         except KeyError:
             continue
