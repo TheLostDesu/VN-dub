@@ -264,6 +264,12 @@ master:
 pack:
   kirikiri: {mode: patch_xp3, patch_name: "", subdir: ""}   # patch_xp3 | unencrypted_dir
   renpy: {mode: loose}           # + unvoiced_dir: voice_dub (lines without original voice, config.auto_voice) | auto_voice: "voice/{id}.ogg" (override of the game's own pattern)
+                                 # + voice_mix: {enabled: auto, duck: 0.3, key: K_F8}   (generated game/vndub_voice_mix.rpy: the dub on Ren'Py's own voice
+                                 #   mixer, ducking, an in-game panel; a bare `voice_mix: true|false` is `enabled`)
+                                 #   enabled: auto = on when the patch holds lines that had no original voice (the game was never mixed for voice;
+                                 #            a voiced game keeps its own mix) | true = always | false = no script (a stale one is removed by a full pack)
+                                 #   duck: music / sfx volume while a line plays, 0.3 = 30 % (about -10 dB), 1.0 = no ducking
+                                 #   key: Ren'Py key name that opens the panel (K_F8); the panel is also a button in the top right corner of the preferences screen
   nscripter: {mode: loose}
   unity: {mode: unitypy_script}
   other: {}

@@ -20,10 +20,20 @@ file name in the game to take over, so they are placed apart from the engine's n
   such a file for a say statement that has no ``voice`` statement of its own. Narration is not dubbed.
 * every other engine: ``out/<engine>/unvoiced/<file>`` and a note in INSTALL.md. The patch cannot put them
   into the game (there is no voice slot to replace), and nothing here claims that it does.
+
+The voice track (Ren'Py only): the dub plays on the ``voice`` channel, which has a mixer of its own only when
+``config.has_voice`` is set early enough, and the music is not lowered under it unless the player turned ducking on. So a
+generated ``game/vndub_voice_mix.rpy`` (:func:`renpy_voice_mix_rpy`) switches the channel on, lowers the music and sound
+effects while a line plays and adds a panel (voice volume, ducking strength; a hotkey and a button on the preferences
+screen). ``pack.renpy.voice_mix`` configures it (``enabled: auto | true | false``, auto = on when the patch holds lines that
+had no original voice; ``duck``; ``key``); ``manifest_patch.json`` carries ``voice_mix`` (``{rpy, key, keysym, duck,
+enabled}`` or ``null``), INSTALL.md the section "The voice track in the game", the summary ``voice_mix: true | false``.
+A full pack removes the script it generated earlier when the feature is now off.
 """
 
 from __future__ import annotations
 
+import math
 import re
 import shutil
 from pathlib import Path, PurePosixPath
@@ -207,6 +217,218 @@ def renpy_auto_voice_rpy(directory: str, ext: str) -> str:
     )
 
 
+# ----------------------------------------------------------------------------
+# Ren'Py: the voice track in the game (mixer, ducking, in-game panel)
+# ----------------------------------------------------------------------------
+
+RENPY_MIX_RPY = "vndub_voice_mix.rpy"
+# pack.renpy.voice_mix: enabled = auto (on when the patch holds lines that had no original voice: the game was never
+# mixed for voice) | true | false; duck = volume of the music and sound effects while a line plays (plain amplitude,
+# 0.3 = about -10 dB, 1.0 = no ducking); key = the Ren'Py key that opens the panel in the game
+VOICE_MIX_DEFAULTS: dict[str, Any] = {"enabled": "auto", "duck": 0.3, "key": "K_F8"}
+_KEYSYM = re.compile(r"[A-Za-z0-9_]+")  # Ren'Py keysyms: K_F8, shift_K_F8, mousedown_4 ...
+
+_MIX_STRINGS: dict[str, dict[str, str]] = {
+    "ru": {
+        "title": "Озвучка",
+        "hint": "Голос идёт отдельной дорожкой: громкость музыки на него не влияет.",
+        "voice_volume": "Громкость голоса",
+        "duck": "Музыка и звуки во время реплик: [vndub_pct]%",
+        "duck_on": "Приглушать музыку во время реплик",
+        "mute": "Выключить озвучку",
+        "test": "Проверить голос",
+        "close": "Закрыть",
+        "button": "Озвучка",
+        "key_hint": "Клавиша {key} открывает эту панель в любой момент игры.",
+    },
+    "en": {
+        "title": "Dub",
+        "hint": "The voice plays on its own track: the music volume does not affect it.",
+        "voice_volume": "Voice volume",
+        "duck": "Music and sounds while a line plays: [vndub_pct]%",
+        "duck_on": "Lower the music while a line plays",
+        "mute": "Mute the dub",
+        "test": "Test the voice",
+        "close": "Close",
+        "button": "Dub",
+        "key_hint": "The {key} key opens this panel at any time in the game.",
+    },
+}
+
+
+def voice_mix_opts(ctx: StageContext) -> dict[str, Any]:
+    """``pack.renpy.voice_mix`` over :data:`VOICE_MIX_DEFAULTS` (a bare ``true`` / ``false`` is ``enabled``)."""
+    raw = ctx.cfg.pack.renpy.get("voice_mix")
+    opts = dict(VOICE_MIX_DEFAULTS)
+    if isinstance(raw, dict):
+        opts.update({k: v for k, v in raw.items() if k in opts and v is not None})
+    elif isinstance(raw, (bool, str)):
+        opts["enabled"] = raw
+    key = str(opts["key"] or "").strip()
+    if not _KEYSYM.fullmatch(key):  # empty or not a Ren'Py keysym: the key goes into a quoted string of the generated script
+        key = VOICE_MIX_DEFAULTS["key"]
+    if re.fullmatch(r"[fF]\d{1,2}", key):
+        key = key.upper()  # "f9" -> "F9" (K_F9; the letter keys are lower case: K_a)
+    opts["key"] = key if key.startswith("K_") or "_" in key else f"K_{key}"  # "F8" -> "K_F8"; "shift_K_F8" stays
+    try:
+        duck = float(opts["duck"])
+    except (TypeError, ValueError):
+        duck = float(VOICE_MIX_DEFAULTS["duck"])
+    if not math.isfinite(duck):
+        duck = float(VOICE_MIX_DEFAULTS["duck"])
+    opts["duck"] = max(0.0, min(1.0, duck))
+    return opts
+
+
+def _mix_mode(enabled: Any) -> str:
+    """``pack.renpy.voice_mix.enabled`` as ``on`` / ``off`` / ``auto`` (YAML gives a bool; a string is accepted too)."""
+    if enabled is True:
+        return "on"
+    if enabled is False:
+        return "off"
+    v = str(enabled or "").strip().lower()
+    if v in ("true", "on", "yes"):
+        return "on"
+    if v in ("false", "off", "no"):
+        return "off"
+    return "auto"
+
+
+def voice_mix_key_name(keysym: str) -> str:
+    """``K_F8`` -> ``F8`` (what the game shows and INSTALL.md says)."""
+    return keysym[2:] if keysym.startswith("K_") else keysym
+
+
+def _py_str(s: str) -> str:
+    """``s`` as the inside of a double-quoted Python string literal (a file name in an action or an assignment)."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _rpy_text(s: str) -> str:
+    """``s`` as displayed Ren'Py text: a string literal whose ``[`` and ``{`` are not interpolation."""
+    return _py_str(s).replace("[", "[[").replace("{", "{{")
+
+
+def renpy_voice_mix_rpy(duck: float, keysym: str, sample: str, lang: str) -> str:
+    """Text of the generated ``game/vndub_voice_mix.rpy``.
+
+    The dub plays on Ren'Py's ``voice`` channel, which has a mixer of its own; the channel gets that mixer only when
+    ``config.has_voice`` is True when ``00mixers.rpy`` binds the mixers (``init 1600``), so the flag is set at
+    ``init 1000``, after the game's ``options.rpy``. Ducking (``config.emphasize_audio_*``) lowers every other channel
+    while the voice channel plays, but it is a player preference that is off by default: the script turns it on once
+    (``persistent.vndub_voice_setup``) and keeps the strength in ``persistent.vndub_duck``, applied at every interaction
+    (``config.emphasize_audio_volume`` is a plain amplitude once ``init 1500`` has run, on every Ren'Py version).
+    ``config.overlay_screens`` are hidden in the game menu, so the button over the preferences screen is a
+    ``config.always_shown_screens`` screen (Ren'Py 7.5 / 8.0+; older versions get it from an interact callback), and
+    the hotkey is a ``config.underlay`` keymap, which works in the game and in the menus. ``sample`` is a voice file
+    relative to ``game/`` for the test buttons (also ``config.sample_voice`` of the standard preferences screen).
+    """
+    s = _MIX_STRINGS.get((lang or "").split("-")[0].lower()) or _MIX_STRINGS["en"]
+    key = voice_mix_key_name(keysym)
+    t = {k: _rpy_text(v.replace("{key}", key)).replace("[[vndub_pct]", "[vndub_pct]") for k, v in s.items()}
+    sample_q = _py_str(sample)
+    duck_s = f"{duck:.3f}".rstrip("0").rstrip(".") or "0"
+    return (
+        "# Generated by vndub: the voice track of the dub.\n"
+        "# The dub plays on Ren'Py's \"voice\" channel, which has a mixer of its own: it is never mixed into the music.\n"
+        "# This file switches that channel on (config.has_voice), lowers the music and sound effects while a line plays\n"
+        f"# (config.emphasize_audio_*, {duck_s} = full volume x {duck_s}) and adds a panel with the voice volume and the ducking\n"
+        f"# strength: press {key} in the game, or the \"{t['button']}\" button in the top right corner of the preferences screen.\n"
+        "# To undo all of it, delete this file and vndub_voice_mix.rpyc next to it.\n"
+        "\n"
+        "init 1000 python:\n"
+        "    # before Ren'Py binds the mixers (init 1600): a voice channel switched on later would stay on the sfx mixer\n"
+        "    config.has_voice = True\n"
+        + (
+            "    if not config.sample_voice:\n"
+            f'        config.sample_voice = "{sample_q}"\n'
+            if sample
+            else ""
+        )
+        + "    if \"voice\" not in config.emphasize_audio_channels:\n"
+        "        config.emphasize_audio_channels = list(config.emphasize_audio_channels) + [\"voice\"]\n"
+        "    config.emphasize_audio_time = 0.3\n"
+        f'    config.keymap["vndub_voice_panel"] = ["{keysym}"]\n'
+        "    config.underlay = list(config.underlay) + [renpy.Keymap(vndub_voice_panel=ToggleScreen(\"vndub_voice_panel\"))]\n"
+        "    if persistent.vndub_duck is None:\n"
+        f"        persistent.vndub_duck = {duck_s}\n"
+        "    if not persistent.vndub_voice_setup:\n"
+        "        # ducking is a player preference that Ren'Py leaves off: switch it on once, the panel can switch it off\n"
+        "        persistent.vndub_voice_setup = True\n"
+        "        _preferences.emphasize_audio = True\n"
+        "\n"
+        "    def vndub_voice_apply():\n"
+        "        # config.emphasize_audio_volume is a plain amplitude after init 1500 (the dB conversion of newer versions ran)\n"
+        "        d = persistent.vndub_duck\n"
+        "        if d is None:\n"
+        f"            d = {duck_s}\n"
+        "        config.emphasize_audio_volume = max(0.0, min(1.0, float(d)))\n"
+        "\n"
+        "    config.interact_callbacks.append(vndub_voice_apply)\n"
+        "\n"
+        "    # renpy.config is the plain module: the store's config proxy raises on an unknown name instead of returning False\n"
+        "    if hasattr(renpy.config, \"always_shown_screens\"):\n"
+        "        config.always_shown_screens = list(config.always_shown_screens) + [\"vndub_voice_hook\"]\n"
+        "    else:\n"
+        "        # Ren'Py before 7.5: no always_shown_screens, and overlay screens are hidden in the game menu\n"
+        "        def vndub_voice_hook_interact():\n"
+        "            try:\n"
+        "                want = renpy.get_screen(\"preferences\") is not None\n"
+        "                have = renpy.get_screen(\"vndub_voice_hook\") is not None\n"
+        "                if want and not have:\n"
+        "                    renpy.show_screen(\"vndub_voice_hook\")\n"
+        "                elif have and not want:\n"
+        "                    renpy.hide_screen(\"vndub_voice_hook\")\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "\n"
+        "        config.interact_callbacks.append(vndub_voice_hook_interact)\n"
+        "\n"
+        "# the button on the preferences screen (empty everywhere else)\n"
+        "screen vndub_voice_hook():\n"
+        "    zorder 100\n"
+        "    if renpy.get_screen(\"preferences\"):\n"
+        f'        textbutton "{t["button"]}":\n'
+        "            action ToggleScreen(\"vndub_voice_panel\")\n"
+        "            text_font \"DejaVuSans.ttf\"\n"
+        "            xalign 1.0\n"
+        "            yalign 0.0\n"
+        "            xoffset -24\n"
+        "            yoffset 24\n"
+        "\n"
+        f"# the panel: {key} in the game, or that button\n"
+        "screen vndub_voice_panel():\n"
+        "    zorder 150\n"
+        "    modal True\n"
+        "    key \"game_menu\" action Hide(\"vndub_voice_panel\")\n"
+        "    $ vndub_pct = int(round((persistent.vndub_duck or 0.0) * 100))\n"
+        "    frame:\n"
+        "        xalign 0.5\n"
+        "        yalign 0.5\n"
+        "        xsize 0.6\n"
+        "        padding (32, 24)\n"
+        "        vbox:\n"
+        "            spacing 12\n"
+        "            xfill True\n"
+        f'            text "{t["title"]}" size 30 font "DejaVuSans.ttf"\n'
+        f'            text "{t["hint"]}" size 18 font "DejaVuSans.ttf"\n'
+        "            null height 8\n"
+        f'            text "{t["voice_volume"]}" font "DejaVuSans.ttf"\n'
+        "            bar value Preference(\"voice volume\") style \"slider\" xfill True\n"
+        "            null height 8\n"
+        f'            text "{t["duck"]}" font "DejaVuSans.ttf"\n'
+        "            bar value FieldValue(persistent, \"vndub_duck\", range=1.0, style=\"slider\") xfill True\n"
+        f'            textbutton "{t["duck_on"]}" action Preference("emphasize audio", "toggle") text_font "DejaVuSans.ttf"\n'
+        f'            textbutton "{t["mute"]}" action Preference("voice mute", "toggle") text_font "DejaVuSans.ttf"\n'
+        "            null height 8\n"
+        "            hbox:\n"
+        "                spacing 24\n"
+        + (f'                textbutton "{t["test"]}" action Play("voice", "{sample_q}") text_font "DejaVuSans.ttf"\n' if sample else "")
+        + f'                textbutton "{t["close"]}" action Hide("vndub_voice_panel") text_font "DejaVuSans.ttf"\n'
+        f'            text "{t["key_hint"]}" size 16 font "DejaVuSans.ttf"\n'
+    )
+
+
 def _pack_unvoiced_renpy(ctx: StageContext, unvoiced: list[FinalIndexRecord]) -> tuple[dict[str, str], dict[str, Any]]:
     """Copy the unvoiced files named by dialogue identifier; returns ({line_id: path relative to game/}, info)."""
     out = ctx.paths.out_engine("renpy") / "game"
@@ -251,12 +473,14 @@ def _loose_root(eng: Any, out: Path) -> Path | None:
     return out if type(eng).pack is BaseEngine.pack else None
 
 
-def _remove_stale(ctx: StageContext, eng: Any, out: Path, regular: list[FinalIndexRecord], placed: dict[str, str], uinfo: dict[str, Any]) -> int:
+def _remove_stale(
+    ctx: StageContext, eng: Any, out: Path, regular: list[FinalIndexRecord], placed: dict[str, str], uinfo: dict[str, Any], mix_on: bool
+) -> int:
     """After a full pack: delete what an earlier pack left in ``out`` and this one does not hold. The installer ships the whole folder,
     so a file the new ``manifest_patch.json`` does not list would be installed all the same (a rejected line, ``include_review_lines``
     switched to ``skip``, an import under another parse version that renamed the Ren'Py ids ...). Touched are only the files the previous
     ``manifest_patch.json`` listed, the audio files next to files of the patch (the engine's voice folders), and the ``vndub_auto_voice.rpy``
-    this stage generated when it is no longer needed; nothing else. Returns the number of files removed."""
+    and ``vndub_voice_mix.rpy`` this stage generated when they are no longer needed; nothing else. Returns the number of files removed."""
     root = _loose_root(eng, out)
     if root is None:
         return 0
@@ -298,14 +522,15 @@ def _remove_stale(ctx: StageContext, eng: Any, out: Path, regular: list[FinalInd
             pass
         except OSError as e:
             ctx.log.warning("pack: cannot remove the stale file %s (%s)", p, e)
-    if eng.name == "renpy" and "rpy" not in uinfo:  # the generated auto_voice script of an earlier pack
-        rpy = root / RENPY_RPY
-        try:
-            if rpy.is_file() and rpy.read_text(encoding="utf-8").startswith("# Generated by vndub"):
-                rpy.unlink()
-                n += 1
-        except OSError as e:
-            ctx.log.warning("pack: cannot remove the stale %s (%s)", rpy, e)
+    if eng.name == "renpy":  # the generated scripts of an earlier pack, when this one does not need them
+        for name, needed in ((RENPY_RPY, "rpy" in uinfo), (RENPY_MIX_RPY, mix_on)):
+            rpy = root / name
+            try:
+                if not needed and rpy.is_file() and rpy.read_text(encoding="utf-8").startswith("# Generated by vndub"):
+                    rpy.unlink()
+                    n += 1
+            except (OSError, UnicodeDecodeError) as e:
+                ctx.log.warning("pack: cannot remove the stale %s (%s)", rpy, e)
     for d in sorted(dirs, key=lambda x: len(x.parts), reverse=True):  # folders the removal emptied
         try:
             if d not in (root, out) and d.is_dir() and not any(d.iterdir()):
@@ -344,6 +569,35 @@ def _install_notes(engine: str, n: int, info: dict[str, Any]) -> list[str]:
         "(`manifest_patch.json` lists them with `unvoiced: true`). This patch does NOT install them automatically: playing them needs a change to the game's script "
         "(a voice command before the line) or a tool of the engine; see docs/ENGINES.md.",
     ]
+
+
+def _voice_mix_notes(info: dict[str, Any]) -> list[str]:
+    """INSTALL.md section for the generated ``vndub_voice_mix.rpy`` (``info``: the manifest's ``voice_mix`` block + the ``button`` text)."""
+    pct = round(float(info["duck"]) * 100)
+    key = voice_mix_key_name(str(info["keysym"]))
+    return [
+        "",
+        "## The voice track in the game",
+        "",
+        "The dub plays on Ren'Py's \"voice\" channel, which has a mixer of its own: the music volume does not touch it. "
+        f"`{info['rpy']}` switches that channel on, lowers the music and sound effects to {pct}% while a line plays, "
+        f"and adds a panel with the voice volume and the ducking strength: press {key} in the game, or the \"{info['button']}\" button in the "
+        "top right corner of the game's preferences screen (a standard preferences screen also gains a \"Voice Volume\" slider with a Test button). "
+        f"To undo it, delete that file and `{PurePosixPath(info['rpy']).stem}.rpyc` next to it. "
+        "`pack.renpy.voice_mix` configures it: `enabled: auto | true | false` (auto = on when the patch holds lines that had no original voice), "
+        "`duck` (0.3 = music at 30 % while a line plays, 1 = no ducking), `key` (default `K_F8`).",
+    ]
+
+
+def _voice_mix_sample(placed: dict[str, str], regular: list[FinalIndexRecord], on_disk: list[FinalIndexRecord]) -> str:
+    """A voice file of the patch relative to ``game/`` for the panel's test button: the first unvoiced file placed now, else the first
+    regular one (of this pack, else of the project: an earlier pack put it there), else nothing."""
+    for rel in placed.values():
+        return rel[len("game/") :] if rel.startswith("game/") else rel
+    for f in [*regular, *on_disk]:
+        if not _is_unvoiced(f):
+            return f.voice_file
+    return ""
 
 
 def run(ctx: StageContext) -> dict[str, Any]:
@@ -388,7 +642,23 @@ def run(ctx: StageContext) -> dict[str, Any]:
                 placed[f.line_id] = f.voice_file
         with open(out / "INSTALL.md", "a", encoding="utf-8") as fh:
             fh.write("\n".join(_install_notes(eng.name, len(unvoiced), uinfo)) + "\n")
-    removed = 0 if ctx.only else _remove_stale(ctx, eng, out, regular, placed, uinfo)  # a partial pack (--only) leaves the rest of the folder alone
+    mix_on = False
+    mix_info: dict[str, Any] | None = None
+    if eng.name == "renpy":
+        mix = voice_mix_opts(ctx)
+        mode = _mix_mode(mix["enabled"])
+        # auto: the game was never mixed for voice when the patch holds lines that had none (the whole project, so --only packs agree)
+        mix_on = mode == "on" or (mode == "auto" and any(_is_unvoiced(f) for f in on_disk))
+        if mix_on:
+            lang = ctx.cfg.project.tgt_lang
+            (out / "game").mkdir(parents=True, exist_ok=True)
+            sample = _voice_mix_sample(placed, regular, on_disk)
+            (out / "game" / RENPY_MIX_RPY).write_text(renpy_voice_mix_rpy(mix["duck"], mix["key"], sample, lang), encoding="utf-8")
+            mix_info = {"rpy": f"game/{RENPY_MIX_RPY}", "key": voice_mix_key_name(mix["key"]), "keysym": mix["key"], "duck": mix["duck"], "enabled": True}
+            strings = _MIX_STRINGS.get((lang or "").split("-")[0].lower()) or _MIX_STRINGS["en"]
+            with open(out / "INSTALL.md", "a", encoding="utf-8") as fh:
+                fh.write("\n".join(_voice_mix_notes({**mix_info, "button": strings["button"]})) + "\n")
+    removed = 0 if ctx.only else _remove_stale(ctx, eng, out, regular, placed, uinfo, mix_on)  # a partial pack (--only) leaves the rest of the folder alone
     entries = []
     for i, f in enumerate(present):
         ctx.progress(i, len(present), f.line_id)
@@ -415,8 +685,13 @@ def run(ctx: StageContext) -> dict[str, Any]:
         entries.append(entry)
     if present:
         ctx.progress(len(present), len(present), None)
-    write_json(out / "manifest_patch.json", {"engine": eng.name, "game_dir": proj.game_dir, "coverage": cov, "files": entries})
+    manifest: dict[str, Any] = {"engine": eng.name, "game_dir": proj.game_dir, "coverage": cov, "files": entries}
+    if eng.name == "renpy":
+        manifest["voice_mix"] = mix_info
+    write_json(out / "manifest_patch.json", manifest)
     summary = {**res, "engine": eng.name, "manifest": str(out / "manifest_patch.json")}
+    if eng.name == "renpy":
+        summary["voice_mix"] = mix_on
     if unvoiced:
         summary["unvoiced"] = len(unvoiced)
         summary["unvoiced_install"] = "renpy auto_voice" if eng.name == "renpy" else "manual"

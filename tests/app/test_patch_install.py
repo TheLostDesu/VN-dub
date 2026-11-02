@@ -166,6 +166,49 @@ def test_unvoiced_folder_is_a_manual_note_not_copied(o_env: Path, tmp_path: Path
     assert done["state"] == "done" and not (game / "unvoiced").exists() and not (game / "_xp3pack").exists()
 
 
+def write_voice_mix(patch: Path, value: Any, *, absent: bool = False) -> None:
+    """Set (or drop) the ``voice_mix`` key the Ren'Py pack stage writes into ``manifest_patch.json``."""
+    f = patch / "manifest_patch.json"
+    data = json.loads(f.read_text(encoding="utf-8"))
+    if absent:
+        data.pop("voice_mix", None)
+    else:
+        data["voice_mix"] = value
+    f.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_voice_mix_manifest_adds_the_hotkey_note(renpy: tuple[Any, Path, Path]) -> None:
+    """The plan tells where the in-game dub panel is (``install.note.voice_mix`` + the hotkey) only when the manifest carries ``voice_mix``."""
+    h, _, patch = renpy
+    c = client_for(patch_install)
+
+    def notes() -> list[dict[str, Any]]:
+        return c.get(f"/api/install/plan?slug={h.slug}").json()["notes"]
+
+    assert notes() == []  # the fixture's manifest has no voice_mix at all (older build)
+    write_voice_mix(patch, {"rpy": "game/vndub_voice_mix.rpy", "key": "F8", "duck": 0.35, "enabled": True})
+    assert notes() == [{"key": "install.note.voice_mix", "params": {"key": "F8"}}]
+    write_voice_mix(patch, {"rpy": "game/vndub_voice_mix.rpy", "key": "F9", "duck": 0.5, "enabled": True})
+    assert notes()[0]["params"] == {"key": "F9"}
+    write_voice_mix(patch, {"rpy": "game/vndub_voice_mix.rpy"})
+    assert notes() == [{"key": "install.note.voice_mix", "params": {"key": "F8"}}]  # no key in the block: the default hotkey
+    for off in (None, {}, {"rpy": "game/vndub_voice_mix.rpy", "key": "F8", "enabled": False}, "F8"):
+        write_voice_mix(patch, off)
+        assert notes() == [], off
+    write_voice_mix(patch, None, absent=True)
+    assert notes() == []
+
+
+def test_voice_mix_note_comes_after_the_other_notes(o_env: Path, tmp_path: Path) -> None:
+    files = {"game/voice/sak_0001.ogg": NEW_A, "unvoiced/line_9.ogg": b"unvoiced", "game/vndub_voice_mix.rpy": RPY}
+    h, _game, patch = make_game_project(tmp_path, engine="renpy", game_files=GAME, patch_files=files)
+    write_voice_mix(patch, {"rpy": "game/vndub_voice_mix.rpy", "key": "F8", "duck": 0.35, "enabled": True})
+    plan = client_for(patch_install).get(f"/api/install/plan?slug={h.slug}").json()
+    assert [n["key"] for n in plan["notes"]] == ["install.note.unvoiced_manual", "install.note.voice_mix"]
+    assert plan["notes"][1]["params"] == {"key": "F8"}
+    assert "game/vndub_voice_mix.rpy" in {f["target"] for f in plan["files"]} and not any(f["target"].startswith("unvoiced") for f in plan["files"])
+
+
 # ---- apply / rollback ------------------------------------------------------------------------------------------------------
 
 
@@ -203,6 +246,67 @@ def test_apply_with_backup_then_rollback_restores_everything(renpy: tuple[Any, P
     assert c.get(f"/api/install/plan?slug={h.slug}").json()["backups"] == []  # rolled back: nothing left to roll back
     again = run(c, "/api/install/rollback", h.slug, backup_id=res["backup_id"])
     assert again["state"] == "failed" and again["error"]["code"] == "nothing_to_install"
+
+
+# ---- Ren'Py compiles every .rpy into a .rpyc twin ----------------------------------------------------------------------------
+
+
+def test_rollback_removes_the_compiled_twin_of_an_added_rpy(renpy: tuple[Any, Path, Path]) -> None:
+    """The game ran once with the patch: Ren'Py wrote ``vndub_auto_voice.rpyc``. Rolling back must take it too, or the script still runs."""
+    h, game, patch = renpy
+    (patch / "game" / "options.rpy").write_bytes(b"define config.name = 'Dub'\n")  # also a REPLACED script: its twin is not ours to delete
+    c = client_for(patch_install)
+    res = run(c, "/api/install/apply", h.slug, backup=True)["result"]
+    assert res["files"] == 5 and res["replaced"] == 3 and res["added"] == 2
+    g = game / "game"
+    assert (g / "vndub_auto_voice.rpy").read_bytes() == RPY
+    compiled = {"vndub_auto_voice.rpyc": b"RENPY RPC2 patch", "script.rpyc": b"RENPY RPC2 game script", "options.rpyc": b"RENPY RPC2 game options"}
+    for name, data in compiled.items():
+        (g / name).write_bytes(data)  # what Ren'Py leaves next to the scripts after a run
+
+    back = run(c, "/api/install/rollback", h.slug, backup_id=res["backup_id"])
+    assert back["state"] == "done", back.get("error")
+    assert back["result"] == {"backup_id": res["backup_id"], "restored": 3, "removed": 3, "unrecoverable": 0}  # removed: voice_dub file + the .rpy + its .rpyc
+    assert not (g / "vndub_auto_voice.rpy").exists() and not (g / "vndub_auto_voice.rpyc").exists()
+    assert (g / "script.rpyc").read_bytes() == compiled["script.rpyc"]  # other .rpyc: untouched
+    assert (g / "options.rpyc").read_bytes() == compiled["options.rpyc"]  # twin of a restored (not added) .rpy: Ren'Py recompiles it by itself
+    assert (g / "options.rpy").read_bytes() == GAME["game/options.rpy"]
+    assert tree_snapshot(game) == {**GAME, "game/script.rpyc": compiled["script.rpyc"], "game/options.rpyc": compiled["options.rpyc"]}
+
+
+def test_rollback_without_a_compiled_twin_is_unchanged(renpy: tuple[Any, Path, Path]) -> None:
+    """Never run the game: no ``.rpyc`` exists, nothing extra is counted or created."""
+    h, game, _ = renpy
+    c = client_for(patch_install)
+    res = run(c, "/api/install/apply", h.slug, backup=True)["result"]
+    back = run(c, "/api/install/rollback", h.slug, backup_id=res["backup_id"])
+    assert back["result"] == {"backup_id": res["backup_id"], "restored": 2, "removed": 2, "unrecoverable": 0}
+    assert tree_snapshot(game) == dict(GAME)
+
+
+def test_apply_removes_a_stale_compiled_twin_of_a_new_rpy(renpy: tuple[Any, Path, Path]) -> None:
+    """A ``.rpyc`` left by an earlier install (rolled back before the rollback learned about twins) must not outlive the fresh ``.rpy``."""
+    h, game, _ = renpy
+    g = game / "game"
+    (g / "vndub_auto_voice.rpyc").write_bytes(b"RENPY RPC2 stale")  # no .rpy next to it
+    (g / "script.rpyc").write_bytes(b"RENPY RPC2 game script")
+    c = client_for(patch_install)
+    first = run(c, "/api/install/apply", h.slug, backup=True)
+    assert first["state"] == "done", first.get("error")
+    assert (g / "vndub_auto_voice.rpy").read_bytes() == RPY and not (g / "vndub_auto_voice.rpyc").exists()
+    assert (g / "script.rpyc").read_bytes() == b"RENPY RPC2 game script"
+
+    # the .rpy exists now: a twin Ren'Py compiled from it is current, an install over it (replacing the .rpy) leaves it alone
+    (g / "vndub_auto_voice.rpyc").write_bytes(b"RENPY RPC2 current")
+    second = run(c, "/api/install/apply", h.slug, backup=True)
+    assert second["state"] == "done", second.get("error")
+    assert (g / "vndub_auto_voice.rpyc").read_bytes() == b"RENPY RPC2 current"
+    # undoing the second install puts the first back (the .rpy is restored, not added): the twin stays for Ren'Py to recompile
+    assert run(c, "/api/install/rollback", h.slug, backup_id=second["result"]["backup_id"])["state"] == "done"
+    assert (g / "vndub_auto_voice.rpy").read_bytes() == RPY and (g / "vndub_auto_voice.rpyc").exists()
+    # undoing the first removes the script and its twin
+    assert run(c, "/api/install/rollback", h.slug, backup_id=first["result"]["backup_id"])["state"] == "done"
+    assert not (g / "vndub_auto_voice.rpy").exists() and not (g / "vndub_auto_voice.rpyc").exists() and (g / "script.rpyc").exists()
 
 
 def test_apply_twice_keeps_two_backups_and_rolls_back_in_order(renpy: tuple[Any, Path, Path]) -> None:

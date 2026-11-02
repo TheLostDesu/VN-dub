@@ -1028,6 +1028,7 @@
   "install.msg.zip": "Building the archive, files: {count}…",
   "install.note.encrypted": "The game is encrypted: a plain patch may be rejected by the game.",
   "install.note.unvoiced_manual": "The dub of lines that had no voice in the game is in {path}. It is not installed automatically: the game script has to be changed (see the instructions).",
+  "install.note.voice_mix": "In the game the dub plays on its own track (the voice channel): the {key} key opens the dub panel with the voice volume and how much the music is lowered while a line plays; the same panel opens from the \"Dub\" button on the game's preferences screen, and the standard preferences screen gains a \"Voice Volume\" slider.",
   "install.rollback_partial": "Some files could not be restored ({n}): there was no backup copy for them, so the original game files cannot come back.",
   "installer.msg.env": "Installing now: {env}",
   "installer.msg.envs": "Installing environments: {count}. This takes from a few minutes to an hour.",

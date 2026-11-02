@@ -541,6 +541,17 @@ that folder (`pack.renpy.unvoiced_dir`, default `voice_dub`), or, when the game 
 `config.auto_voice`, the files under its pattern and no rpy; every other engine gets
 `out/<engine>/unvoiced/<file>` and a note in INSTALL.md that they are NOT installed automatically.
 `manifest_patch.json` marks them (`unvoiced`, `renpy_auto_voice` / `manual`).
+Ren'Py voice track (1.0.3): the dub plays on Ren'Py's `voice` channel, whose mixer Ren'Py binds at `init 1600` only when
+`config.has_voice` is True, so a second generated script `game/vndub_voice_mix.rpy` (`init 1000`, after the game's
+`options.rpy`) sets `config.has_voice`, a `config.sample_voice` (when the game has none: the standard preferences screen
+then shows a "Voice Volume" slider), Ren'Py's ducking (`config.emphasize_audio_channels = ["voice"]`, the `emphasize_audio`
+preference switched on once: music and sfx drop to `duck` while a line plays) and an in-game panel (screen
+`vndub_voice_panel`: voice volume, music level during a line, ducking and mute toggles, test) on a hotkey and on a button in
+the preferences screen. Config `pack.renpy.voice_mix`: `enabled: auto | true | false` (auto = the patch holds lines that had
+no original voice; a bare `voice_mix: true|false` is `enabled`), `duck: 0.3` (1.0 = no ducking), `key: K_F8`.
+`manifest_patch.json` carries a top-level `voice_mix` (`{rpy, key, keysym, duck, enabled}` or `null`), INSTALL.md the section
+"The voice track in the game", the pack summary `voice_mix: true|false`. A full pack removes a `vndub_voice_mix.rpy` it
+generated earlier when the feature is now off (same rule as the stale auto_voice script). See ENGINES.md.
 
 ### report
 Out: `work/report/index.html`, `work/report/report.md`: mapping coverage, per-character

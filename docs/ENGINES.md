@@ -22,7 +22,7 @@ case-insensitively, extension-less and with `\` or `/` separators
 
 | Engine | Detected by | Extraction | Voice mapping | Pack | Status |
 |---|---|---|---|---|---|
-| Ren'Py | `game/*.rpy`, `*.rpyc`, `*.rpa` (+ `renpy/`) | loose; `unrpa`; `unrpyc` for `.rpyc` | `voice "f"`, `voice sustain`, `config.auto_voice` ids, `dialogue.tab` | loose `out/renpy/game/...` | complete |
+| Ren'Py | `game/*.rpy`, `*.rpyc`, `*.rpa` (+ `renpy/`) | loose; `unrpa`; `unrpyc` for `.rpyc` | `voice "f"`, `voice sustain`, `config.auto_voice` ids, `dialogue.tab` | loose `out/renpy/game/...` + voice-track script | complete |
 | KiriKiri 2/Z | `*.xp3`, loose `.ks`, `.scn` | built-in XP3 reader (unencrypted); dump folders; FreeMote for `.scn` | KAG macros + conventions; `.scn` JSON | `patchN.xp3` (built-in writer or Xp3Pack), or `unencrypted/` | complete |
 | NScripter / ONScripter | `nscript.dat`, `0.txt`, `arc*.nsa`, `*.sar`, `*.ns2` | built-in XOR 0x84 decoder, NSA/SAR/NS2 reader | `dwave CH,"file"` -> next text line | loose beside the exe | complete |
 | Siglus | `Scene.pck` + `Gameexe.dat`, `koe_master.csv` | `siglus-ssu -k` / `-x` | `koe_master.csv` | dump layout + instructions (`.ovk` repack not available) | parser complete, pack manual |
@@ -146,6 +146,35 @@ is read from `init python` / `define config.auto_voice`).
 filesystem before archives. If the game sets `config.force_archives = True`,
 repack into an `.rpa` that sorts after the originals (`rpatool -c`); noted in
 INSTALL.md.
+
+**The voice track** (1.0.3). The dub plays on Ren'Py's own `voice` channel, which has a mixer of its own (never the
+music mixer), but Ren'Py binds that mixer at `init 1600` only if `config.has_voice` is True at that moment. A game that
+never had voice usually switches it off in `options.rpy`: the preferences have no voice slider and the dub is drowned by the music. So `pack`
+writes a second generated script, `game/vndub_voice_mix.rpy`, next to `vndub_auto_voice.rpy`, at `init 1000` (after the
+game's `options.rpy`, long before 1600), which:
+
+* sets `config.has_voice = True`, and `config.sample_voice` to one of the patch's files when the game has none, so the
+  standard preferences screen shows a "Voice Volume" slider with a Test button;
+* turns on Ren'Py's ducking: `config.emphasize_audio_channels = ["voice"]`, `emphasize_audio_time = 0.3`, and the
+  player preference `emphasize_audio` (Ren'Py leaves it OFF by default; it is switched on once), so the music and the
+  sound effects drop to `duck` (default 0.3 = 30 %, about -10 dB) while a line plays;
+* adds an in-game panel (screen `vndub_voice_panel`): voice volume, "music while a line plays" (stored in
+  `persistent.vndub_duck`), "lower the music while a line plays", "mute the dub", "test the voice" and "close". Texts are
+  Russian when the dub's target language is Russian, else English; the font is DejaVuSans, so Cyrillic always renders;
+* opens the panel with a hotkey (`K_F8`, bound through `config.underlay`: it works in the game and in the menus) and
+  with a button "Озвучка" / "Dub" in the top right corner of the game's preferences screen (a
+  `config.always_shown_screens` screen on Ren'Py 7.5 / 8.0+, an interact callback on older versions; shown only while the
+  `preferences` screen is up).
+
+Config `pack.renpy.voice_mix`: `enabled: auto | true | false` (auto = on when the patch holds lines that had no
+original voice, i.e. the game was never mixed for voice; a voiced game keeps its own mix unless `true`; a bare
+`voice_mix: true|false` is read as `enabled`), `duck: 0.3` (music / sfx volume while a line plays, 1.0 = no ducking),
+`key: K_F8`. `manifest_patch.json` carries `voice_mix` (`{rpy, key, keysym, duck, enabled}` or `null`), INSTALL.md the
+section "The voice track in the game", the pack summary `voice_mix: true|false`. A full `pack` removes a
+`vndub_voice_mix.rpy` it generated earlier when the feature is now off (the same rule as the stale auto_voice script).
+To undo it in a game by hand, delete `game/vndub_voice_mix.rpy` and `game/vndub_voice_mix.rpyc`.
+**Not yet run in a real Ren'Py** (no SDK on the build machine): the script follows the Ren'Py source and docs; open the
+game once, press F8 and open the preferences screen.
 
 ## KiriKiri 2 / KiriKiri Z
 

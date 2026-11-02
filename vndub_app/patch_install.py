@@ -25,6 +25,8 @@ generic
 
 Not copied automatically for any engine: ``INSTALL.md``, ``manifest_patch.json``, temporary ``_*`` folders and
 the ``unvoiced/`` folder (voices for lines the game never voiced: a manual step, see the plan ``notes``).
+A Ren'Py patch whose manifest has ``voice_mix`` adds the ``install.note.voice_mix`` note (the hotkey of the in-game dub panel). Ren'Py compiles
+every ``game/*.rpy`` into a ``.rpyc`` twin: the stale twin of a ``.rpy`` the patch adds is removed on apply and again on rollback.
 Backups live in ``<data>/backups/<slug>/<timestamp>/`` (``files/`` + ``manifest.json``); the manifest is written
 before the first game file is touched so an interrupted install can still be rolled back.
 """
@@ -312,6 +314,9 @@ def build_plan(slug: str | None = None) -> dict[str, Any]:
         notes.append({"key": "install.note.unvoiced_manual", "params": {"path": str(unv)}})
     if getattr(proj, "encrypted", False) and engine == "kirikiri":
         notes.append({"key": "install.note.encrypted", "params": {}})
+    vm = (read_manifest(pdir) or {}).get("voice_mix")  # absent / null in manifests of other engines and older builds
+    if isinstance(vm, dict) and vm and vm.get("enabled") is not False:
+        notes.append({"key": "install.note.voice_mix", "params": {"key": str(vm.get("key") or "F8")}})
     md = pdir / "INSTALL.md"
     return {
         "slug": h.slug,
@@ -375,6 +380,23 @@ def _copy_atomic(src: Path, dst: Path) -> None:
                 pass
 
 
+def _rpyc_twin(p: Path) -> Path | None:
+    """The ``.rpyc`` Ren'Py compiles next to a ``.rpy`` (``None`` for any other file)."""
+    return p.with_name(p.name + "c") if p.suffix.lower() == ".rpy" else None
+
+
+def _drop_rpyc_twin(rpy: Path) -> bool:
+    """Delete the compiled twin of a ``.rpy`` the patch added (Ren'Py keeps loading it even after the ``.rpy`` is gone). True when removed."""
+    twin = _rpyc_twin(rpy)
+    try:
+        if twin is not None and twin.is_file():
+            twin.unlink()
+            return True
+    except OSError as e:
+        log.warning("cannot remove %s: %s", twin, e)
+    return False
+
+
 def _missing_dirs(game_dir: Path, dst: Path) -> list[Path]:
     out = []
     p = dst.parent
@@ -435,6 +457,8 @@ def apply_patch(slug: str | None, backup: bool, ctx: JobContext) -> dict[str, An
     try:
         for i, (src, dst) in enumerate(todo):
             ctx.progress(n + i if backup else i, n * 2 if backup else n, dst.name)
+            if not manifest["files"][i]["existed"]:
+                _drop_rpyc_twin(dst)  # a .rpyc left by an earlier install of a script that is new again
             _copy_atomic(src, dst)
             written += 1
     except BaseException as e:
@@ -491,6 +515,8 @@ def _restore(manifest: dict[str, Any], bdir: Path, game_dir: Path) -> dict[str, 
                     removed += 1
             except OSError as e:
                 log.warning("cannot remove %s: %s", dst, e)
+            if _drop_rpyc_twin(dst):  # Ren'Py's compiled copy of a script the patch added: it would keep running the script
+                removed += 1
     for d in sorted(manifest.get("created_dirs", []), key=len, reverse=True):
         p = game_dir / d
         try:

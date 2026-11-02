@@ -81,6 +81,20 @@ For patches, use `version.dll` so the game accepts an unencrypted `patchN.xp3`.
 **Ren'Py `.rpyc` only** — install unrpyc v2 and set `tools.unrpyc`; `.rpa` archives need
 `unrpa` (`uv sync --extra extract`).
 
+**Ren'Py: the dub is drowned by the music / no voice slider** — a game that never had voice usually switches Ren'Py's voice
+mixer off (`config.has_voice = False` in `options.rpy`), so the preferences have no voice slider and the dub competes with the music. Since
+1.0.3 `pack` writes `game/vndub_voice_mix.rpy` (see ENGINES.md, "The voice track") that turns the mixer on and ducks the
+music while a line plays. In the game press **F8** (or open the preferences screen and press the "Dub" / "Озвучка"
+button in the top right corner): the panel has the voice volume, "music while a line plays" (lower = quieter music),
+the ducking toggle and the mute. To change the defaults edit the project's `pipeline.yaml` and pack and install again:
+`pack.renpy.voice_mix: {enabled: true, duck: 0.2, key: K_F8}` (`enabled: auto` is on only when the patch holds lines that
+had no original voice; a voiced game keeps its own mix unless `true`; `false` writes no script). To undo it in a game by
+hand delete `game/vndub_voice_mix.rpy` and `game/vndub_voice_mix.rpyc`. If F8 does nothing: the file must be in the
+game's `game/` folder (check the install location, and that a rollback has not removed it), the game must run Ren'Py 7.4
+or newer, and no other script may bind F8 (set another `key`); a game that was running while the patch was installed has
+to be restarted. The script has not been run in a real Ren'Py on the build machine: if the game reports an error in
+`vndub_voice_mix.rpy` (`traceback.txt`, `log.txt`), delete the two files above and report the text.
+
 **Many lines in `review` after `link`** — check `work/review_queue.jsonl`. Typical causes:
 BGM under the voice (ASR fails), names spelled differently in the script, a wrong
 `engine_opts.kag.voice_attr`. Raising `link.review_score` only hides the problem.
