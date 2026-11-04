@@ -116,13 +116,20 @@ translate:
   stress:
     tool: ruaccent               # ruaccent | none
     model: turbo
-    yo: true
+    yo: safe                     # safe = ё only for words that exist only with ё (the LLM writes the rest) | true = also ruaccent's guess for небо/нёбо-type homographs | false = no ё
     format: auto                 # auto = per backend ('+' marks for f5_ru, plain otherwise)
   interjections: "configs/interjections.yaml"
   mock_dictionary: ""
   # include_unvoiced: auto       # auto = when synth.voice_unvoiced is on (the app) | on | off: also translate speaker lines WITHOUT original audio (mode B: the unvoiced protagonist; narration never).
                                  # off = voiced lines only (the old behaviour); auto = on only when synth.voice_unvoiced is on.
                                  # These lines also get an LLM `delivery` (see text_emotion.llm).
+  # names_pass: true             # ONE extra LLM request before the first batch: the canonical target spelling of the script's proper nouns (Gensokyo, Patchouli ...),
+                                 # added to the glossary terms (note "auto"; a term you wrote is never overwritten) so every batch spells a name the same way. Cached; false = skip.
+  # include_narration: auto      # auto | on | off: translate narration (lines of the narrator without audio) as TEXT-ONLY lines: context for the model and text for the Ren'Py
+                                 # text patch, never synthesized. auto = on when the engine is renpy and pack.renpy.text.enabled is not false. Menu choices (translation record
+                                 # `choices_tgt`) are translated when this is on OR the engine is renpy.
+  # A GGUF model that does not fit llm.ctx in the VRAM budget is tried again at ctx 8192 and 4096 (batch_lines / context_window_lines shrink by the same ratio) before the next
+  # model of llm.fallbacks; it always stays fully on the GPU. The protagonist's gender (glossary `player.gender`) is set in the app's step 2 or in configs/glossary.yaml.
 
 # text_emotion: delivery from text for lines without original audio (stage `text_emotion`, `vndub text-emotion`).
 # Everything below is the default; uncomment a key to change it.
@@ -218,6 +225,14 @@ synth:
     enabled: true                # false = the TTS gets the text exactly as translated (stage directions included)
     table: "configs/laughter.yaml"   # per target language and laugh kind (hearty chuckle giggle evil nervous snort): the spelling the model voices as a laugh,
                                  # backend overrides (CosyVoice [laughter] token, Fish/Higgs tags) in its `backends:` block; edit it to tune per voice
+  sounds:                        # written non-speech sounds ("ZZZ...", "Muah!", "Achoo!", "*yawns*") are not read letter by letter
+    enabled: true                # false = the TTS gets the text exactly as translated
+    table: "configs/sounds.yaml"     # stand-in spelling per target language and sound kind (snore kiss yawn gasp sneeze cough hum hmph shiver eat), backend tags in `backends:`
+    only: spell                  # what a line that is NOTHING but a sound becomes (no voice model really snores on request):
+                                 #   spell  = the table stand-in is spoken ("Хр-р-р... хр-р-р..."), the style says it is a snore with no words
+                                 #   sample = a recorded clip from `samples` replaces the TTS for that line (a kind without a clip falls back to spell, warned once)
+                                 #   silent = such a line is left out of the patch and listed in the coverage report
+    samples: {}                  # kind -> clip (wav/ogg/mp3, relative to the repo or absolute), e.g. {snore: "assets/sounds/snore.wav"}; used by only: sample
   # routes: P is not in the default dict on purpose: it is picked per line for characters without original audio / with
   # characters.yaml route: P. Tuning: characters.yaml <sid>.performer.tuning (pitch_st, speed, expressiveness, energy,
   # timbre_preset, character_note) and per-line "tuning" overrides; see docs/PIPELINE.md (synth).
@@ -270,6 +285,12 @@ pack:
                                  #            a voiced game keeps its own mix) | true = always | false = no script (a stale one is removed by a full pack)
                                  #   duck: music / sfx volume while a line plays, 0.3 = 30 % (about -10 dB), 1.0 = no ducking
                                  #   key: Ren'Py key name that opens the panel (K_F8); the panel is also a button in the top right corner of the preferences screen
+                                 # + text: {enabled: auto, language: "", font: ""}   (generated game/tl/<language>/vndub_dialogue.rpy + game/vndub_language.rpy:
+                                 #   the translated text on screen, one `translate <language> <id>:` block per say line and a `strings` block for menu choices;
+                                 #   a bare `text: true|false` is `enabled`)
+                                 #   enabled: auto = on when the project has a translation file | true | false = no script (a stale one is removed by a full pack)
+                                 #   language: Ren'Py language name = the folder under game/tl/ ("" = from project.tgt_lang: ru -> russian, en -> english, ja -> japanese ...)
+                                 #   font: a .ttf / .otf inside game/ for a game whose own font lacks the alphabet (`translate <language> python:` sets gui.text_font); "" = none
   nscripter: {mode: loose}
   unity: {mode: unitypy_script}
   other: {}

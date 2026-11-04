@@ -22,7 +22,7 @@ case-insensitively, extension-less and with `\` or `/` separators
 
 | Engine | Detected by | Extraction | Voice mapping | Pack | Status |
 |---|---|---|---|---|---|
-| Ren'Py | `game/*.rpy`, `*.rpyc`, `*.rpa` (+ `renpy/`) | loose; `unrpa`; `unrpyc` for `.rpyc` | `voice "f"`, `voice sustain`, `config.auto_voice` ids, `dialogue.tab` | loose `out/renpy/game/...` + voice-track script | complete |
+| Ren'Py | `game/*.rpy`, `*.rpyc`, `*.rpa` (+ `renpy/`) | loose; `unrpa`; `unrpyc` for `.rpyc` | `voice "f"`, `voice sustain`, `config.auto_voice` ids, `dialogue.tab` | loose `out/renpy/game/...` + voice-track and text-patch scripts | complete |
 | KiriKiri 2/Z | `*.xp3`, loose `.ks`, `.scn` | built-in XP3 reader (unencrypted); dump folders; FreeMote for `.scn` | KAG macros + conventions; `.scn` JSON | `patchN.xp3` (built-in writer or Xp3Pack), or `unencrypted/` | complete |
 | NScripter / ONScripter | `nscript.dat`, `0.txt`, `arc*.nsa`, `*.sar`, `*.ns2` | built-in XOR 0x84 decoder, NSA/SAR/NS2 reader | `dwave CH,"file"` -> next text line | loose beside the exe | complete |
 | Siglus | `Scene.pck` + `Gameexe.dat`, `koe_master.csv` | `siglus-ssu -k` / `-x` | `koe_master.csv` | dump layout + instructions (`.ovk` repack not available) | parser complete, pack manual |
@@ -175,6 +175,27 @@ section "The voice track in the game", the pack summary `voice_mix: true|false`.
 To undo it in a game by hand, delete `game/vndub_voice_mix.rpy` and `game/vndub_voice_mix.rpyc`.
 **Not yet run in a real Ren'Py** (no SDK on the build machine): the script follows the Ren'Py source and docs; open the
 game once, press F8 and open the preferences screen.
+
+**The translated text** (1.1.0). Until 1.0.3 the patch carried only voice: the dub spoke Russian over the game's English
+text. `pack` now also writes `game/tl/<language>/vndub_dialogue.rpy`, one `translate <language> <dialogue id>:` block per
+translated say line (the shape `renpy translate` writes; the identifier is the same one the auto-voice files are named by,
+a menu's own say keeps its `nointeract`, a `voice` statement of the original group is repeated), plus a
+`translate <language> strings:` block for menu choices (`choices_tgt` of the menu's translation record) and menu captions,
+and `game/vndub_language.rpy` (`define config.language = "<language>"`: Ren'Py's `_init_language` reads
+`RENPY_LANGUAGE or config.language or _preferences.language`, so the game starts in the dub's language every time). The
+language name is the conventional lowercase one (`ru` -> `russian`, `ja` -> `japanese`, ...; `pack.renpy.text.language`
+overrides). Ren'Py refuses duplicate identifiers and duplicate `old` strings, so ids and strings the game already
+translates under `game/tl/<language>/` are skipped and listed, as are lines whose translation lost an interpolation or flow
+tag (`[name]`, `{w}`), menus without translated choices, and lines with their own `voice` expression. Config
+`pack.renpy.text: {enabled: auto | true | false, language: "", font: ""}` (auto = the project has a translation file;
+`font` = a .ttf/.otf inside `game/` set through a `translate <language> python:` block for games whose font lacks
+Cyrillic; Ren'Py's bundled DejaVuSans has it). `manifest_patch.json` carries `text` (`{rpy, language_rpy, language, lines,
+strings, skipped, skipped_count, skipped_reasons, font, enabled}` or `null`), INSTALL.md the section "The translated text",
+the desktop app's install step a note. A full `pack` removes the two scripts when the feature is off. To undo it in a game
+by hand, delete `game/vndub_language.rpy`, `game/tl/<language>/vndub_dialogue.rpy` and their `.rpyc` twins. Narration and
+menu choices are translated for this patch as text-only lines (`translate.include_narration`, auto = on for Ren'Py); they
+never reach synth. **Not yet run in a real Ren'Py**: the first real run is the check (the text is in the dub's language,
+a menu too, the game reports no "duplicate" error).
 
 ## KiriKiri 2 / KiriKiri Z
 

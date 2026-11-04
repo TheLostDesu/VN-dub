@@ -58,6 +58,11 @@ _COMMON = dict(role="llm", env=None, adapter="llamacpp", heavy=True, local_impl=
 #   gemma4_12b  IQ4_XS 6.38 GB -> 5.9 GiB; 8 global layers (1 kv head x 512) = 16 KiB/token, 40 sliding layers
 #               (8 kv x 256, window 1024 + a 512 batch) = 0.47 GiB fixed -> 7.5 at 16K. Does NOT fit an 8 GB card
 #               next to the desktop: the budget check skips it there (12 GB cards run it).
+#               Context ladder (translate._llm_candidates): a model that misses the budget at translate.llm.ctx is costed again at
+#               ctx 8192 and 4096 before it is given up (batch_lines / context_window_lines shrink by the same ratio); only the KV
+#               cache shrinks, the layers stay on the GPU. gemma4_12b: 7.5 GiB at 16K, 7.4 at 8K, 7.3 at 4K -- the weights and the
+#               fixed part (5.9 + 0.47 + 0.9) dominate, so on a 7.5 GB budget with a 0.5 margin it still does not fit (it needs a margin
+#               of 0.1 or less at 8K, or a 12 GB card).
 #   qwen35_9b   Q4_K_M 5.68 GB -> ~4.8 GiB in VRAM; 8 full-attention layers (4 kv x 256) = 32 KiB/token, 24
 #               linear-attention layers ~0.05 GiB -> 6.3 at 16K.
 #   hy_mt15_7b  Q4_K_M 4.62 GB -> ~4.1 GiB; 32 layers (8 kv x 128) = 128 KiB/token -> 6.0 at 8K, 7.0 at 16K.

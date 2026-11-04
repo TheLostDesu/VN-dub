@@ -210,6 +210,23 @@ def to_acute_format(text: str) -> str:
     return plus_to_acute(_RU_WORD.sub(word, text or ""))
 
 
+def graft_stress(original: str, stressed: str) -> str | None:
+    """The marks of ``stressed`` put onto the words of ``original``, or None when the two do not have the same words.
+
+    ruaccent rewrites more than the stress: it deletes straight quotes, apostrophes, ``*``, ``/``, ``%`` and any other
+    character outside its small alphabet and closes the gaps around dashes and punctuation. A line with a ``"`` came
+    back different, so the "a stresser must not change the words" guard threw the whole line's marks away. Here the
+    original text stays as it is and only its Cyrillic words are replaced by the marked ones, if they are the same
+    words in the same order (ё/е aside).
+    """
+    new = _RU_WORD.findall(stressed or "")
+    old = _RU_WORD.findall(original or "")
+    if len(new) != len(old) or any(deyo(strip_stress(a)).lower() != deyo(b).lower() for a, b in zip(new, old)):
+        return None
+    it = iter(new)
+    return _RU_WORD.sub(lambda m: next(it), original)
+
+
 def deyo(text: str) -> str:
     return (text or "").replace("ё", "е").replace("Ё", "Е")
 
@@ -242,9 +259,13 @@ def prepare_tts_text(
     text: str,
     stresser: Callable[[str], str] | None = None,
     fmt: str = "plain",
-    yo: bool = True,
+    yo: bool | str = True,
 ) -> tuple[str, str]:
-    """(text_tts, text_plain). ``stresser`` maps normalized text -> '+'-stressed text."""
+    """(text_tts, text_plain). ``stresser`` maps normalized text -> '+'-stressed text.
+
+    ``yo``: False takes every ё back to е; True and "safe" keep the ё the text has (what the stresser added is
+    decided inside the stresser, see ``translate.stress.yo``).
+    """
     norm = normalize_for_tts(text)
     stressed = norm
     if stresser is not None and norm:
@@ -252,9 +273,9 @@ def prepare_tts_text(
             stressed = to_plus_format(stresser(norm) or norm)
         except Exception:
             stressed = norm
-        # a stresser must not change the words; fall back if it did
+        # a stresser must not change the words; keep its marks on the original text if it changed more than the marks
         if deyo(strip_stress(stressed)).lower() != deyo(norm).lower():
-            stressed = norm
+            stressed = graft_stress(norm, stressed) or norm
     if not yo:
         stressed = deyo(stressed)
     text_tts = to_plus_format(stressed) if fmt == "plus" else strip_stress(stressed)

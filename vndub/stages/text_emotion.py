@@ -63,6 +63,7 @@ from vndub.text.delivery import (  # noqa: F401  (load_cues / save_cues are this
     llm_layer,
     load_cues,
     merge_layers,
+    valid_sound,
     rule_pass,
     save_cues,
     scan_cues,
@@ -73,7 +74,7 @@ from vndub.text.delivery import (  # noqa: F401  (load_cues / save_cues are this
 from vndub.util import hash_obj
 
 NAME = "text_emotion"
-VERSION = "2"  # 2: laughter kinds / Latin laughter / delivery.laughter (passports written by version 1 have none)
+VERSION = "3"  # 3: non-speech sounds (delivery.sound); 2: laughter kinds / Latin laughter / delivery.laughter (passports written by version 1 have none)
 CONFIG_SECTIONS = ("text_emotion",)
 
 NARRATOR = "narrator"
@@ -270,9 +271,11 @@ def build_delivery(
     lexicon: Mapping[str, str] | None = None,
     min_confidence: float = 0.6,
     src_lang: str = "auto",
+    llm_sound: Mapping[str, Any] | None = None,
 ) -> Delivery:
-    """rule -> cue -> llm for one line (see :func:`vndub.text.delivery.merge_layers`)."""
-    layers = [rule_pass(line.text_src, tgt_text, lexicon, src_lang), cue_layer(hits), llm_layer(llm_delivery)]
+    """rule -> cue -> llm for one line (see :func:`vndub.text.delivery.merge_layers`). ``llm_sound`` is the ``sound`` the
+    translation record names (the LLM's answer, or translate's own rule result): it joins the llm layer."""
+    layers = [rule_pass(line.text_src, tgt_text, lexicon, src_lang), cue_layer(hits), llm_layer(llm_delivery, llm_sound)]
     return merge_layers(layers, min_confidence)
 
 
@@ -361,9 +364,10 @@ def run(ctx: StageContext) -> dict[str, Any]:
         llm_d = ((rec.model_extra or {}).get("delivery") if (rec is not None and use_llm) else None)
         llm_d = validate_delivery(llm_d, lid) if llm_d else None
         llm_have += llm_d is not None
+        snd = valid_sound((rec.sound if rec is not None else None))
         hits = hits_by_line.get(lid, [])
         key = cache.key(
-            line.text_src, line.speaker_id, tgt_text, llm_d,
+            line.text_src, line.speaker_id, tgt_text, llm_d, *([snd] if snd else []),
             [[h.line_id, h.lang, h.cue, h.confidence] for h in hits],
             window_context(lines, pos_of[lid], te.narration_window, tgt_texts), cues.hash,
             lex_hash, src_lang,
@@ -373,7 +377,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
             cached += 1
             d = Delivery.from_dict(prev.get("delivery") or {})
         else:
-            d = build_delivery(line, hits, tgt_text, llm_d, lexicon, te.min_confidence, src_lang)
+            d = build_delivery(line, hits, tgt_text, llm_d, lexicon, te.min_confidence, src_lang, snd)
             write_json(pp, text_passport(line, d))
             cache.put(lid, key)
             written += 1

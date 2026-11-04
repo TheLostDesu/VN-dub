@@ -34,6 +34,17 @@ says the GPU ran out of memory is treated the same way (``Job.keep``), whether i
 Resume: a route-B candidate stores ``<cid>:tts`` in the stage cache when its pre-VC wav is complete; a rerun whose TTS
 request is unchanged skips the TTS and converts the kept ``.prevc.wav``.
 
+Non-speech sounds (``synth.sounds``, ``configs/sounds.yaml``, ``vndub/text/sounds.py``): "ZZZ...", "Muah!", "Achoo!", ``*yawns*``
+are letters to a TTS. After the laughs, every sound of the text is written the way :func:`vndub.text.sounds.render_for_backend` says
+for the backend (the target language's stand-in spelling, a backend event tag + the spelling, stage directions removed); a stand-in
+never gets stress marks (the pass runs before the acute conversion, marks inside a sound are dropped first). The kind reaches the
+style (``StyleSpec.sound`` + the kind as an event) and the sidecar records ``sound: {kind, n, mode, only, stage}``. A line that is
+nothing but a sound follows ``synth.sounds.only``: ``spell`` (the stand-in, the default), ``sample`` (a recorded clip from
+``synth.sounds.samples`` becomes the one candidate ``sample_P_<k>.wav``, no model; a kind without a clip is spelled, warned once) or
+``silent`` (no candidates; pack lists the line as ``sound_silent``). The record's ``sound`` (written by translate) is read with
+``getattr`` and the regexes are the fallback, so a project translated before the table ("З-З-З...", "Му-ах!") is handled too. Like
+the laughter spelling, the spelled text is part of every candidate key and ``synth.sounds`` is not part of the section hash.
+
 Laughter (``synth.laughter``, ``configs/laughter.yaml``, ``vndub/text/laughter.py``): a written laugh in the text a backend
 gets ("Ха-ха-ха", "Haha", "あはは", a stage direction like ``*laughs*``) is read letter by letter by an LLM-based TTS, so
 after the text variant is picked every laugh is written the way that backend voices as a laugh: the table spelling for the
@@ -68,6 +79,7 @@ from vndub.manifest.io import LineRecord, load_overrides, write_json
 from vndub.stages import genutil as gu
 from vndub.stages.common import StageError
 from vndub.text import laughter as lg
+from vndub.text import sounds as snd
 from vndub.text import ru
 from vndub.text.style_prompt import (
     CALM_BELOW,
@@ -112,6 +124,7 @@ class Job:
     plan: dict[str, Any] | None = None  # tuning_plan(): what master / score still need to know
     options: dict[str, Any] = field(default_factory=dict)
     laughter: dict[str, Any] | None = None  # {kind, n, mode, only, stage}: how the laughs of the text were written for this backend
+    sound: dict[str, Any] | None = None  # {kind, n, mode, only, stage}: how the non-speech sounds of the text were handled
     error: str = ""
     keep: bool = False  # the failure is about the machine (backend unavailable, out of memory): leave wav and sidecar alone
     elapsed: float = 0.0
@@ -241,12 +254,17 @@ def run(ctx: Any) -> dict[str, Any]:
 
     enabled_routes = [r for r, on in sc.routes.items() if on]
     cache = gu.stage_cache(ctx, NAME, VERSION, "synth", "project")  # the project folders are not part of a candidate's key
-    # nor is synth.laughter: its effect (the spelled text, the laugh phrase of the style) is part of every candidate's key already,
+    # nor is synth.laughter (or synth.sounds, same reasoning): its effect (the spelled text, the laugh phrase of the style) is part of every candidate's key already,
     # and a key that moved with the section would regenerate every candidate of a project that has no laughter at all
     cache.rekey(_synth_hash(cfg))
     laughter_table = _laughter_table(ctx) if sc.laughter.enabled else None
     laughter_lines: set[str] = set()
     laughter_modes: Counter[str] = Counter()
+    sounds_table = _sounds_table(ctx) if sc.sounds.enabled else None
+    sound_lines: set[str] = set()
+    sound_modes: Counter[str] = Counter()
+    silent_sound_lines: list[str] = []
+    sample_warned: set[str] = set()
     jobs: list[Job] = []
     orig_jobs: list[tuple[LineRecord, int]] = []
     interjection_lex = _interjections(ctx)
@@ -292,6 +310,16 @@ def run(ctx: Any) -> dict[str, Any]:
             ctx.log.warning("%s: %d sustain continuation line(s) without a usable translation", line.line_id, len(cont_ids) - len(cont))
 
         user_text = set_text is not None and bool(set_text.payload.get("text"))
+        lsound = None if (sounds_table is None or user_text) else line_sound(tr, tr.text_tts or tr.text_tgt, tgt)
+        sound_only = bool(lsound and lsound["only"] and not cont)
+        policy = sc.sounds.only if sound_only else "spell"
+        if policy == "silent":
+            silent_sound_lines.append(line.line_id)
+            _purge_stale(ctx, line.line_id, tkey, set(), drop_all=True)
+            continue
+        sample_clip: Path | None = None
+        if policy == "sample":
+            sample_clip = _sample_clip(ctx, sc.sounds.samples, lsound["kind"], sample_warned)
 
         def texts(plus: bool) -> tuple[str, str]:
             if user_text:
@@ -308,6 +336,16 @@ def run(ctx: Any) -> dict[str, Any]:
         else:
             routes = enabled_routes
         planned: set[Path] = set()
+        if sample_clip is not None:
+            sj = _sample_job(ctx, cache, line, sid, rnd, lsound, sample_clip, sc.sounds.samples[lsound["kind"]], tr, tgt, spec)
+            planned.add(sj.out)
+            jobs.append(sj)
+            sound_lines.add(line.line_id)
+            sound_modes[sj.sound["mode"]] += 1
+            if interj and sc.keep_original_for_interjections and line.src_wav and not list(ctx.paths.synth_dir(line.line_id).glob("orig_orig_*.wav")):
+                orig_jobs.append((line, rnd))
+            _purge_stale(ctx, line.line_id, tkey, planned, drop_all=True)
+            continue
         if interj and sc.keep_original_for_interjections and line.src_wav and not list(ctx.paths.synth_dir(line.line_id).glob("orig_orig_*.wav")):
             orig_jobs.append((line, rnd))
 
@@ -341,9 +379,16 @@ def run(ctx: Any) -> dict[str, Any]:
                 spec_b, laugh = spec, None
                 if laughter_table is not None and not user_text:
                     text, spec_b, laugh = _laughter_for(lg.unstress_laughs(text), tgt, bname, caps, laughter_table, spec, tuning)
+                sound = None
+                if sounds_table is not None and not user_text:
+                    text, plain, spec_b, sound = _sounds_for(_unstress_sounds(text), plain, tgt, bname, sounds_table, spec_b, lsound)
                 if stress == "acute" and tgt == "ru" and not user_text:
                     text = ru.to_acute_format(text)
-                rendered = render(spec_b, caps, bopts, cross_lingual=(route == "A"), laughter_inline=bool(laugh) and laugh["mode"].startswith(("inline", "tag")))
+                rendered = render(spec_b, caps, bopts, cross_lingual=(route == "A"), laughter_inline=bool(laugh) and laugh["mode"].startswith(("inline", "tag")),
+                                  sound_inline=bool(sound) and sound["mode"].startswith(("inline", "tag")))
+                if sound:
+                    sound_lines.add(line.line_id)
+                    sound_modes[sound["mode"]] += 1
                 if laugh:
                     rendered["laughter"] = laugh["mode"]
                     laughter_lines.add(line.line_id)
@@ -412,7 +457,7 @@ def run(ctx: Any) -> dict[str, Any]:
                     job = Job(
                         line_id=line.line_id, speaker_id=sid, backend=bname, route=route, k=k, round=rnd, seed=seed,
                         text=text_used, text_plain=plain, text_variant=variant if set_text is None else "override",
-                        style=spec_b, rendered=rendered, item=item, out=out, vc=vc, options=options, tuning=tkey, plan=plan, laughter=laugh,
+                        style=spec_b, rendered=rendered, item=item, out=out, vc=vc, options=options, tuning=tkey, plan=plan, laughter=laugh, sound=sound,
                     )
                     parts: list[Any] = [
                         text_used, spec_b.to_dict(), {k2: v2 for k2, v2 in rendered.items() if k2 != "laughter"},
@@ -429,6 +474,7 @@ def run(ctx: Any) -> dict[str, Any]:
 
     # ---- execute ------------------------------------------------------------
     todo = [j for j in jobs if not cache.fresh(j.cid, j.cache_key, [j.out])]
+    samples_todo = [j for j in todo if j.backend == "sample"]
     todo_ids = {j.cid for j in todo}
     summary["cached"] = len(jobs) - len(todo)
     # route B: the pre-VC audio of an interrupted run is complete (its ``:tts`` entry is written when the file was) and
@@ -455,8 +501,14 @@ def run(ctx: Any) -> dict[str, Any]:
         unavailable[label] = reason
         ctx.log.error("synth: backend %s (route %s) cannot be used: %s", label, ", ".join(routes), reason)
 
+    for j in samples_todo:  # recorded clips: no model, no VRAM
+        _render_sample(j)
+        _finish(ctx, cache, j)
+        progress(j.line_id)
     groups: dict[tuple[str, str], list[Job]] = {}
     for j in todo:
+        if j.backend == "sample":
+            continue
         if j.cid not in tts_done:
             groups.setdefault((j.backend, j.options.get("lora", "")), []).append(j)
             if j.route == "B":
@@ -607,6 +659,10 @@ def run(ctx: Any) -> dict[str, Any]:
     summary["round"] = max(rounds, default=0)
     if laughter_lines:
         summary["laughter"] = {"lines": len(laughter_lines), "modes": dict(laughter_modes.most_common())}
+    if sound_lines or silent_sound_lines:
+        summary["sounds"] = {"lines": len(sound_lines), "modes": dict(sound_modes.most_common()), "silent": len(silent_sound_lines)}
+        if silent_sound_lines:
+            ctx.log.info("synth: %d line(s) are only a sound and are left silent (synth.sounds.only: silent)", len(silent_sound_lines))
     if unavailable:
         summary["unavailable"] = unavailable
     if skipped_routes:
@@ -640,11 +696,11 @@ class _Progress:
 
 
 def _synth_hash(cfg: Any) -> str:
-    """``gu.stable_section_hash(cfg, "synth", "project")`` without ``synth.laughter`` (see the module docstring)."""
+    """``gu.stable_section_hash(cfg, "synth", "project")`` without ``synth.laughter`` and ``synth.sounds`` (see the module docstring)."""
     dump = cfg.model_dump(mode="json", by_alias=True)
     synth_d = dump.get("synth")
     if isinstance(synth_d, dict):
-        synth_d = {k: v for k, v in synth_d.items() if k != "laughter"}
+        synth_d = {k: v for k, v in synth_d.items() if k not in ("laughter", "sounds")}
     project_d = dump.get("project")
     if isinstance(project_d, dict):
         project_d = {k: v for k, v in project_d.items() if k not in gu.PROJECT_PATH_KEYS}
@@ -685,6 +741,151 @@ def _laughter_for(
     return new_text, spec_b, rec
 
 
+def _sounds_table(ctx: Any) -> dict[str, Any] | None:
+    """``configs/sounds.yaml`` (``synth.sounds.table``); ``None`` (sounds are left as written) when the file is missing."""
+    path = ctx.cfg.resolve(ctx.cfg.synth.sounds.table)
+    try:
+        return snd.load_table(path)
+    except FileNotFoundError:
+        ctx.log.warning("sounds table %s not found: non-speech sounds are sent to the TTS as written", path)
+        return None
+    except ValueError as e:
+        raise StageError(f"sounds table is invalid: {e}") from e
+
+
+def line_sound(tr: Any, text: str, lang: str = "auto") -> dict[str, Any] | None:
+    """The non-speech sound of a line as ``{kind, n, only, stage}`` (``None`` = the line has none).
+
+    The regexes read the text (a project translated before the sounds table still carries "З-З-З..." / "Му-ах!", which they
+    find); when they find nothing but the translation record's ``sound`` (written by translate from the LLM's answer) says the
+    line is only a sound, that names the kind. Shared by synth, score and pack, so all three agree on which lines are sound-only.
+    """
+    found = snd.find_sounds(text or "", lang)
+    if found:
+        s = snd.summarize(text, lang, found) or {}
+        return {"kind": s.get("kind"), "n": s.get("n", len(found)), "only": bool(s.get("only")), "stage": bool(s.get("stage"))}
+    hint = getattr(tr, "sound", None)
+    if isinstance(hint, dict) and hint.get("only") and hint.get("kind") in snd.KINDS:
+        return {"kind": hint["kind"], "n": 1, "only": True, "stage": bool(hint.get("stage"))}
+    return None
+
+
+def silent_sound_line(cfg: Any, tr: Any, line: Any = None) -> bool:
+    """Does synth leave this line without candidates on purpose (``synth.sounds.only: silent`` and the line is only a sound)?
+
+    Score and pack ask the same question synth answered: such a line is neither a failure nor a review item.
+    """
+    so = cfg.synth.sounds
+    if not so.enabled or so.only != "silent" or tr is None or not _usable(tr):
+        return False
+    if line is not None and (line.model_extra or {}).get("sustain_lines"):
+        return False
+    s = line_sound(tr, tr.text_tts or tr.text_tgt)
+    return bool(s and s["only"])
+
+
+def _unstress_sounds(text: str) -> str:
+    """``text`` without the stress marks inside its sounds (the stresser marks "Хр-р-р" like a word and the patterns miss it then)."""
+    t = text or ""
+    marks = [m.start() for m in lg._PLUS_MARK.finditer(t)]
+    if not marks:
+        return t
+    found = snd.find_sounds(lg._PLUS_MARK.sub("", t))
+    drop = {p for i, p in enumerate(marks) if any(s.start <= p - i < s.end or (t[p] == "́" and p - i == s.end) for s in found)}
+    return "".join(ch for i, ch in enumerate(t) if i not in drop)
+
+
+# one written sound per kind (the pattern of vndub.text.sounds finds exactly this one): rendering it gives the stand-in once
+_PROBE = {
+    "snore": "zzz", "kiss": "muah", "yawn": "yawn", "gasp": "gasp", "sneeze": "achoo", "cough": "ahem", "hum": "mmm", "hmph": "hmph",
+    "shiver": "brrr", "eat": "nom nom",
+}
+
+
+def _sounds_for(
+    text: str, plain: str, tgt: str, backend: str, table: dict[str, Any], spec: StyleSpec, line: dict[str, Any] | None,
+) -> tuple[str, str, StyleSpec, dict[str, Any] | None]:
+    """The TTS text with its non-speech sounds written for ``backend``, the CER reference to match and the StyleSpec that knows them.
+
+    Returns ``(text, plain, spec, record)``; ``record`` = ``{kind, n, mode, only, stage}`` (``None``: no sound, everything comes
+    back as it went in). A line that is only a sound (``line``: regexes, or the translation record's ``sound`` when they find
+    nothing) becomes the target language's spelling of its kind as a whole.
+    """
+    if line and line.get("only") and line.get("kind") in _PROBE:
+        # the line is only a sound: its text is the stand-in, built from ONE sound of that kind so that a spelling the patterns
+        # match twice ("Хр-р-р... хр-р-р...") is not rendered again on top of itself
+        new_text, rec = snd.render_for_backend(_PROBE[line["kind"]], tgt, backend, table)
+        if rec is None:
+            return text, plain, spec, None
+        rec = {**rec, "kind": line["kind"], "only": True, "stage": bool(line.get("stage"))}
+        new_plain = snd.render_for_backend(_PROBE[line["kind"]], tgt, "", table)[0]
+    else:
+        found = snd.find_sounds(text, "auto")
+        if not found:
+            return text, plain, spec, None
+        new_text, rec = snd.render_for_backend(text, tgt, backend, table, found)
+        new_plain = snd.render_for_backend(plain, tgt, "", table)[0] if snd.has_sound(plain) else plain
+    if rec is None:
+        return text, plain, spec, None
+    spec_b = StyleSpec.from_dict(spec.to_dict())
+    spec_b.sound = {"kind": rec["kind"], "n": rec.get("n", 1), "only": bool(rec.get("only")), "stage": bool(rec.get("stage"))}
+    if rec["kind"] not in spec_b.events:
+        spec_b.events = [*spec_b.events, rec["kind"]]
+    return new_text, new_plain, spec_b, rec
+
+
+def _sample_clip(ctx: Any, samples: dict[str, str], kind: str, warned: set[str]) -> Path | None:
+    """The recorded clip for ``kind`` (``synth.sounds.samples``), or ``None`` (the line is spelled instead; warned once per kind)."""
+    raw = samples.get(kind)
+    if not raw:
+        reason = f"no clip configured for {kind!r} in synth.sounds.samples"
+    else:
+        p = ctx.cfg.resolve(raw)
+        if Path(p).is_file():
+            return Path(p)
+        reason = f"clip {p} not found"
+    if kind not in warned:
+        warned.add(kind)
+        ctx.log.warning("synth.sounds.only is sample, but %s: lines that are only a %s are spelled instead", reason, kind)
+    return None
+
+
+def _sample_job(
+    ctx: Any, cache: Any, line: LineRecord, sid: str, rnd: int, lsound: dict[str, Any], clip: Path, configured: str, tr: Any, tgt: str,
+    spec: StyleSpec,
+) -> Job:
+    """The single candidate of a sound-only line whose sound is a recorded clip (backend ``sample``, route ``P``): no model runs."""
+    k = rnd * 100
+    out = ctx.paths.candidate(line.line_id, "sample", "P", k)
+    spelled = (tr.text_tts or tr.text_tgt or "").strip()
+    rec = {"kind": lsound["kind"], "n": lsound.get("n", 1), "mode": f"sample:{configured}", "only": True, "stage": bool(lsound.get("stage"))}
+    spec_s = StyleSpec.from_dict(spec.to_dict())
+    spec_s.sound = {k2: rec[k2] for k2 in ("kind", "n", "only", "stage")}
+    item = {"id": f"{line.line_id}|sample|P|{k}", "text": spelled, "lang": tgt, "out": str(out), "clip": str(clip)}
+    job = Job(
+        line_id=line.line_id, speaker_id=sid, backend="sample", route="P", k=k, round=rnd, seed=0, text=spelled, text_plain="",
+        text_variant="sound", style=spec_s, rendered={"instruct": None, "text_prefix": "", "knobs": {}, "style_prompt": f"recorded sample: {configured}"},
+        item=item, out=out, sound=rec,
+    )
+    job.cache_key = cache.key("sample", lsound["kind"], clip.name, tgt, files=[str(clip)])
+    return job
+
+
+def _render_sample(j: Job) -> None:
+    """The clip of ``j.item["clip"]`` as the candidate wav: mono, at the clip's own sample rate (master resamples)."""
+    from vndub.audio import features
+
+    t0 = time.perf_counter()
+    try:
+        y, sr = features.load(j.item["clip"], mono=True)
+        if not len(y):
+            raise ValueError("the clip is empty")
+        features.save(j.out, y, sr)
+    except Exception as e:
+        j.error = f"sample clip {j.item['clip']}: {e}"
+    j.elapsed = time.perf_counter() - t0
+
+
 def _base_style(passport: dict[str, Any], stats: dict[str, Any], notes: str, cfg: Any) -> StyleSpec:
     """The line's StyleSpec before tuning: built from an audio passport; taken as is from a text passport
     (``source: "text"``, written by ``text_emotion``); neutral when there is no passport."""
@@ -697,14 +898,17 @@ def _base_style(passport: dict[str, Any], stats: dict[str, Any], notes: str, cfg
     return build_style(passport, stats, notes, cfg.analyze.e2v_weight, cfg.analyze.anime_weight, cfg.analyze.caption)
 
 
-def _purge_stale(ctx: Any, line_id: str, tkey: dict[str, Any] | None, planned: set[Path]) -> None:
+def _purge_stale(ctx: Any, line_id: str, tkey: dict[str, Any] | None, planned: set[Path], drop_all: bool = False) -> None:
     """Delete candidates rendered under another tuning that this run does not regenerate in place
-    (e.g. extra regen-round candidates): they would compete with the tuned ones in score."""
+    (e.g. extra regen-round candidates): they would compete with the tuned ones in score.
+
+    A recorded sample (``sample_*``) that this run does not plan is stale too (the line is spoken again), and with ``drop_all``
+    (a sound line that is left silent, or replaced by a sample) so is every synthesized take."""
     for wav, side in gu.candidate_files(ctx, line_id):
         if side is None or side.route == "orig" or wav in planned:
             continue
         old = ((side.params or {}).get("tuning") or {}).get("values")
-        if old == tkey:
+        if old == tkey and not drop_all and side.backend != "sample":
             continue
         for p in (wav, wav.with_suffix(".json"), wav.with_name(wav.stem + ".prevc.wav")):
             p.unlink(missing_ok=True)
@@ -844,6 +1048,8 @@ def _finish(ctx: Any, cache: Any, j: Job) -> None:
         data["pre_vc_wav"] = ctx.paths.rel(j.prevc)
     if j.laughter:
         data["laughter"] = j.laughter
+    if j.sound:
+        data["sound"] = j.sound
     if j.error:
         # this run tried to generate this very item and it failed on its own: a wav of an earlier request would be stale
         data["error"] = j.error

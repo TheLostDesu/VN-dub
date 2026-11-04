@@ -40,6 +40,15 @@ characters:
     age_hint: teen
     notes: "shy, quiet"
 
+# The player: the protagonist the characters address as "you" (darling, dear ...). Its gender decides grammatical agreement of the words said
+# to or about the player (ru: "ty vernulsya, dorogoi" for m, "ty vernulas, dorogaya" for f). m | f | unknown (unknown: wordings that do not reveal it,
+# the masculine when impossible).
+player:
+  name: ""
+  gender: unknown
+  notes: ""
+
+# Proper nouns the model should spell one way. The names pass (translate.names_pass) adds the ones it finds with notes "auto"; a term written here wins.
 terms:
   - {src: 放課後, tgt: после уроков}
   - {src: 校門, tgt: школьные ворота}

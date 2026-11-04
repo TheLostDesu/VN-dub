@@ -1,0 +1,77 @@
+# Non-speech sounds for the TTS (stage `synth`, config `synth.sounds`; the sibling of laughter.yaml).
+#
+# A text-to-speech model reads "ZZZ..." as "зэ-зэ-зэ" and "Muah!" as a word, because written onomatopoeia is just letters to
+# it. Before a line is sent to the TTS, synth finds every non-speech sound in it (vndub/text/sounds.py: zzz / хр-р-р / ぐーぐー,
+# muah / чмок / ちゅっ, achoo / апчхи, ahem / кхе-кхе, hmph, brrr, nom nom ... and bracketed stage directions like *yawns*,
+# (храпит), （あくび）) and writes it the way this table says for the TARGET language of the project. The translate LLM may also
+# name the kind of a line ("sound" in its answer); the regexes here are the deterministic fallback.
+#
+# What a voice model can really do with a sound is limited: no model snores on request. The spelling below is a stand-in
+# that a text-trained TTS has met in chats and subtitles; a model with an event tag (Fish, Higgs) gets the tag. For a line
+# that is NOTHING but a sound ("ZZZ...", "Muah!") the config decides: synth.sounds.only = spell (this table) | sample
+# (a recorded clip from synth.sounds.samples, by kind) | silent (the line is left out of the patch and listed as such).
+#
+# Kinds: snore, kiss, yawn, gasp, sneeze, cough, hum, hmph, shiver, eat. `any` = every kind without an entry of its own.
+# `stage: remove` (default): a stage direction is dropped from the spoken text; `respell`: it is spoken as the sound.
+
+stage: remove
+
+ru:
+  snore:  "Хр-р-р... хр-р-р..."
+  kiss:   "Чмок!"
+  yawn:   "А-а-ах..."
+  gasp:   "Ах!"
+  sneeze: "Апчхи!"
+  cough:  "Кхе-кхе."
+  hum:    "М-м-м."
+  hmph:   "Хм!"
+  shiver: "Бр-р-р!"
+  eat:    "Ням-ням."
+
+en: &en
+  snore:  "Zzz... zzz..."
+  kiss:   "Mwah!"
+  yawn:   "Yaaawn..."
+  gasp:   "Gasp!"
+  sneeze: "Achoo!"
+  cough:  "Ahem."
+  hum:    "Mmm."
+  hmph:   "Hmph!"
+  shiver: "Brrr!"
+  eat:    "Nom nom."
+
+ja:
+  snore:  "ぐーぐー……"
+  kiss:   "ちゅっ"
+  yawn:   "ふぁ〜あ……"
+  gasp:   "はっ！"
+  sneeze: "ハクション！"
+  cough:  "ごほごほ。"
+  hum:    "んー。"
+  hmph:   "ふん！"
+  shiver: "ぶるぶる……"
+  eat:    "もぐもぐ。"
+
+default: *en
+
+# Per backend (the key is the backend name from `vndub models list`):
+#   mode      respell | inline | tag | keep   inline = the token REPLACES the written sound; tag = the token goes BEFORE the
+#             spelled sound; keep = leave the written sound as it is (stage directions still follow `stage`)
+#   tokens    {kind: token}   token  one token for every kind   spelling  the language of the table used next to a tag
+#   stage     remove | respell (overrides the top-level `stage` for this backend)
+# A kind without a token under inline / tag falls back to the spelling.
+backends:
+  # CosyVoice3 knows [breath] and [laughter] only: spellings.
+  cosyvoice3: {mode: respell}
+  # Qwen3-TTS Base ignores instruct and has no event tokens: spellings.
+  qwen3_tts: {mode: respell}
+  chatterbox_ml: {mode: respell}
+  # Fish Audio S2: free-form bracket tags anywhere in the text (docs.fish.audio lists (laughing), (sighing), (panting) ...;
+  # the ones below are the same shape and untested by ear). The tag goes before the spelled sound.
+  fish_s2:
+    mode: tag
+    tokens: {snore: "[snoring]", kiss: "[kissing]", yawn: "[yawning]", gasp: "[gasping]", sneeze: "[sneezing]", cough: "[coughing]", hum: "[humming]", shiver: "[shivering]", eat: "[eating]"}
+  # Higgs Audio v3: <|sfx:...|> tags; the model card names laughter, crying, sigh and cough. The rest is spelled.
+  higgs_tts3:
+    mode: tag
+    tokens: {cough: "<|sfx:cough|>"}

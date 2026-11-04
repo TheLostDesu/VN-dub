@@ -95,6 +95,32 @@ or newer, and no other script may bind F8 (set another `key`); a game that was r
 to be restarted. The script has not been run in a real Ren'Py on the build machine: if the game reports an error in
 `vndub_voice_mix.rpy` (`traceback.txt`, `log.txt`), delete the two files above and report the text.
 
+**Ren'Py: the voice is in the dub's language but the text on screen is not** — patches made before 1.1.0 carried only
+voice. Pack and install again with 1.1.0: the patch then holds `game/tl/<language>/vndub_dialogue.rpy` and
+`game/vndub_language.rpy` (see ENGINES.md, "The translated text"), and the game starts in that language. A project
+imported by an older version must be imported again first (the Game step says so), and a project translated before 1.1.0
+is translated once more (menu choices and narration are new). Lines that stay in the original language are listed under
+`text.skipped` in `out/renpy/manifest_patch.json` with the reason. If the game reports a "duplicate" error after the
+install, the game already translates that language: delete the two files and report the text. To undo by hand delete
+`game/vndub_language.rpy`, `game/tl/<language>/vndub_dialogue.rpy` and their `.rpyc` twins.
+
+**A laugh is read letter by letter ("э-хе-хе-хе"), or a word gets a wrong stress / ё** — since 1.1.0 Russian laughs
+written "Эхехе", "Ихихи", "Уфуфу", "Кукуку" are detected (tune the spellings in `configs/laughter.yaml`, `ru` block:
+the coy laugh is "Эхехе..."), ruaccent's bare words are marked from its dictionary, and `translate.stress.yo: safe`
+adds ё only to words that exist only with ё ("по небу" stays, "насчёт" gets its ё). The translation model is asked to
+write ё itself; a word it wrote without ё and that ruaccent cannot decide stays as written. Takes made before 1.1.0 keep
+their old text until the line is voiced again.
+
+**"ZZZ..." is read as letters, "Muah!" as a word** — no voice model snores or kisses on request. Since 1.1.0 a line that is
+(or contains) a non-speech sound is found by the translation model and by the rules in `vndub/text/sounds.py` (zzz /
+хр-р-р, muah / чмок, achoo / апчхи, ahem / кхе-кхе, hmph, brrr, nom nom, `*yawns*` ...) and written for the voice the way
+`configs/sounds.yaml` says for the dub's language ("Хр-р-р... хр-р-р...", "Чмок!"); Fish and Higgs also get their event
+tag. For a line that is nothing but a sound choose in the project's `pipeline.yaml`: `synth.sounds.only: spell` (the
+stand-in, default), `sample` (a recorded clip of yours per kind, `synth.sounds.samples: {snore: path/to/snore.wav}`,
+the only way to get a real snore) or `silent` (the line is left out of the patch and listed under `left_out_reasons`).
+A project translated before 1.1.0 keeps its old text ("З-З-З...") in the translation file, but synth still recognises
+it as a snore and voices the stand-in.
+
 **Many lines in `review` after `link`** — check `work/review_queue.jsonl`. Typical causes:
 BGM under the voice (ASR fails), names spelled differently in the script, a wrong
 `engine_opts.kag.voice_attr`. Raising `link.review_score` only hides the problem.

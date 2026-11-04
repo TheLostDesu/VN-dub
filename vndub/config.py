@@ -226,7 +226,8 @@ class LlmOpts(_Section):
 class StressOpts(_Section):
     tool: str = "ruaccent"  # ruaccent | none
     model: str = "turbo"
-    yo: bool = True
+    # safe = ruaccent adds ё only to words that exist only with ё; true = also guesses for e/ё homographs (небо/нёбо); false = no ё
+    yo: bool | Literal["safe"] = "safe"
     # plus = "+" before the stressed vowel (F5-TTS_RUSSIAN); plain = no marks
     format: Literal["auto", "plus", "plain"] = "auto"
 
@@ -246,6 +247,15 @@ class TranslateSection(_Section):
     # auto (default) = on only when synth.voice_unvoiced is on (the app; the CLI keeps voiced lines only)
     # | on = always translate speaker lines without audio too | off = voiced lines only.
     include_unvoiced: Literal["auto", "on", "off"] = "auto"
+    # Names pass: before the first batch the LLM is asked ONCE for the canonical target spelling of the proper nouns the script
+    # uses (places, people who are no characters, ...); the answers become glossary terms (note "auto") for the lines that
+    # contain them. A term the user wrote is never overwritten. Cached like the scene summaries. false = skip.
+    names_pass: bool = True
+    # Narration (lines of the narrator without a voice) is translated too, as TEXT ONLY: it gives the model context and feeds
+    # the Ren'Py text patch, but is never synthesized / scored / mastered. auto = on when the engine is renpy and
+    # pack.renpy.text.enabled is not false | on | off. Menu choices (record flag `menu`) follow: translated when this resolves to
+    # on or the engine is renpy.
+    include_narration: Literal["auto", "on", "off"] = "auto"
 
 
 # ----------------------------------------------------------------------------
@@ -331,6 +341,16 @@ class LaughterOpts(_Section):
     table: str = "configs/laughter.yaml"  # spelling per language and laugh kind, backend overrides
 
 
+class SoundsOpts(_Section):
+    """How synth handles written non-speech sounds (``vndub.text.sounds``): "ZZZ...", "Muah!", "*yawns*" are not read letter by
+    letter. ``only`` decides what happens to a line that is nothing but such a sound."""
+
+    enabled: bool = True
+    table: str = "configs/sounds.yaml"  # stand-in spelling per language and sound kind, backend tags
+    only: Literal["spell", "sample", "silent"] = "spell"
+    samples: dict[str, str] = Field(default_factory=dict)  # sound kind -> recorded clip (for only: sample)
+
+
 class SynthSection(_Section):
     n_candidates: int = 4
     n_candidates_short: int = 6
@@ -346,6 +366,7 @@ class SynthSection(_Section):
     # narration is never dubbed). CLI default off; the desktop app turns it on.
     voice_unvoiced: bool = False
     laughter: LaughterOpts = Field(default_factory=LaughterOpts)
+    sounds: SoundsOpts = Field(default_factory=SoundsOpts)
 
 
 class Gates(_Section):

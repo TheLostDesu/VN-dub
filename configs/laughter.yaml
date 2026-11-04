@@ -28,7 +28,9 @@ ru:
   chuckle: {short: "Хехе",         long: "Хехехе"}
   giggle:  {short: "Хихи",         long: "Хихихи"}
   evil:    {short: "Муахаха!",     long: "Муахахаха!"}
-  nervous: {short: "Ахаха...",     long: "Ахахаха..."}
+  # nervous = the sheepish / coy "эхехе" (also a "ха-ха" that trails into "..."): spelled as the "ehehe" laugh, not as "ахаха...".
+  # A by-ear lever: put "Ахаха..." back here if the voices read the trailing laugh better that way.
+  nervous: {short: "Эхехе...",     long: "Эхехехе..."}
   snort:   {short: "Пфф",          long: "Пффф"}
 
 en: &en

@@ -361,6 +361,7 @@ def default_app_state() -> dict[str, Any]:
             "import_path": "",
             "honorifics": "drop",      # drop | keep | adapt
             "address_default": "ты",   # ты | вы
+            "player_gender": "unknown",  # m | f | unknown: the protagonist the characters address as "you" (missing in old files = unknown)
         },
         "advanced": {"asr_check": False},
         "config_overrides": {},        # dotted key -> value, applied to pipeline.yaml

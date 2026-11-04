@@ -206,6 +206,12 @@ def test_04_translation_settings_roundtrip(flow: Flow) -> None:
     sids = {sid for sid in gl["characters"]}
     assert {"sakura", "haruto", "yui", "hero"} <= sids and "narrator" not in sids
     assert all(gl["address_matrix"][sid]["default"] == "вы" for sid in sids)
+    # the protagonist: unknown until the user says (an app_state written before the key existed reads the same), then the glossary follows
+    assert t["player_gender"] == "unknown" and gl["player"]["gender"] == "unknown"
+    t = flow.put("/api/project/translation", {"player_gender": "f"})
+    gl = yaml.safe_load((flow.data / "projects" / flow.slug / "glossary.yaml").read_text(encoding="utf-8"))
+    assert t["player_gender"] == "f" and gl["player"] == {"name": "", "notes": "", "gender": "f"}
+    flow.put("/api/project/translation", {"player_gender": "unknown"})
     cfg = yaml.safe_load((flow.data / "projects" / flow.slug / "pipeline.yaml").read_text(encoding="utf-8"))
     assert cfg["license_policy"] == "commercial" and cfg["link"]["mode"] == "asr"
     assert cfg["synth"]["n_candidates"] == 3 and cfg["synth"]["n_candidates_short"] == 5 and cfg["synth"]["routes"]["B"] is False
@@ -225,7 +231,7 @@ def test_04_translation_settings_roundtrip(flow: Flow) -> None:
 def test_05_translation_settings_validation(flow: Flow) -> None:
     flow.needs("import")
     bad = [
-        {"tgt_lang": "de"}, {"src_lang": "xx"}, {"source": "magic"}, {"honorifics": "x"}, {"address_default": "ну"}, {"license_policy": "free"},
+        {"tgt_lang": "de"}, {"src_lang": "xx"}, {"source": "magic"}, {"honorifics": "x"}, {"address_default": "ну"}, {"player_gender": "x"}, {"license_policy": "free"},
         {"advanced": {"n_candidates": 0}}, {"advanced": {"n_candidates": 99}}, {"advanced": {"n_candidates": "many"}},
         {"advanced": {"routes": {"Z": True}}}, {"advanced": {"routes": {"A": False, "B": False, "C": False}}}, {"advanced": {"backends": [{"name": "nope", "enabled": True}]}},
     ]

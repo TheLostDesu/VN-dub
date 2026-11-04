@@ -806,7 +806,7 @@ def test_preview_import_errors_are_stage_errors(make_ctx, tmp_path):
 
 @requires_ffmpeg
 def test_mixed_renpy_mini_fixture(make_ctx):
-    ctx = make_ctx(FIXTURES / "renpy_mini", sets={"synth.voice_unvoiced": True}, copy_project=True)  # app config: unvoiced speaker lines are translated
+    ctx = make_ctx(FIXTURES / "renpy_mini", sets={"synth.voice_unvoiced": True, "translate.include_narration": "off"}, copy_project=True)  # app config: unvoiced speaker lines are translated  # narration off: Ren'Py would translate it as text-only lines by default (translate.include_narration: auto)
     for st in ("detect", "extract", "parse"):
         run_stage(st, ctx)
     lines = ctx.lines()
@@ -839,7 +839,7 @@ def test_mixed_renpy_mini_fixture(make_ctx):
     run_stage("translate", ctx)
     recs = {r.line_id: r for r in read_jsonl(ctx.paths.translation("ru"), TranslationRecord)}
     assert {lid for lid, r in recs.items() if _delivery_of(r)} == {l.line_id for l in hero.values()}
-    assert all(l.line_id in recs for l in hero.values()) and not any(l.line_id in recs for l in lines if l.speaker_id == "narrator")
+    assert all(l.line_id in recs for l in hero.values()) and not any(l.line_id in recs for l in lines if l.speaker_id == "narrator" and not ({"menu", "menu_caption"} & set(l.flags)))  # menus are game text, translated for the text patch
     s2 = run_stage("text_emotion", ctx)
     assert s2["written"] >= 1 and s2["layers"].get("llm", 0) >= 1
     assert run_stage("text_emotion", ctx)["written"] == 0

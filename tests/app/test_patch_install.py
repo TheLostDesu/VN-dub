@@ -550,3 +550,69 @@ def test_patch_files_helper_skips_metadata_and_temp_folders(tmp_path: Path) -> N
         p.write_bytes(b"x")
     assert [p.relative_to(tmp_path).as_posix() for p in patch_install.patch_files(tmp_path)] == ["game/a.ogg"]
     assert patch_install.patch_files(tmp_path / "missing") == []
+
+
+# ---- the Ren'Py translated-text patch (game/tl/<language>/vndub_dialogue.rpy) ------------------------------------------------
+
+TEXT_RPY = "game/tl/russian/vndub_dialogue.rpy"
+TEXT_PATCH = {**PATCH, TEXT_RPY: b"# generated\ntranslate russian start_1:\n\n    e \"x\"\n", "game/vndub_language.rpy": b"define config.language = 'russian'\n"}
+
+
+def write_text_block(patch: Path, value: Any) -> None:
+    f = patch / "manifest_patch.json"
+    data = json.loads(f.read_text(encoding="utf-8"))
+    data["text"] = value
+    f.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_text_manifest_adds_the_text_note(renpy: tuple[Any, Path, Path]) -> None:
+    h, _, patch = renpy
+    c = client_for(patch_install)
+
+    def notes() -> list[dict[str, Any]]:
+        return c.get(f"/api/install/plan?slug={h.slug}").json()["notes"]
+
+    assert notes() == []  # no text block (older build)
+    write_text_block(patch, {"rpy": TEXT_RPY, "language": "russian", "lines": 224, "strings": 9, "skipped": [], "enabled": True})
+    assert notes() == [{"key": "install.note.text_patch", "params": {"language": "russian", "lines": 224}}]
+    for off in (None, {}, {"rpy": TEXT_RPY, "language": "russian", "lines": 3, "enabled": False}, "russian"):
+        write_text_block(patch, off)
+        assert notes() == [], off
+    write_voice_mix(patch, {"rpy": "game/vndub_voice_mix.rpy", "key": "F8", "enabled": True})
+    write_text_block(patch, {"language": "russian", "lines": 2, "enabled": True})
+    assert [n["key"] for n in notes()] == ["install.note.voice_mix", "install.note.text_patch"]  # after the voice note
+
+
+def test_text_note_has_a_message_in_both_languages() -> None:
+    root = Path(patch_install.__file__).resolve().parents[1] / "app" / "i18n"
+    for lang in ("ru", "en"):
+        msgs = json.loads((root / f"{lang}.json").read_text(encoding="utf-8"))
+        assert "{language}" in msgs["install.note.text_patch"] and "{lines}" in msgs["install.note.text_patch"]
+
+
+def test_nested_tl_folder_is_installed_and_rolled_back_with_its_compiled_twin(o_env: Path, tmp_path: Path) -> None:
+    """``game/tl/russian/`` does not exist in the game: the install creates the folders, rollback removes the script, its ``.rpyc`` and the folders."""
+    h, game, _patch = make_game_project(tmp_path, engine="renpy", game_files=GAME, patch_files=TEXT_PATCH)
+    c = client_for(patch_install)
+    res = run(c, "/api/install/apply", h.slug, backup=True)["result"]
+    g = game / "game"
+    assert (g / "tl" / "russian" / "vndub_dialogue.rpy").read_bytes() == TEXT_PATCH[TEXT_RPY] and (g / "vndub_language.rpy").exists()
+    (g / "tl" / "russian" / "vndub_dialogue.rpyc").write_bytes(b"RENPY RPC2 text")  # what Ren'Py leaves after a run
+    (g / "vndub_language.rpyc").write_bytes(b"RENPY RPC2 lang")
+    back = run(c, "/api/install/rollback", h.slug, backup_id=res["backup_id"])
+    assert back["state"] == "done", back.get("error")
+    assert not (g / "tl").exists() and not (g / "vndub_language.rpy").exists() and not (g / "vndub_language.rpyc").exists()
+    assert tree_snapshot(game) == dict(GAME)
+
+
+def test_tl_folder_the_game_already_has_keeps_its_other_files(o_env: Path, tmp_path: Path) -> None:
+    other = b"translate russian strings:\n    old 'A'\n    new 'B'\n"
+    h, game, _patch = make_game_project(
+        tmp_path, engine="renpy", game_files={**GAME, "game/tl/russian/common.rpy": other, "game/tl/russian/common.rpyc": b"RENPY RPC2 c"}, patch_files=TEXT_PATCH
+    )
+    c = client_for(patch_install)
+    res = run(c, "/api/install/apply", h.slug, backup=True)["result"]
+    back = run(c, "/api/install/rollback", h.slug, backup_id=res["backup_id"])
+    assert back["state"] == "done", back.get("error")
+    t = game / "game" / "tl" / "russian"
+    assert sorted(p.name for p in t.iterdir()) == ["common.rpy", "common.rpyc"] and (t / "common.rpy").read_bytes() == other

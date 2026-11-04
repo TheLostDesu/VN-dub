@@ -285,6 +285,19 @@ export default function TranslateScreen() {
         />
 
         <RadioGroup
+          name="tr-player"
+          legend={t("translate.player")}
+          value={tr.player_gender ?? "unknown"}
+          onChange={(v) => updateTr({ player_gender: v as TranslationSettings["player_gender"] })}
+          testid="translate-player"
+          options={[
+            { value: "m", label: t("translate.player.m"), hint: t("translate.player.m_hint"), testid: "player-m" },
+            { value: "f", label: t("translate.player.f"), hint: t("translate.player.f_hint"), testid: "player-f" },
+            { value: "unknown", label: t("translate.player.unknown"), hint: t("translate.player.unknown_hint"), testid: "player-unknown" },
+          ]}
+        />
+
+        <RadioGroup
           name="tr-license"
           legend={t("translate.license")}
           value={tr.license_policy}

@@ -314,9 +314,13 @@ def build_plan(slug: str | None = None) -> dict[str, Any]:
         notes.append({"key": "install.note.unvoiced_manual", "params": {"path": str(unv)}})
     if getattr(proj, "encrypted", False) and engine == "kirikiri":
         notes.append({"key": "install.note.encrypted", "params": {}})
-    vm = (read_manifest(pdir) or {}).get("voice_mix")  # absent / null in manifests of other engines and older builds
+    man = read_manifest(pdir) or {}
+    vm = man.get("voice_mix")  # absent / null in manifests of other engines and older builds
     if isinstance(vm, dict) and vm and vm.get("enabled") is not False:
         notes.append({"key": "install.note.voice_mix", "params": {"key": str(vm.get("key") or "F8")}})
+    tx = man.get("text")  # the Ren'Py translated-text patch (game/tl/<language>/...); absent / null when there is none
+    if isinstance(tx, dict) and tx.get("enabled") is True:
+        notes.append({"key": "install.note.text_patch", "params": {"language": str(tx.get("language") or ""), "lines": int(tx.get("lines") or 0)}})
     md = pdir / "INSTALL.md"
     return {
         "slug": h.slug,

@@ -564,6 +564,7 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
             enter_label(m.group("name"), False, ctx_label, declare=False)
             continue
         direct_menu_child = False
+        menu_say = False
         if menu_stack and indent > menu_stack[-1][0]:
             if menu_stack[-1][2] is None:
                 menu_stack[-1][2] = indent
@@ -615,6 +616,7 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
                      "label": ctx_label[0], "file": filename, "line": no, "raw": s, "caption": True}
                 )
                 continue
+            menu_say = True
             interact = False  # the say menuitem: ``finish_say(..., interact=False)``, the menu itself waits for the click
         monologue = what_tok[:3] in ('"""', "'''")  # monologue mode: one say statement per paragraph
         paragraphs = triple_paragraphs(what_tok) if monologue else [(0, dequote(what_tok))]
@@ -645,6 +647,7 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
                     "file": filename,
                     "line": no + offset,
                     "raw": s,
+                    "menu_say": menu_say,
                 }
             )
 
@@ -896,6 +899,8 @@ class RenpyEngine(BaseEngine):
             flags = []
             if who == "extend":
                 flags.append("extend")
+            if st.get("menu_say"):
+                flags.append("menu_say")  # a menu's own say: nointeract in its code, though the script never writes it
             if st.get("caption"):
                 flags.append("menu_caption")  # a bare string in a menu: shown, never spoken, no dialogue identifier
             rec = lb.add(scene, text, speaker_raw=speaker_raw, speaker_id=sid, raw=st["raw"], source_file=st["file"], source_line=st["line"], flags=flags)

@@ -28,6 +28,16 @@ from adapters.common.rpc import ModelImpl, UnavailableError, WeightsMissingError
 # config name -> ruaccent omograph model size
 MODEL_SIZES = {"turbo": "turbo3.1", "turbo3.1": "turbo3.1", "turbo3": "turbo3", "turbo2": "turbo2", "tiny": "tiny2.1", "big": "big_poetry"}
 _PLUS_VOWEL = re.compile(r"\+([аеёиоуыэюяАЕЁИОУЫЭЮЯ])")
+_VOWELS = "аеёиоуыэюяАЕЁИОУЫЭЮЯ"
+_WORD = re.compile(r"(?:\+?[а-яёА-ЯЁ])+")
+
+#: e-spellings that are also real words next to their ё-spelling but are missing from ruaccent's own list of such
+#: homographs (``yo_homographs.json.gz``, 637 words): the ё is never added to these in the ``safe`` yo mode
+EXTRA_YO_HOMOGRAPHS = frozenset(
+    "совершенный совершенная совершенное совершенные совершенного совершенной совершенному совершенным совершенных "
+    "совершенном совершенную совершенными "
+    "полет полете".split()
+)
 
 
 def convert(text: str, fmt: str = "plain", yo: bool = True) -> str:
@@ -39,6 +49,43 @@ def convert(text: str, fmt: str = "plain", yo: bool = True) -> str:
     if fmt == "acute":
         return _PLUS_VOWEL.sub(lambda m: m.group(1) + "́", out).replace("+", "")
     return out.replace("+", "")
+
+
+def fill_unmarked(text: str, accents: dict[str, str], put_accent: Any = None, skip: Any = ()) -> str:
+    """Mark the multi-vowel words ruaccent left without a stress.
+
+    ruaccent asks a small network (stress usage predictor) which words of a sentence take a stress at all, and
+    that network answers "no" for plenty of ordinary words ("Даже", "тебя", "Хотя", "Таким образом", a verb after
+    "..."), which then reach the TTS bare. A word of two or more vowels always has a stress, so such a word gets
+    it from ruaccent's dictionary, or from its accent network (``put_accent``) when the dictionary lacks the word.
+    Words with ё, with a mark already and one-vowel words are left alone; ``skip`` holds words not to touch.
+    """
+
+    def word(m: re.Match[str]) -> str:
+        w = m.group(0)
+        low = w.lower()
+        if "+" in w or "ё" in low or sum(c in _VOWELS for c in low) < 2 or low in skip:
+            return w
+        known = accents.get(low)
+        if known and "+" in known and known.replace("+", "") == low:
+            out, i = [], 0
+            for ch in known:
+                if ch == "+":
+                    out.append("+")
+                else:
+                    out.append(w[i])
+                    i += 1
+            return "".join(out)
+        if put_accent is not None:
+            try:
+                got = put_accent(w)
+            except Exception:
+                return w
+            if isinstance(got, str) and "+" in got and got.replace("+", "") == w:
+                return got
+        return w
+
+    return _WORD.sub(word, text)
 
 
 def _load(workdir: Path, size: str, use_dictionary: bool):
@@ -114,12 +161,35 @@ class RuAccentStress(ModelImpl):
         self.acc = _load(workdir, size, bool(self.options.get("use_dictionary", True)))
         return {"workdir": str(workdir), "omograph_model": size, "koziev": koziev}
 
-    def op_stress(self, item: dict[str, Any], fmt: str = "plain", yo: bool = True, **_: Any) -> dict[str, Any]:
+    def _safe_yo(self):
+        """ruaccent with the ё of the unambiguous words only (``yo: safe``).
+
+        ruaccent adds ё in two ways: ``yo_words`` (85k forms that exist only with ё: "темном" -> "тёмном", "насчет",
+        "найдешь") and a network that picks ё for ``yo_homographs`` (637 e/ё pairs: "небу" -> "нёбу", "узнаем" ->
+        "узнаём", "все" -> "всё"), which guesses wrong on short chat lines. Safe mode turns the network off and
+        takes from ``yo_words`` every word that is not also a homograph (250 of its keys are).
+        """
+        if not hasattr(self, "_safe_words"):
+            homographs = set(self.acc.yo_homographs) | EXTRA_YO_HOMOGRAPHS
+            self._full_words = self.acc.yo_words
+            self._safe_words = {k: v for k, v in self.acc.yo_words.items() if k not in homographs}
+        return self._safe_words
+
+    def op_stress(self, item: dict[str, Any], fmt: str = "plain", yo: Any = True, **_: Any) -> dict[str, Any]:
         text = item.get("text") or ""
         if not text.strip():
             return {"text": text}
-        stressed = self.acc.process_all(text)
-        return {"text": convert(stressed, fmt, yo), "stressed": stressed}
+        model = self.acc.yo_homograph_model
+        saved = (self.acc.yo_words, model.predict_yo_homographs)
+        if yo == "safe":
+            self.acc.yo_words = self._safe_yo()
+            model.predict_yo_homographs = lambda sentence: []
+        try:
+            stressed = self.acc.process_all(text)
+        finally:
+            self.acc.yo_words, model.predict_yo_homographs = saved
+        stressed = fill_unmarked(stressed, self.acc.accents, self.acc.accent_model.put_accent, self.acc.omographs)
+        return {"text": convert(stressed, fmt, bool(yo)), "stressed": stressed}
 
     def selftest_items(self, tmp: Path) -> list[dict[str, Any]]:
         return [{"id": "selftest", "text": "На двери висит замок, а вдали виден старый замок."}]

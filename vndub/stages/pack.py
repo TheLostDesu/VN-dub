@@ -29,6 +29,12 @@ screen). ``pack.renpy.voice_mix`` configures it (``enabled: auto | true | false`
 had no original voice; ``duck``; ``key``); ``manifest_patch.json`` carries ``voice_mix`` (``{rpy, key, keysym, duck,
 enabled}`` or ``null``), INSTALL.md the section "The voice track in the game", the summary ``voice_mix: true | false``.
 A full pack removes the script it generated earlier when the feature is now off.
+
+The translated text (Ren'Py only): ``game/tl/<language>/vndub_dialogue.rpy`` (:func:`build_text_patch`, :func:`renpy_text_rpy`: a
+``translate <language> <dialogue id>:`` block per translated say line and a ``strings`` block for menu choices and captions) and
+``game/vndub_language.rpy`` (:func:`renpy_language_rpy`, ``config.language``). ``pack.renpy.text`` configures it (``enabled: auto |
+true | false``, auto = the project has a translation file; ``language``; ``font``); ``manifest_patch.json`` carries ``text``
+(``{rpy, language_rpy, language, lines, strings, skipped, ..., enabled}`` or ``null``), INSTALL.md the section "The translated text".
 """
 
 from __future__ import annotations
@@ -36,11 +42,12 @@ from __future__ import annotations
 import math
 import re
 import shutil
+from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from vndub.engines.base import BaseEngine, write_install
-from vndub.manifest.io import FinalIndexRecord, SelectionRecord, read_json, read_jsonl, write_json
+from vndub.manifest.io import FinalIndexRecord, SelectionRecord, TranslationRecord, read_json, read_jsonl, write_json
 from vndub.stages.common import StageContext, StageError
 from vndub.util import hash_file
 
@@ -77,6 +84,22 @@ def _left_out_why(s: SelectionRecord | None) -> tuple[str, str]:
     return "not mastered", "mastering failed or its file is missing (see the master log)"
 
 
+def _silent_sound_ids(ctx: StageContext, lines: list[Any]) -> set[str]:
+    """Lines synth left silent on purpose (``synth.sounds.only: silent``, the line is only a sound): see ``synth.silent_sound_line``."""
+    so = ctx.cfg.synth.sounds
+    if not lines or not so.enabled or so.only != "silent":
+        return set()
+    try:
+        from vndub.stages import genutil as gu
+        from vndub.stages.synth import silent_sound_line
+
+        trs = gu.load_translations(ctx)
+        return {l.line_id for l in lines if silent_sound_line(ctx.cfg, trs.get(l.line_id), l)}
+    except Exception as e:  # coverage is a report: it must not stop the pack
+        ctx.log.warning("patch coverage: cannot tell which lines are only a sound (%s)", e)
+        return set()
+
+
 def patch_coverage(ctx: StageContext, finals: list[FinalIndexRecord], sel: dict[str, SelectionRecord] | None = None) -> dict[str, Any]:
     """What a patch built from ``finals`` (the records whose file exists) holds and what it leaves out.
 
@@ -111,10 +134,14 @@ def patch_coverage(ctx: StageContext, finals: list[FinalIndexRecord], sel: dict[
             n_prov[st if st in n_prov else "review"] += 1
     left: list[dict[str, str]] = []
     reasons: dict[str, int] = {}
+    silent_sounds = _silent_sound_ids(ctx, [l for l in dub if l.line_id not in have])
     for l in dub:
         if l.line_id in have:
             continue
-        cat, why = _left_out_why(sel.get(l.line_id))
+        if l.line_id in silent_sounds:
+            cat, why = "sound_silent", "the line is only a sound (snoring, a kiss ...) and synth.sounds.only is silent"
+        else:
+            cat, why = _left_out_why(sel.get(l.line_id))
         reasons[cat] = reasons.get(cat, 0) + 1
         left.append({"line_id": l.line_id, "status": cat, "reason": why[:300]})
     narration = sum(1 for l in others if l.speaker_id == "narrator" and (l.text_src or "").strip() and not ({"menu", "voice_sustain"} & set(l.flags)))
@@ -155,6 +182,12 @@ def _coverage_notes(cov: dict[str, Any]) -> list[str]:
                 else ""
             )
             + "Each line is listed with its reason under `coverage.left_out_lines` in `manifest_patch.json`."
+        )
+    n_snd = cov["left_out_reasons"].get("sound_silent", 0)
+    if n_snd:
+        notes.append(
+            f"- {n_snd} line(s) are only a sound (snoring, a kiss ...) and were left silent: `synth.sounds.only` is `silent`. "
+            "Set it to `spell` (a stand-in spelling) or `sample` (a recorded clip per sound in `synth.sounds.samples`) to voice them."
         )
     if cov["narration"]:
         notes.append(f"- {cov['narration']} narration line(s) (no speaker) are never dubbed and stay silent in the game.")
@@ -429,6 +462,391 @@ def renpy_voice_mix_rpy(duck: float, keysym: str, sample: str, lang: str) -> str
     )
 
 
+# ----------------------------------------------------------------------------
+# Ren'Py: the translated text (game/tl/<language>/vndub_dialogue.rpy + game/vndub_language.rpy)
+# ----------------------------------------------------------------------------
+
+RENPY_TEXT_NAME = "vndub_dialogue.rpy"
+RENPY_LANG_RPY = "vndub_language.rpy"
+TEXT_DEFAULTS: dict[str, Any] = {"enabled": "auto", "language": "", "font": ""}
+GENERATED = "# Generated by vndub"
+# project.tgt_lang -> the lowercase language name Ren'Py's own tools and the launcher use for game/tl/<name>/
+RENPY_LANGUAGES = {
+    "ru": "russian", "en": "english", "ja": "japanese", "zh": "chinese", "ko": "korean", "de": "german", "fr": "french",
+    "es": "spanish", "it": "italian", "pt": "portuguese", "uk": "ukrainian",
+}
+_LANG_NAME = re.compile(r"[a-z][a-z0-9_]*")
+# what a translated text must keep from the original string: [interpolation], %(old)s substitution; of the {tags} only the ones that
+# change the flow or the content (the translator sees the text without tags, so {i} / {b} / {color} are dropped, the line still reads)
+_TOKEN = re.compile(r"\[\[|\{\{|%%|%\([^)]*\)[#0 +\-]*\d*(?:\.\d+)?[sdifr]|\[[^\[\]]+\]|\{[^{}]+\}")
+_ESCAPED = {"[[", "{{", "%%"}
+_KEEP_SCAN = re.compile(r"%\([^)]*\)[#0 +\-]*\d*(?:\.\d+)?[sdifr]|\[[^\[\]]+\]|\{[^{}]+\}")
+_BEHAVIOR_TAGS = {"w", "p", "nw", "fast", "done", "cps", "clear", "image", "a", "rb", "rt", "space", "vspace"}
+_TL_ID = re.compile(r"^\s*translate\s+(\w+)\s+(\w+)\s*:", re.M)
+_TL_OLD = re.compile(r'^\s*old\s+("(?:[^"\\]|\\.)*")\s*$', re.M)
+_FONT_EXT = {".ttf", ".otf", ".ttc"}
+
+
+def renpy_language(tgt_lang: str, override: str = "") -> str:
+    """Ren'Py's conventional language name for a project language code (``ru`` -> ``russian``); ``override`` wins when it is a valid
+    name, an unknown code is its own name."""
+    o = str(override or "").strip().lower()
+    if o and _LANG_NAME.fullmatch(o):
+        return o
+    code = (tgt_lang or "").split("-")[0].split("_")[0].strip().lower()
+    name = RENPY_LANGUAGES.get(code) or re.sub(r"[^a-z0-9_]", "", code)
+    return name if _LANG_NAME.fullmatch(name) else "translated"
+
+
+def text_opts(ctx: StageContext) -> dict[str, Any]:
+    """``pack.renpy.text`` over :data:`TEXT_DEFAULTS` (a bare ``true`` / ``false`` is ``enabled``) plus the resolved ``lang`` name."""
+    raw = ctx.cfg.pack.renpy.get("text")
+    opts = dict(TEXT_DEFAULTS)
+    if isinstance(raw, dict):
+        opts.update({k: v for k, v in raw.items() if k in opts and v is not None})
+    elif isinstance(raw, (bool, str)):
+        opts["enabled"] = raw
+    opts["lang"] = renpy_language(ctx.cfg.project.tgt_lang, str(opts["language"] or ""))
+    opts["font"] = str(opts["font"] or "").strip().replace("\\", "/")
+    return opts
+
+
+def _markup_esc(s: str) -> str:
+    return s.replace("%", "%%").replace("[", "[[").replace("{", "{{")
+
+
+def _real_tokens(s: str) -> list[str]:
+    return [t for t in _TOKEN.findall(s) if t not in _ESCAPED]
+
+
+def _required_tokens(orig: str) -> list[str]:
+    """The tokens of the original string that the translation has to carry: interpolations and the tags that change the flow."""
+    out = []
+    for t in _real_tokens(orig):
+        if t.startswith(("[", "%(")):
+            out.append(t)
+        else:
+            m = re.match(r"\{/?([a-z]+)", t)
+            if m and m.group(1) in _BEHAVIOR_TAGS:
+                out.append(t)
+    return out
+
+
+def translated_string(orig: str, tr: str) -> str | None:
+    """``tr`` as Ren'Py string content (``[`` ``{`` ``%`` escaped except the original's own tokens), or None when the translation
+    dropped an interpolation / flow tag of ``orig`` ("interpolation lost")."""
+    need = Counter(_required_tokens(orig))
+    have = Counter(_KEEP_SCAN.findall(tr))
+    if any(have[t] < n for t, n in need.items()):
+        return None
+    keep = set(_real_tokens(orig))
+    out: list[str] = []
+    pos = 0
+    for m in _KEEP_SCAN.finditer(tr):
+        out.append(_markup_esc(tr[pos : m.start()]))
+        out.append(m.group(0) if m.group(0) in keep else _markup_esc(m.group(0)))
+        pos = m.end()
+    out.append(_markup_esc(tr[pos:]))
+    return "".join(out)
+
+
+def existing_translations(ctx: StageContext, language: str) -> tuple[set[str], set[str]]:
+    """(dialogue identifiers, ``old`` string literals) the game's own ``game/tl/<language>/*.rpy`` already translate: Ren'Py refuses a
+    second block for either. The files this stage generated earlier are not counted."""
+    ids: set[str] = set()
+    olds: set[str] = set()
+    gd = ctx.game_dir
+    for base in (gd / "game" / "tl" / language, gd / "tl" / language):
+        if not base.is_dir():
+            continue
+        for p in sorted(base.rglob("*.rpy")):
+            try:
+                text = p.read_text(encoding="utf-8-sig", errors="replace")
+            except OSError:
+                continue
+            if text.startswith(GENERATED):
+                continue
+            ids |= {m.group(2) for m in _TL_ID.finditer(text) if m.group(1) == language and m.group(2) != "strings"}
+            olds |= set(_TL_OLD.findall(text))
+    return ids, olds
+
+
+def _say_parts(rec: Any) -> tuple[str, str, str] | None:
+    """``(head, tail, what)`` of a say line's raw statement, or None when it cannot be read: ``head`` = speaker, attributes and
+    ``@ temporary`` words, ``tail`` = the clauses after the text, ``what`` = the original string as Ren'Py holds it (tags and all)."""
+    from vndub.engines import renpy as rp
+
+    raw = (rec.raw or "").strip()
+    m = rp.SAY_RE.match(raw) if raw else None
+    if not m:
+        return None
+    tok = m.group("what")
+    head = " ".join(
+        [w for w in [m.group("who") or ""] if w] + (m.group("attrs") or "").split()
+        + (["@"] + (m.group("tmp") or "").replace("@", " ").split() if m.group("tmp") else [])
+    )
+    tail = m.group("rest").strip()
+    index = 0
+    if tok[:3] in ('"""', "'''"):
+        paras = [p for _o, p in rp.triple_paragraphs(tok)]
+        want = (rec.text_src or "").strip()
+        hits = [i for i, p in enumerate(paras) if rp.strip_text_tags(p) == want]
+        if not hits:
+            return None
+        index = hits[0]
+        what = paras[index]
+        if index:
+            tail = re.sub(r"\bid\s+\S+\s*", "", tail).strip()  # the explicit identifier belongs to the first paragraph
+    else:
+        what = rp.dequote(tok)
+    return head, tail, what
+
+
+def build_text_patch(ctx: StageContext, language: str, font: str, tl: dict[str, Any]) -> dict[str, Any]:
+    """The translated-text patch of a Ren'Py project: ``{text, lines, strings, skipped, skipped_count, reasons}``.
+
+    One block per translated say line (``text_tgt`` of ``lines.<tgt>.jsonl``, never ``text_tts``), a ``strings`` block for menu
+    choices (``choices_tgt`` of the menu's translation record) and menu captions. What is left out is listed in ``skipped``."""
+    from vndub.engines import renpy as rp
+
+    taken_ids, taken_old = existing_translations(ctx, language)
+    skipped: list[dict[str, str]] = []
+    reasons: Counter[str] = Counter()
+
+    def skip(rec: Any, why: str, ident: str = "") -> None:
+        reasons[why] += 1
+        if len(skipped) < LEFT_OUT_LISTED:
+            skipped.append({"line_id": rec.line_id, "id": ident, "reason": why})
+
+    blocks: list[str] = []
+    strings: list[str] = []
+    seen_ids: set[str] = set()
+    seen_old: dict[str, str] = {}
+    n_lines = n_strings = 0
+
+    def add_string(rec: Any, old_raw: str, new_content: str) -> None:
+        nonlocal n_strings
+        old_lit = rp.encode_say_string(old_raw)
+        new_lit = rp.encode_say_string(new_content)
+        if old_lit in taken_old:
+            skip(rec, "string already translated by the game", old_raw)
+            return
+        if old_lit in seen_old:
+            if seen_old[old_lit] != new_lit:
+                skip(rec, "same string translated twice", old_raw)
+            return
+        seen_old[old_lit] = new_lit
+        strings.append(f"    # {_loc(rec)}\n    old {old_lit}\n    new {new_lit}\n")
+        n_strings += 1
+
+    for rec in ctx.lines(recovered=False, edits=False):
+        flags = set(rec.flags or [])
+        extra = rec.model_extra or {}
+        tr = tl.get(rec.line_id)
+        if "menu" in flags:
+            choices = [str(c) for c in (rec.choices or [])]
+            ctr = getattr(tr, "choices_tgt", None) if tr is not None else None
+            if not choices:
+                continue
+            if not isinstance(ctr, list) or len(ctr) != len(choices) or not all(isinstance(c, str) for c in ctr):
+                skip(rec, "choices not translated")
+                continue
+            for old, new in zip(choices, ctr):
+                new = new.strip()
+                if not new:
+                    skip(rec, "choices not translated", old)
+                elif re.search(r"[\[\]{}%]", old):
+                    skip(rec, "markup in the choice", old)  # the parser stripped its tags: the script string cannot be restored
+                else:
+                    add_string(rec, old, _markup_esc(new))
+            continue
+        if "menu_caption" in flags:
+            parts = _say_parts(rec)
+            text = (tr.text_tgt or "").strip() if tr is not None else ""
+            if parts is None or not text:
+                skip(rec, "not translated" if not text else "source line unreadable")
+                continue
+            new = translated_string(parts[2], text)
+            if new is None:
+                skip(rec, "interpolation lost")
+            else:
+                add_string(rec, parts[2], new)
+            continue
+        ident = str(extra.get("dialogue_id") or "")
+        if not ident:
+            continue
+        text = (tr.text_tgt or "").strip() if tr is not None else ""
+        if not text:
+            skip(rec, "not translated", ident)
+            continue
+        if ident in taken_ids:
+            skip(rec, "identifier already translated by the game", ident)
+            continue
+        if ident in seen_ids:
+            skip(rec, "duplicate identifier", ident)
+            continue
+        parts = _say_parts(rec)
+        if parts is None:
+            skip(rec, "source line unreadable", ident)
+            continue
+        head, tail, what = parts
+        new = translated_string(what, text)
+        if new is None:
+            skip(rec, "interpolation lost", ident)
+            continue
+        voice = ""
+        if "voice_sustain" in flags:
+            voice = "voice sustain"
+        elif "voice_expression" in flags or "voice_missing" in flags:
+            skip(rec, "own voice statement", ident)  # a translate block replaces the voice statement of its group: it cannot be rebuilt
+            continue
+        elif rec.has_voice and "auto_voice" not in flags and rec.voice_file:
+            voice = f"voice {rp.encode_say_string(rec.voice_file)}"
+        if "nointeract" not in tail.split() and ("menu_say" in flags or _menu_say_by_digest(rec, ident, voice)):
+            tail = ("nointeract " + tail).strip()  # a menu's own say: the script never writes it, the menu provides the interaction
+        seen_ids.add(ident)
+        code = " ".join(x for x in (head, rp.encode_say_string(new), tail) if x)
+        comment = f"    # {rec.raw.strip()}\n" if rec.raw and "\n" not in rec.raw else ""
+        body = (f"    {voice}\n" if voice else "") + f"    {code}\n"
+        blocks.append(f"# {_loc(rec)}\ntranslate {language} {ident}:\n\n{comment}{body}")
+        n_lines += 1
+    text = renpy_text_rpy(language, blocks, strings, font)
+    return {
+        "text": text if (blocks or strings) else "", "lines": n_lines, "strings": n_strings,
+        "skipped": skipped, "skipped_count": sum(reasons.values()), "reasons": dict(reasons),
+    }
+
+
+_ID_DIGEST = re.compile(r"_([0-9a-f]{8})(?:_\d+)?$")
+
+
+def _menu_say_by_digest(rec: Any, ident: str, voice: str) -> bool:
+    """Records parsed before the ``menu_say`` flag existed: True when the dialogue identifier's digest matches this say's code WITH
+    ``nointeract`` and not without it (the id of a menu's own say is computed over the code of the ``nointeract`` say)."""
+    from vndub.engines import renpy as rp
+
+    dm = _ID_DIGEST.search(ident)
+    m = rp.SAY_RE.match((rec.raw or "").strip())
+    if not dm or not m or m.group("what")[:3] in ('"""', "'''"):
+        return False
+    interact, explicit_id, args, with_ = rp.parse_say_tail(m.group("rest").strip())
+    if not interact:
+        return False
+    attrs = (m.group("attrs") or "").split()
+    tmp = (m.group("tmp") or "").replace("@", " ").split()
+    what = rp.dequote(m.group("what"))
+    prefixes = [[], [voice]] if voice else [[]]
+
+    def hit(inter: bool) -> bool:
+        code = rp.say_code(m.group("who"), what, attrs, tmp, inter, explicit_id, args, with_)
+        return any(rp.block_digest([*p, code]) == dm.group(1) for p in prefixes)
+
+    return hit(False) and not hit(True)
+
+
+def _loc(rec: Any) -> str:
+    f = str(rec.source_file or "").replace("\\", "/")
+    if f and not f.startswith("game/"):
+        f = "game/" + f
+    return f"{f}:{rec.source_line}" if f and rec.source_line else (f or rec.line_id)
+
+
+def renpy_text_rpy(language: str, blocks: list[str], strings: list[str], font: str = "") -> str:
+    """Text of the generated ``game/tl/<language>/vndub_dialogue.rpy``: a ``translate <language> <id>:`` block per say line (the
+    shape ``renpy translate`` writes), then ``translate <language> strings:`` for menu choices and captions, then (``font``)
+    a ``translate <language> python:`` block that switches the game's fonts."""
+    head = (
+        f"{GENERATED}: the translated text of the dub.\n"
+        f"# One translate block per say statement (the identifier is the one \"renpy translate\" writes) and one strings block for menu\n"
+        f"# choices and captions. Ren'Py uses them while the game language is \"{language}\" (game/{RENPY_LANG_RPY} sets it).\n"
+        f"# To undo it, delete this file and {PurePosixPath(RENPY_TEXT_NAME).stem}.rpyc next to it.\n"
+    )
+    out = [head]
+    if font:
+        out.append(
+            f"translate {language} python:\n"
+            f'    gui.text_font = "{_py_str(font)}"\n'
+            f'    gui.name_text_font = "{_py_str(font)}"\n'
+            f'    gui.interface_text_font = "{_py_str(font)}"\n'
+        )
+    out.extend(blocks)
+    if strings:
+        out.append(f"translate {language} strings:\n\n" + "\n".join(strings))
+    return "\n".join(out)
+
+
+def renpy_language_rpy(language: str) -> str:
+    """Text of the generated ``game/vndub_language.rpy``: the game starts in the translated language."""
+    return (
+        f"{GENERATED}: the game starts in the language of the dub.\n"
+        f"# config.language beats the player's saved language choice at every start. The text itself is in\n"
+        f"# game/tl/{language}/{RENPY_TEXT_NAME}.\n"
+        f"# To undo it, delete this file and {PurePosixPath(RENPY_LANG_RPY).stem}.rpyc next to it (the player can then pick the language in the preferences).\n"
+        f'define config.language = "{language}"\n'
+    )
+
+
+def _text_notes(info: dict[str, Any]) -> list[str]:
+    """INSTALL.md section for the generated translation script (``info``: the manifest's ``text`` block)."""
+    lang = info["language"]
+    rpyc = PurePosixPath(info["rpy"]).stem + ".rpyc"
+    return [
+        "",
+        "## The translated text",
+        "",
+        f"The dub also carries the translated text. `{info['rpy']}` holds {info['lines']} `translate {lang} <dialogue identifier>:` block(s) "
+        f"(one per say statement, the shape `renpy translate` writes)"
+        + (f" and a `translate {lang} strings:` block with {info['strings']} menu choice(s) and caption(s)" if info["strings"] else "")
+        + f", and `{info['language_rpy']}` makes the game start in the language \"{lang}\" (`config.language`, which beats the player's saved choice). "
+        + (f"{info['skipped_count']} line(s) stay in the original language (see `text.skipped` in manifest_patch.json). " if info["skipped_count"] else "")
+        + f"To undo it, delete `{info['language_rpy']}`, `{info['rpy']}` and their `.rpyc` twins (`{rpyc}`) from the game folder. "
+        "`pack.renpy.text` configures it: `enabled: auto | true | false` (auto = on when the project has a translation), `language` (the folder name under `game/tl/`), "
+        "`font` (a .ttf / .otf inside `game/` for a game whose own font lacks the alphabet).",
+    ]
+
+
+def _pack_text_renpy(ctx: StageContext, out: Path) -> tuple[dict[str, Any] | None, int]:
+    """Write ``game/tl/<language>/vndub_dialogue.rpy`` and ``game/vndub_language.rpy``; returns (the manifest's ``text`` block or None
+    when the feature is off or has nothing to write, the number of lines left out)."""
+    opts = text_opts(ctx)
+    mode = _mix_mode(opts["enabled"])
+    tgt = ctx.cfg.project.tgt_lang
+    p = ctx.paths.translation(tgt)
+    if mode == "off" or (mode == "auto" and not p.exists()):
+        return None, 0
+    if not p.exists():
+        ctx.log.warning("pack: pack.renpy.text is on but %s does not exist: run `vndub translate` first; no text patch", p)
+        return None, 0
+    lang = opts["lang"]
+    font = opts["font"]
+    if font:
+        rel = font[len("game/") :] if font.startswith("game/") else font
+        if PurePosixPath(rel).suffix.lower() not in _FONT_EXT or ".." in PurePosixPath(rel).parts or rel.startswith("/") or re.match(r"[A-Za-z]:", rel):
+            ctx.log.warning("pack: pack.renpy.text.font %r is not a .ttf / .otf path inside game/: ignored", font)
+            rel = ""
+        font = rel
+    tl = {r.line_id: r for r in read_jsonl(p, TranslationRecord)}
+    res = build_text_patch(ctx, lang, font, tl)
+    if not res["text"]:
+        ctx.log.warning("pack: no line of %s could be written as Ren'Py text (%s)", p, res["reasons"] or "no say statements with a dialogue identifier")
+        return None, res["skipped_count"]
+    rel_rpy = f"game/tl/{lang}/{RENPY_TEXT_NAME}"
+    (out / "game" / "tl" / lang).mkdir(parents=True, exist_ok=True)
+    for name, text in ((out / rel_rpy, res["text"]), (out / "game" / RENPY_LANG_RPY, renpy_language_rpy(lang))):
+        with open(name, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+    info = {
+        "rpy": rel_rpy, "language_rpy": f"game/{RENPY_LANG_RPY}", "language": lang, "lines": res["lines"], "strings": res["strings"],
+        "skipped": res["skipped"], "skipped_count": res["skipped_count"], "skipped_reasons": res["reasons"], "font": font or None, "enabled": True,
+    }
+    ctx.log.info("pack: text patch %s: %d line(s), %d string(s), %d left in the original language %s", rel_rpy, res["lines"], res["strings"], res["skipped_count"], res["reasons"] or "")
+    if res["skipped_count"]:
+        ids = [s["id"] or s["line_id"] for s in res["skipped"] if s["reason"] == "interpolation lost"]
+        if ids:
+            ctx.log.warning("pack: %d line(s) lost an interpolation or flow tag in the translation and keep the original text: %s", len(ids), ", ".join(ids[:20]))
+    return info, res["skipped_count"]
+
+
 def _pack_unvoiced_renpy(ctx: StageContext, unvoiced: list[FinalIndexRecord]) -> tuple[dict[str, str], dict[str, Any]]:
     """Copy the unvoiced files named by dialogue identifier; returns ({line_id: path relative to game/}, info)."""
     out = ctx.paths.out_engine("renpy") / "game"
@@ -474,13 +892,15 @@ def _loose_root(eng: Any, out: Path) -> Path | None:
 
 
 def _remove_stale(
-    ctx: StageContext, eng: Any, out: Path, regular: list[FinalIndexRecord], placed: dict[str, str], uinfo: dict[str, Any], mix_on: bool
+    ctx: StageContext, eng: Any, out: Path, regular: list[FinalIndexRecord], placed: dict[str, str], uinfo: dict[str, Any], mix_on: bool,
+    text_keep: set[Path] | None = None,
 ) -> int:
     """After a full pack: delete what an earlier pack left in ``out`` and this one does not hold. The installer ships the whole folder,
     so a file the new ``manifest_patch.json`` does not list would be installed all the same (a rejected line, ``include_review_lines``
     switched to ``skip``, an import under another parse version that renamed the Ren'Py ids ...). Touched are only the files the previous
     ``manifest_patch.json`` listed, the audio files next to files of the patch (the engine's voice folders), and the ``vndub_auto_voice.rpy``
-    and ``vndub_voice_mix.rpy`` this stage generated when they are no longer needed; nothing else. Returns the number of files removed."""
+    and ``vndub_voice_mix.rpy`` this stage generated when they are no longer needed, and so are the translation scripts
+    (``vndub_language.rpy``, ``tl/<language>/vndub_dialogue.rpy``; ``text_keep`` = the ones this pack wrote); nothing else. Returns the number of files removed."""
     root = _loose_root(eng, out)
     if root is None:
         return 0
@@ -513,6 +933,10 @@ def _remove_stale(
     for d in dirs:
         if d.is_dir():
             stale |= {p for p in d.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_SUFFIXES and p not in keep}
+    text_files: list[Path] = []
+    if eng.name == "renpy":  # the generated translation scripts of any language (a changed language leaves the old folder behind)
+        text_files = [root / RENPY_LANG_RPY, *sorted(root.glob(f"tl/*/{RENPY_TEXT_NAME}"))]
+        dirs |= {p.parent for p in text_files[1:]} | {root / "tl"}
     n = 0
     for p in sorted(stale):
         try:
@@ -523,8 +947,9 @@ def _remove_stale(
         except OSError as e:
             ctx.log.warning("pack: cannot remove the stale file %s (%s)", p, e)
     if eng.name == "renpy":  # the generated scripts of an earlier pack, when this one does not need them
-        for name, needed in ((RENPY_RPY, "rpy" in uinfo), (RENPY_MIX_RPY, mix_on)):
-            rpy = root / name
+        keep_text = text_keep or set()
+        gen = [(root / RENPY_RPY, "rpy" in uinfo), (root / RENPY_MIX_RPY, mix_on)] + [(p, p in keep_text) for p in text_files]
+        for rpy, needed in gen:
             try:
                 if not needed and rpy.is_file() and rpy.read_text(encoding="utf-8").startswith("# Generated by vndub"):
                     rpy.unlink()
@@ -658,7 +1083,16 @@ def run(ctx: StageContext) -> dict[str, Any]:
             strings = _MIX_STRINGS.get((lang or "").split("-")[0].lower()) or _MIX_STRINGS["en"]
             with open(out / "INSTALL.md", "a", encoding="utf-8") as fh:
                 fh.write("\n".join(_voice_mix_notes({**mix_info, "button": strings["button"]})) + "\n")
-    removed = 0 if ctx.only else _remove_stale(ctx, eng, out, regular, placed, uinfo, mix_on)  # a partial pack (--only) leaves the rest of the folder alone
+    text_info: dict[str, Any] | None = None
+    text_keep: set[Path] = set()
+    text_skipped = 0
+    if eng.name == "renpy":
+        text_info, text_skipped = _pack_text_renpy(ctx, out)
+        if text_info:
+            text_keep = {out / "game" / RENPY_LANG_RPY, out / text_info["rpy"]}
+            with open(out / "INSTALL.md", "a", encoding="utf-8") as fh:
+                fh.write("\n".join(_text_notes(text_info)) + "\n")
+    removed = 0 if ctx.only else _remove_stale(ctx, eng, out, regular, placed, uinfo, mix_on, text_keep)  # a partial pack (--only) leaves the rest of the folder alone
     entries = []
     for i, f in enumerate(present):
         ctx.progress(i, len(present), f.line_id)
@@ -688,10 +1122,17 @@ def run(ctx: StageContext) -> dict[str, Any]:
     manifest: dict[str, Any] = {"engine": eng.name, "game_dir": proj.game_dir, "coverage": cov, "files": entries}
     if eng.name == "renpy":
         manifest["voice_mix"] = mix_info
+        manifest["text"] = text_info
     write_json(out / "manifest_patch.json", manifest)
     summary = {**res, "engine": eng.name, "manifest": str(out / "manifest_patch.json")}
     if eng.name == "renpy":
         summary["voice_mix"] = mix_on
+        summary["text"] = bool(text_info)
+        if text_info:
+            summary["text_lines"] = text_info["lines"]
+            summary["text_strings"] = text_info["strings"]
+        if text_skipped:
+            summary["text_skipped"] = text_skipped
     if unvoiced:
         summary["unvoiced"] = len(unvoiced)
         summary["unvoiced_install"] = "renpy auto_voice" if eng.name == "renpy" else "manual"

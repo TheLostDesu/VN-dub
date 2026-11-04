@@ -69,15 +69,22 @@ _LAT_STAGE = re.compile(
 _RU_B = r"(?<![а-яёА-ЯЁ])"
 _RU_E = r"(?![а-яёА-ЯЁ]|[\-~][а-яёА-ЯЁ])"
 _RU_SEP = r"(?:[\s\-~]*)"
-_RU_LEAD = r"(?:бва|буа|муа|бу|му|а|ы)"
+# Lead-ins, mirroring the Latin side: bva/mua = evil; э/е ("Эхехехе", "Эхе-хе", the sheepish "ehehe") = nervous; и ("Ихихи") and
+# у ("Ухаха") by the vowel of the units; "ня" ("Ня-хаха") by the units. "о" is not a lead: "Ох-хо" is a sigh.
+_RU_LEAD = r"(?:бва|буа|муа|бу|му|ня|а|ы|э|е|и|у)"
 _RU_UNITS = re.compile(
     # the lead-in may be hyphenated from the laugh ("Муа-ха-ха-ха", "А-ха-ха") and then belongs to it
     _RU_B + "(?:(?P<lead>" + _RU_LEAD + r")[\-~]?)?(?P<units>х[аеиоыэ](?:" + _RU_SEP + r"х[аеиоыэ])+)х?" + _RU_E,
     re.I,
 )
+# "Ухухуху": у + at least two "ху" (hearty); the units of _RU_UNITS have no "у" vowel
+_RU_UKH = re.compile(_RU_B + r"у[\-~]?(?P<units>ху(?:" + _RU_SEP + r"ху)+)х?" + _RU_E, re.I)
+# Singles: "хех"; "эхэ"/"эхе" (a lead and ONE unit; "эхо" is an echo, so only е/э after х); "гы-гы"; "бугага"; "пфф";
+# "Фу-фу-фу"/"Уфуфу" (giggle; a bare "фу" is disgust, so three units, or two behind the "у"); "Кукуку" (evil; "ку-ку" is a cuckoo,
+# so three units).
 _RU_SINGLES = re.compile(
     _RU_B
-    + r"(?:(?P<heh>хех)|(?P<gy>гы(?:" + _RU_SEP + r"гы)+)|(?P<buga>буга(?:" + _RU_SEP + r"га)+\w*)"
+    + r"(?:(?P<heh>хех)|(?P<eh>э[\-~]?х[еэ])|(?P<fufu>у(?:" + _RU_SEP + r"?фу){2,}|фу(?:" + _RU_SEP + r"фу){2,})|(?P<kuku>к[уе](?:" + _RU_SEP + r"к[уе]){2,})|(?P<gy>гы(?:" + _RU_SEP + r"гы)+)|(?P<buga>буга(?:" + _RU_SEP + r"га)+\w*)"
     r"|(?P<pff>пф{1,4}(?:[\-~]ф+)*|пхах?|фыр))" + _RU_E,
     re.I,
 )
@@ -136,8 +143,8 @@ def _units_latin(s: str) -> int:
 
 
 def _units_ru(s: str) -> int:
-    n = len(re.findall(r"х[аеиоыэ]|гы|га", s, re.I))
-    if re.match(r"^[аы](?=[\-~]?х)", s, re.I):
+    n = len(re.findall(r"х[аеиоыэу]|гы|га|фу|к[уе]", s, re.I))
+    if re.match(r"^[аыэеиу](?=[\-~]?х)", s, re.I):
         n += 1
     return n or 1
 
@@ -170,7 +177,7 @@ def _kind_ru(m: re.Match[str]) -> str:
     vowel = re.search(r"х([аеиоыэ])", units)
     v = vowel.group(1) if vowel else "а"
     if v in ("е", "э"):
-        return "chuckle"
+        return "nervous" if lead in ("э", "е") else "chuckle"
     if v == "и":
         return "giggle"
     if v == "ы":
@@ -210,9 +217,16 @@ def _find_ru(text: str) -> list[Laugh]:
     for m in _RU_STAGE.finditer(text):
         out.append(Laugh(m.start(), m.end(), m.group(0), _stage_kind(m.group("word"), _RU_STAGE_KIND), "ru", 0, True))
     for m in _RU_UNITS.finditer(text):
+        if (m.group("lead") or "").lower() in ("э", "е") and re.search(r"х[аиоы]", m.group("units"), re.I):
+            continue  # "Эхо-хо" is not "ehehe": an э/е lead takes only е/э units
         out.append(_nervous_if_trailing(text, Laugh(m.start(), m.end(), m.group(0), _kind_ru(m), "ru", _units_ru(m.group(0)))))
+    for m in _RU_UKH.finditer(text):
+        out.append(_nervous_if_trailing(text, Laugh(m.start(), m.end(), m.group(0), "hearty", "ru", _units_ru(m.group(0)))))
     for m in _RU_SINGLES.finditer(text):
-        kind = "chuckle" if (m.group("heh") or m.group("gy")) else "snort" if m.group("pff") else "hearty"
+        kind = (
+            "chuckle" if (m.group("heh") or m.group("gy")) else "nervous" if m.group("eh") else "giggle" if m.group("fufu")
+            else "evil" if m.group("kuku") else "snort" if m.group("pff") else "hearty"
+        )
         out.append(_nervous_if_trailing(text, Laugh(m.start(), m.end(), m.group(0), kind, "ru", _units_ru(m.group(0)))))
     return out
 
@@ -254,11 +268,11 @@ def find_laughs(text: str, lang: str = "auto") -> list[Laugh]:
     return _dedupe(found)
 
 
-_PLUS_MARK = re.compile(r"\+(?=[аеёиоуыэюяАЕЁИОУЫЭЮЯ])")
+_PLUS_MARK = re.compile(r"\+(?=[аеёиоуыэюяАЕЁИОУЫЭЮЯ])|́")
 
 
 def unstress_laughs(text: str) -> str:
-    """``text`` without the ``+`` stress marks inside its laughs; every other mark stays.
+    """``text`` without the stress marks (ruaccent ``+`` before the vowel, U+0301 after it) inside its laughs; every other mark stays.
 
     A stresser marks a laugh like any word ("Х+а-х+а-х+а!"), and the patterns of :func:`find_laughs` no longer see it then.
     """
@@ -268,7 +282,7 @@ def unstress_laughs(text: str) -> str:
         return t
     laughs = find_laughs(_PLUS_MARK.sub("", t))
     # the i marks before position p are not in the text the laughs were found in
-    drop = {p for i, p in enumerate(marks) if any(l.start <= p - i < l.end for l in laughs)}
+    drop = {p for i, p in enumerate(marks) if any(l.start <= p - i < l.end or (t[p] == "́" and p - i == l.end) for l in laughs)}
     return "".join(ch for i, ch in enumerate(t) if i not in drop)
 
 

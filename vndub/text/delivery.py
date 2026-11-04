@@ -38,6 +38,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import yaml
 
 from vndub.text import ja
+from vndub.text import sounds
 from vndub.text.laughter import KIND_NOTE, KINDS, Laugh, find_laughs, is_laughter_only
 from vndub.text.style_prompt import ALL_EMOTIONS, StyleSpec
 from vndub.util import hash_obj, repo_root
@@ -45,14 +46,15 @@ from vndub.util import hash_obj, repo_root
 EMOTIONS: tuple[str, ...] = tuple(ALL_EMOTIONS)
 TEMPOS = ("slow", "normal", "fast")
 LOUDNESSES = ("soft", "normal", "loud")
-EVENTS = ("laugh", "sigh", "cry", "breath", "whisper")
+SPEECH_EVENTS = ("laugh", "sigh", "cry", "breath", "whisper")
+EVENTS = (*SPEECH_EVENTS, *sounds.KINDS)  # + the non-speech sounds (snore, kiss, yawn ...; vndub.text.sounds)
 ARCS = ("flat", "rising_end", "falling_end")
 POSITIONS = ("any", "after", "before")
 LAYERS = ("rule", "cue", "llm", "neutral")
 CJK_LANGS = frozenset({"ja", "zh", "ko"})
 
 # delivery.events (laugh ...) -> StyleSpec.events vocabulary used by the style renderers
-STYLE_EVENT = {"laugh": "laughter", "sigh": "sigh", "cry": "cry", "breath": "breath", "whisper": "whisper"}
+STYLE_EVENT = {"laugh": "laughter", "sigh": "sigh", "cry": "cry", "breath": "breath", "whisper": "whisper", **{k: k for k in sounds.KINDS}}
 
 NEUTRAL_INTENSITY = 0.3
 NEUTRAL_CONFIDENCE = 0.2
@@ -81,6 +83,7 @@ class Layer:
     notes: list[str] = field(default_factory=list)
     cues: list[str] = field(default_factory=list)
     laughter: dict[str, Any] | None = None  # {kind, units, stage, only}: the laugh this layer found / was told about
+    sound: dict[str, Any] | None = None  # {kind, only, stage}: the non-speech sound this layer found / was told about
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -103,6 +106,7 @@ class Delivery:
     notes: str = ""
     layers: dict[str, Any] = field(default_factory=dict)
     laughter: dict[str, Any] = field(default_factory=dict)  # {kind, units, stage, only}; empty = no laugh known
+    sound: dict[str, Any] = field(default_factory=dict)  # {kind, only, stage}; empty = no non-speech sound known
 
     @property
     def is_neutral(self) -> bool:
@@ -124,6 +128,8 @@ class Delivery:
         }
         if self.laughter:  # absent without a laugh: passports of earlier versions read the same
             d["laughter"] = dict(self.laughter)
+        if self.sound:  # likewise
+            d["sound"] = dict(self.sound)
         return d
 
     @classmethod
@@ -134,6 +140,7 @@ class Delivery:
             events=list(d.get("events") or []), confidence=float(d.get("confidence", NEUTRAL_CONFIDENCE)),
             layer=str(d.get("layer", "neutral")), cues=list(d.get("cues") or []), arc=str(d.get("arc", "flat")),
             notes=str(d.get("notes", "")), layers=dict(d.get("layers") or {}), laughter=dict(d.get("laughter") or {}),
+            sound=dict(d.get("sound") or {}),
         )
 
 
@@ -155,6 +162,7 @@ class _Sig:
     note: str = ""
     match: str = ""
     laugh: dict[str, Any] | None = None  # the laugh signal only: {kind, units, stage, only}
+    sound: dict[str, Any] | None = None  # the sound signal only: {kind, only, stage}
 
 
 def _add(sigs: dict[str, _Sig], sig: _Sig) -> None:
@@ -177,7 +185,7 @@ def _prep_spoken(text: str) -> str:
     """:func:`_prep` for the laughter finder: a bracketed stage direction (``[laughs]``, ``[giggles]``) is kept, because
     stripping ``[...]`` as a KAG tag made the laugh invisible in a Latin-script source (the translation was never stripped)."""
     t = ja.strip_ruby(text or "")
-    t = _BRACKET_TAG.sub(lambda m: m.group(0) if any(l.stage for l in find_laughs(m.group(0))) else "", t)
+    t = _BRACKET_TAG.sub(lambda m: m.group(0) if (any(l.stage for l in find_laughs(m.group(0))) or any(x.stage for x in sounds.find_sounds(m.group(0)))) else "", t)
     return unicodedata.normalize("NFKC", _BRACE_TAG.sub("", t)).strip()
 
 
@@ -386,6 +394,41 @@ def _laugh_signal(laughs: Sequence[Laugh], only: bool) -> _Sig | None:
     )
 
 
+# non-speech sounds (vndub.text.sounds): kind -> (emotion, intensity, tempo, loudness). The intensity is the target value of the
+# line (the bump is that minus the neutral 0.3), None = no opinion (a neutral sound does not vote, so it never dilutes the emotion
+# of the laugh or the words next to it). A snore is the quietest thing a voice does.
+_SOUND_KIND: dict[str, tuple[str | None, float | None, str | None, str | None]] = {
+    "snore": (None, 0.1, None, "soft"),
+    "kiss": (None, None, None, None),
+    "yawn": (None, 0.2, "slow", None),
+    "gasp": ("surprised", 0.5, None, None),
+    "sneeze": (None, None, None, None),
+    "cough": (None, None, None, None),
+    "hum": (None, None, None, None),
+    "hmph": ("angry", 0.3, None, None),
+    "shiver": (None, None, None, None),
+    "eat": (None, None, None, None),
+}
+_SOUND_W = 0.7  # weight of a spoken sound
+_SOUND_W_STAGE = 0.65  # a bracketed stage direction describes, it is not heard
+
+
+def _sound_signal(info: Mapping[str, Any] | None) -> _Sig | None:
+    """The one sound signal of a line from ``{kind, only, stage}`` (``sounds.summarize``)."""
+    if not info or info.get("kind") not in _SOUND_KIND:
+        return None
+    kind = str(info["kind"])
+    emotion, inten, tempo, loud = _SOUND_KIND[kind]
+    only = bool(info.get("only"))
+    stage = bool(info.get("stage"))
+    note = sounds.KIND_NOTE[kind] + (", no words" if only else "")
+    return _Sig(
+        "sound", _SOUND_W_STAGE if stage else _SOUND_W, emotion=emotion, d_int=0.0 if inten is None else round(inten - NEUTRAL_INTENSITY, 3),
+        tempo=tempo, loud=loud, events=(kind,), note=note, match=kind,
+        sound={"kind": kind, "only": only, "stage": stage},
+    )
+
+
 def _is_bare_stage(text: str) -> bool:
     """The whole text (quotes aside) is one bracketed stage direction."""
     ls = find_laughs(text)
@@ -418,11 +461,18 @@ def rule_pass(text_src: str, text_tgt: str = "", lexicon: Mapping[str, str] | No
         mapped = unicodedata.normalize("NFKC", mapped)
         _ru_tokens(mapped.lower().replace("ё", "е"), sigs)
         laughs += find_laughs(mapped, "ru")
+    # a non-speech sound (snore, kiss, yawn ...): the source line first (the actual onomatopoeia), else the translation
+    sound_info = sounds.summarize(_prep_spoken(text_src), src_lang or "auto") or (sounds.summarize(unicodedata.normalize("NFKC", tgt), "auto") if tgt else None)
+    ssig = _sound_signal(sound_info)
     lsig = _laugh_signal(laughs, bool(laughs) and is_laughter_only(spoken_text))
     if lsig is not None:
         if lsig.laugh and lsig.laugh["stage"] and any(_is_bare_stage(t) for t in (_prep_spoken(text_src), spoken_text)):
             sigs.pop("inner", None)  # a line that is only "(笑)" / "(giggles)" is a stage direction, not an inner voice
         _add(sigs, lsig)
+    if ssig is not None:
+        if (c := sigs.get("caps")) is not None and any(c.match in s.text for s in sounds.find_sounds(_prep_spoken(text_src) + " " + tgt)):
+            sigs.pop("caps", None)  # "ZZZ" is not shouting
+        _add(sigs, ssig)
     if not sigs:
         return Layer("rule", confidence=NEUTRAL_CONFIDENCE, emotion="neutral", intensity=NEUTRAL_INTENSITY)
 
@@ -467,6 +517,7 @@ def rule_pass(text_src: str, text_tgt: str = "", lexicon: Mapping[str, str] | No
         "rule", confidence=conf, emotion=emotion, intensity=intensity,
         tempo=first("tempo") if len(tempos) == 1 else None, loudness=first("loud"),
         events=events, arc=first("arc"), notes=notes, cues=cues, laughter=dict(sigs["laugh"].laugh) if "laugh" in sigs and sigs["laugh"].laugh else None,
+        sound=dict(sigs["sound"].sound) if "sound" in sigs and sigs["sound"].sound else None,
     )
 
 
@@ -814,13 +865,36 @@ def validate_delivery(obj: Any, line_id: str | None = None) -> dict[str, Any] | 
     return out
 
 
-def llm_layer(d: Mapping[str, Any] | None) -> Layer | None:
-    v = validate_delivery(d) if d else None
-    if v is None:
+def valid_sound(obj: Any) -> dict[str, Any] | None:
+    """A ``sound`` object ``{kind, only?, stage?}`` (a translation record's field, or the LLM's answer) checked: the kind must be
+    one of :data:`vndub.text.sounds.KINDS` (a word with a different case or spaces is accepted), anything else is junk -> ``None``."""
+    if not isinstance(obj, Mapping):
         return None
+    kind = obj.get("kind")
+    kind = kind.strip().lower() if isinstance(kind, str) else None
+    if kind not in sounds.KINDS:
+        return None
+    out: dict[str, Any] = {"kind": kind, "only": bool(obj.get("only")), "stage": bool(obj.get("stage"))}
+    return out
+
+
+def llm_layer(d: Mapping[str, Any] | None, sound: Mapping[str, Any] | None = None) -> Layer | None:
+    """The LLM layer: its ``delivery`` object and/or the ``sound`` the translation record names. A sound without a delivery makes
+    a layer of its own (confidence 0.7: the model named it, there was nothing else to ask it)."""
+    v = validate_delivery(d) if d else None
+    snd = _sound_signal(valid_sound(sound))
+    if v is None:
+        if snd is None:
+            return None
+        return Layer(
+            "llm", confidence=snd.w, emotion=snd.emotion, intensity=None if snd.d_int == 0.0 else round(NEUTRAL_INTENSITY + snd.d_int, 3),
+            tempo=snd.tempo, loudness=snd.loud, events=list(snd.events), notes=[snd.note], sound=dict(snd.sound or {}),
+        )
+    notes = [snd.note] if snd is not None else []
     return Layer(
         "llm", confidence=v["confidence"], emotion=v["emotion"], intensity=v["intensity"], tempo=v["tempo"],
-        loudness=v["loudness"], events=list(v["events"]), laughter={"kind": v["laugh_kind"]} if v.get("laugh_kind") else None,
+        loudness=v["loudness"], events=list(dict.fromkeys([*v["events"], *(snd.events if snd is not None else ())])),
+        laughter={"kind": v["laugh_kind"]} if v.get("laugh_kind") else None, notes=notes, sound=dict(snd.sound or {}) if snd is not None else None,
     )
 
 
@@ -881,6 +955,7 @@ def merge_layers(layers: Iterable[Layer | None], min_confidence: float = 0.6) ->
     notes: list[str] = []
     cues: list[str] = []
     laughter: dict[str, Any] = {}
+    sound: dict[str, Any] = {}
     for lyr in layers:
         if lyr is None:
             continue
@@ -904,6 +979,8 @@ def merge_layers(layers: Iterable[Layer | None], min_confidence: float = 0.6) ->
         cues += [c for c in lyr.cues if c not in cues]
         if lyr.laughter:
             laughter = {**lyr.laughter, **laughter}  # an earlier layer wins: the rule pass read the actual text, the LLM only guessed a kind
+        if lyr.sound:
+            sound = {**lyr.sound, **sound}  # likewise
         d.layer = lyr.name
         d.confidence = round(lyr.confidence, 3)
     d.layers = seen
@@ -913,6 +990,7 @@ def merge_layers(layers: Iterable[Layer | None], min_confidence: float = 0.6) ->
     d.notes = ", ".join(notes)
     d.cues = cues
     d.laughter = laughter if "laugh" in events else {}
+    d.sound = sound if sound.get("kind") in events else {}
     return d
 
 
@@ -924,4 +1002,5 @@ def to_style(d: Delivery, notes: str = "") -> StyleSpec:
         events=[STYLE_EVENT.get(e, e) for e in d.events], voice_quality=[], arc=d.arc, notes=txt,
         confidence=round(float(d.confidence), 3), emotion_probs={d.emotion: 1.0},
         laughter=dict(d.laughter) if d.laughter and "laugh" in d.events else None,
+        **({"sound": dict(d.sound)} if d.sound and d.sound.get("kind") in d.events and "sound" in StyleSpec.__dataclass_fields__ else {}),
     )

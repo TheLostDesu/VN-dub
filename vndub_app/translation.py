@@ -8,6 +8,7 @@ app choice                      pipeline
 =============================== =========================================================
 honorifics drop / keep / adapt  glossary ``honorifics`` drop / transliterate / map
 address_default ты / вы         glossary ``address_matrix.<sid>.default`` for every character
+player_gender m / f / unknown   glossary ``player.gender`` (the protagonist the characters address as "you"; unknown = not set)
 n_candidates, routes, backends  ``config_overrides`` -> ``pipeline.yaml`` (synth.*)
 license policy                  global ``Settings.license_policy`` -> ``pipeline.yaml``
 source auto / import            ``translate.import`` (path) in ``pipeline.yaml``
@@ -36,6 +37,7 @@ _TRANSLATION_LOCK = threading.Lock()  # read-modify-write of the translation fil
 HONORIFICS_TO_GLOSSARY = {"drop": "drop", "keep": "transliterate", "adapt": "map"}
 HONORIFICS_FROM_GLOSSARY = {v: k for k, v in HONORIFICS_TO_GLOSSARY.items()}
 ADDRESS_FORMS = ("ты", "вы")
+PLAYER_GENDERS = ("m", "f", "unknown")
 TGT_LANGS = ("ru", "en")
 SRC_LANGS = ("auto", "ja", "en", "zh", "ko", "ru", "uk", "de", "fr", "es", "it", "pt")
 LICENSE_POLICIES = ("research", "commercial")
@@ -140,6 +142,7 @@ def get_settings(h: appdirs.ProjectHandle) -> dict[str, Any]:
         "import_path": tr.get("import_path", ""),
         "honorifics": tr.get("honorifics", "drop"),
         "address_default": tr.get("address_default", "ты"),
+        "player_gender": tr.get("player_gender", "unknown") if tr.get("player_gender") in PLAYER_GENDERS else "unknown",  # an old app_state has no key
         "license_policy": appdirs.load_settings().license_policy,
         "llm_available": llm_available(cfg),
         "advanced": {
@@ -186,6 +189,10 @@ def _put_settings(h: appdirs.ProjectHandle, body: dict[str, Any]) -> dict[str, A
         if body["address_default"] not in ADDRESS_FORMS:
             raise _bad("address_default", body["address_default"])
         tr["address_default"] = body["address_default"]
+    if "player_gender" in body:
+        if body["player_gender"] not in PLAYER_GENDERS:
+            raise _bad("player_gender", body["player_gender"])
+        tr["player_gender"] = body["player_gender"]
     if "license_policy" in body:
         if body["license_policy"] not in LICENSE_POLICIES:
             raise _bad("license_policy", body["license_policy"])
@@ -362,6 +369,9 @@ def write_glossary(h: appdirs.ProjectHandle, terms: list[dict[str, Any]] | None 
         }
     g["address_matrix"] = matrix
     g["characters"] = gchars
+    pg = tr.get("player_gender", "unknown")
+    old_player = old.get("player") if isinstance(old.get("player"), dict) else {}
+    g["player"] = {"name": "", "notes": "", **old_player, "gender": pg if pg in PLAYER_GENDERS else "unknown"}  # name / notes stay hand-editable in the file
     if terms is not None:
         g["terms"] = terms
     g.setdefault("terms", [])

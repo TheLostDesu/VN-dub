@@ -76,9 +76,14 @@ class StyleSpec:
     # the laugh of the line: {"kind": hearty|chuckle|giggle|evil|nervous|snort, "units": syllables, "only": the line is nothing
     # but a laugh, "stage": only a stage direction}; None = no information (the generic laugh phrase)
     laughter: dict[str, Any] | None = None
+    # the non-speech sound of the line (snore, kiss, yawn ...; vndub.text.sounds): {"kind", "n", "only", "stage"}; the kind is
+    # also an event of ``events``. ``only`` = the line is nothing but that sound. None = no sound
+    sound: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
+        if not d.get("sound"):
+            d.pop("sound", None)  # absent when empty, like laughter: the cache keys of lines without a sound do not move
         if not d.get("laughter"):
             # absent when empty: spec dicts (candidate cache keys, stored sidecars and passports) of lines without
             # laughter stay byte-identical to what earlier versions wrote
@@ -290,6 +295,34 @@ def laugh_phrase(spec: StyleSpec) -> str:
     return _LAUGH_PHRASE[kind][_laugh_level(spec)] if kind else _EVENT_PHRASE["laughter"]
 
 
+# non-speech sounds (vndub.text.sounds.KINDS): the kind is an event of the StyleSpec; the phrase tells an instruct model what the
+# sound is and that there are no words. A sound inside speech uses the short phrase, a sound-only line the sentence below.
+_SOUND_PHRASE = {
+    "snore": "snoring softly, no words", "kiss": "blowing a kiss", "yawn": "yawning", "gasp": "gasping", "sneeze": "sneezing",
+    "cough": "coughing", "hum": "humming", "hmph": "huffing in annoyance", "shiver": "shivering", "eat": "chewing",
+}
+_SOUND_ONLY = {
+    "snore": "soft, even snoring", "kiss": "a light kiss sound", "yawn": "a long yawn", "gasp": "a sharp gasp", "sneeze": "a sneeze",
+    "cough": "a cough", "hum": "a closed-mouth hum", "hmph": "a short huff of annoyance", "shiver": "a shiver", "eat": "the sounds of chewing",
+}
+
+
+def _sound_kind(spec: StyleSpec) -> str | None:
+    k = (spec.sound or {}).get("kind")
+    return k if k in _SOUND_PHRASE else None
+
+
+def _sound_only(spec: StyleSpec) -> bool:
+    k = _sound_kind(spec)
+    return bool(k) and bool((spec.sound or {}).get("only")) and k in spec.events
+
+
+def _event_phrase(spec: StyleSpec, ev: str) -> str | None:
+    if ev in _SOUND_PHRASE and ev == _sound_kind(spec):
+        return _SOUND_PHRASE[ev]
+    return _EVENT_PHRASE.get(ev) or _SOUND_PHRASE.get(ev)
+
+
 def _notes_text(spec: StyleSpec) -> str:
     """``spec.notes`` without the kind note (``"giggling"``) of a laugh the laugh phrase already says."""
     notes = (spec.notes or "").strip()
@@ -306,7 +339,10 @@ def to_instruction(spec: StyleSpec, lang: str = "en", include_caption: bool = Tr
     if lang != "en":
         # Only English templates are maintained; instruct models accept English.
         lang = "en"
-    if _laugh_only(spec):
+    if _sound_only(spec):
+        # the whole line is one sound (snoring, a kiss ...): no model performs it on request, so say what it is and that nothing is spoken
+        parts = [f"Only {_SOUND_ONLY[_sound_kind(spec)]}, no words: a real sound and not letters read out", _intensity_word(spec.intensity)]
+    elif _laugh_only(spec):
         # the whole line is a laugh: the instruction is about the laugh, not about a tone to speak words in
         noun = _LAUGH_ONLY.get(_laugh_kind(spec) or "", "a natural laugh")
         parts = [f"Only laugh, no words: make {noun}, a real laugh and not syllables read out", _intensity_word(spec.intensity)]
@@ -320,8 +356,10 @@ def to_instruction(spec: StyleSpec, lang: str = "en", include_caption: bool = Tr
         if ev == "laughter":
             if not _laugh_only(spec):
                 parts.append(laugh_phrase(spec))
-        elif ev in _EVENT_PHRASE:
-            parts.append(_EVENT_PHRASE[ev])
+        elif ev in _SOUND_PHRASE and _sound_only(spec) and ev == _sound_kind(spec):
+            continue  # said by the opening sentence
+        elif _event_phrase(spec, ev):
+            parts.append(_event_phrase(spec, ev))
     vq = [q for q in spec.voice_quality if q not in ("whispery",)]
     if vq:
         parts.append("voice " + " and ".join(vq))
@@ -355,7 +393,7 @@ def to_voxcpm_prefix(spec: StyleSpec) -> str:
     if spec.loudness != "normal":
         words.append("loud" if spec.loudness == "loud" else "soft")
     words += [
-        (_LAUGH_WORD.get(_laugh_kind(spec) or "", "laughing") if e == "laughter" else {"cry": "tearful", "whisper": "whispering", "breath": "breathy", "sigh": "sighing"}.get(e, ""))
+        (_LAUGH_WORD.get(_laugh_kind(spec) or "", "laughing") if e == "laughter" else {"cry": "tearful", "whisper": "whispering", "breath": "breathy", "sigh": "sighing"}.get(e, "") or (_SOUND_PHRASE.get(e, "").split(",")[0] if e in _SOUND_PHRASE else ""))
         for e in spec.events
     ]
     if spec.arc == "rising_end":
@@ -382,7 +420,7 @@ _FISH_LAUGH = {
 }
 
 
-def to_fish_tags(spec: StyleSpec, inline_laughter: bool = False) -> str:
+def to_fish_tags(spec: StyleSpec, inline_laughter: bool = False, inline_sound: bool = False) -> str:
     """Fish S2 inline tags placed before the line, e.g. ``[happy] [laughing]``.
 
     ``inline_laughter``: the laughs of the text carry their own tag (``laughter.apply_laughter``), the prefix has none.
@@ -396,6 +434,8 @@ def to_fish_tags(spec: StyleSpec, inline_laughter: bool = False) -> str:
             if not inline_laughter:
                 tags.append(_FISH_LAUGH.get(_laugh_kind(spec) or "", _FISH_EVENT["laughter"]))
         elif e in _FISH_EVENT:
+            if inline_sound and e == _sound_kind(spec):
+                continue  # the text carries the sounds table's tag already: no second one for the same event
             tags.append(_FISH_EVENT[e])
     if spec.loudness == "loud":
         tags.append("shouting" if spec.intensity >= 0.75 else "loud")
@@ -423,7 +463,7 @@ _HIGGS_EMO = {
 _HIGGS_SFX = {"laughter": "laughter", "cry": "crying", "sigh": "sigh", "cough": "cough"}  # "breath" has no tag in v3
 
 
-def to_higgs_tags(spec: StyleSpec, inline_laughter: bool = False) -> str:
+def to_higgs_tags(spec: StyleSpec, inline_laughter: bool = False, inline_sound: bool = False) -> str:
     emo = _HIGGS_EMO.get(spec.emotion, "")
     if emo == "elation" and "laughter" in spec.events:
         emo = "amusement"
@@ -435,7 +475,7 @@ def to_higgs_tags(spec: StyleSpec, inline_laughter: bool = False) -> str:
     if spec.tempo != "normal":
         tags.append(f"<|prosody:speed_{'fast' if spec.tempo == 'fast' else 'slow'}|>")
     for e in spec.events:
-        if e in _HIGGS_SFX and not (e == "laughter" and inline_laughter):
+        if e in _HIGGS_SFX and not (e == "laughter" and inline_laughter) and not (inline_sound and e == _sound_kind(spec)):
             tags.append(f"<|sfx:{_HIGGS_SFX[e]}|>")
     return "".join(tags)
 
@@ -509,13 +549,15 @@ def to_knobs(spec: StyleSpec, backend: str, opts: Mapping[str, Any] | None = Non
 
 def render(
     spec: StyleSpec, caps: Mapping[str, Any], opts: Mapping[str, Any] | None = None, cross_lingual: bool = False, laughter_inline: bool = False,
+    sound_inline: bool = False,
 ) -> dict[str, Any]:
     """Everything a backend needs from the style: ``instruct``, ``text_prefix``, ``knobs``, ``style_prompt``, ``laughter``.
 
     ``style_prompt`` is the human-readable string stored in the synth sidecar. ``laughter`` is the decision for the TEXT
     (:func:`laughter_decision`: ``respell`` | ``inline:<token>`` | ``tag:<token>``); synth applies it with
     ``vndub.text.laughter.apply_laughter`` (and may turn it into ``keep``). ``laughter_inline``: the text carries the
-    laugh tokens itself, so the Fish / Higgs prefix leaves its own laughter tag out.
+    laugh tokens itself, so the Fish / Higgs prefix leaves its own laughter tag out. ``sound_inline``: the same for a non-speech
+    sound (the sounds table's tag is in the text; the event-level ``cough`` tag of the prefix is dropped).
     """
     instruct_kind = caps.get("instruct", "none")
     tags_kind = caps.get("tags", "none")
@@ -528,9 +570,9 @@ def render(
     elif instruct_kind == "voxcpm":
         out["text_prefix"] = to_voxcpm_prefix(spec)
     if tags_kind == "fish":
-        out["text_prefix"] = (out["text_prefix"] + " " + to_fish_tags(spec, laughter_inline)).strip()
+        out["text_prefix"] = (out["text_prefix"] + " " + to_fish_tags(spec, laughter_inline, sound_inline)).strip()
     elif tags_kind == "higgs":
-        out["text_prefix"] = (out["text_prefix"] + to_higgs_tags(spec, laughter_inline)).strip()
+        out["text_prefix"] = (out["text_prefix"] + to_higgs_tags(spec, laughter_inline, sound_inline)).strip()
     elif tags_kind == "cosy_inline" and "breath" in spec.events:
         out["text_prefix"] = (out["text_prefix"] + " [breath]").strip()
     if knobs_kind in ("chatterbox", "zonos"):

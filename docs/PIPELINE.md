@@ -250,7 +250,42 @@ source import|llm:<model>|mock, glossary_hits, flags).
 - Post-processing: ruaccent stress (+ yo), numbers -> words, abbreviations expanded. `text_tts` has no marks;
   `text_tts_plus` / `text_tts_short_plus` keep ruaccent's `+` and are written when an enabled backend asks for stress
   (`stress_format`: `plus` for F5-TTS_RUSSIAN, `acute` for Chatterbox).
+  Every word of two vowels or more gets a mark (ruaccent's own predictor skips some; the gap is filled from its dictionary and accent
+  network), and a line with quotes or other characters ruaccent drops keeps its marks and its text. `translate.stress.yo`: `safe` (default)
+  adds ё only to words that exist only with ё (`тёмном`, `насчёт`, `ещё`), never to e/ё homographs (`небу`, `узнаем`, `все`, `самое`; the LLM
+  writes those itself and its letters are kept); `true` lets ruaccent guess for homographs too; `false` removes every ё.
 - `--seed-glossary` writes/extends `configs/glossary.yaml` from `characters.yaml`.
+- **Player character**: glossary `player: {name, gender: m|f|unknown, notes}` (`--seed-glossary` adds it with `unknown`; the app's
+  Step 2 sets the gender). The prompt says that words said to or about the player (you, darling, dear ...) agree with the player's gender
+  ("ты вернулся, дорогой" / "ты вернулась, дорогая"); unknown = wordings that do not reveal it, the masculine when impossible.
+- **Names pass** (`translate.names_pass`, default on): before the first batch ONE request asks the model for the canonical target spelling of the
+  script's proper nouns (candidates: capitalised words not at a sentence start, or seen twice, minus a stop list, lower-case words and character
+  names; the game title and the character sheet go with it). Answers become glossary `terms` with `notes: auto` (in memory, a copy in
+  `work/glossary_auto.yaml`), never overwriting a term that exists; cached in `translate_llm` like scene summaries. Skipped for the mock translator and
+  for sources without letter case.
+- **Post-checks**: a glossary spelling missing from a line that contains its source is logged (`glossary: <id> is translated without ...`) and counted
+  (`glossary_misses`); a mixed-script word ("Ватаzuki"), a Latin word the source does not have, or an untranslated line is re-asked once with its
+  previous answer and a fix note, then kept with the flag `check_failed` (summary `check_failed`).
+- **Context ladder**: a GGUF model that does not fit its VRAM budget at `translate.llm.ctx` is costed at 8192, then 4096, before the next model of the
+  chain is tried; `batch_lines` and `context_window_lines` shrink by `ctx_used / ctx` for that run and the log names the ctx. The model stays fully on the GPU.
+- **Narration and menus** (`translate.include_narration: auto|on|off`, auto = Ren'Py with `pack.renpy.text.enabled` not false): narrator lines without
+  audio are translated as text-only lines (`translate.text_only(line)`; never dubbed: synth/score/master work from `StageContext.dub_lines()`). A menu
+  record (`menu` flag, `choices`) gets `choices_tgt: [str, ...]` (same order and length as `choices`, text fields empty) when narration is on or the engine
+  is Ren'Py; each choice is an item `<line_id>#c<i>` (`"kind": "player_choice"`) of the scene's batch. A `menu_caption` line gets a normal record. With
+  `translate.import`, narration and menus the file does not cover are skipped instead of flagged `translate_missing`.
+- **Non-speech sounds** (snoring, kisses, yawns ...; `vndub/text/sounds.py`, `configs/sounds.yaml`): the prompt asks the model to name them
+  (`"sound": {"kind": snore|kiss|yawn|gasp|sneeze|cough|hum|hmph|shiver|eat, "only": true|false}`, only for lines that have one; `only` = the
+  line is nothing but the sound, a bracketed stage direction counts). `parse_response` keeps a valid answer (a bare kind word counts as
+  `only: false`) and drops anything else. Every translated line then gets `TranslationRecord.sound = {kind, only, stage, source}`: the
+  model's answer, else `sounds.summarize` of the source line, else of the translation (`source: llm | rule`; the model's `only: true` is
+  believed only when the rules agree or the source is at most 12 characters). Flags: `sound` on every such line, `interjection` too when
+  `only` (the lower CER gate and short candidate count of a laughter-only line; a laugh and a sound in one line carry both families of
+  flags). A sound-only line whose translation came from the model is **replaced by the table's spelling** for the target language
+  (`ZZZ...` -> `Хр-р-р... хр-р-р...`, `Muah!` -> `Чмок!`; a spelling without end punctuation takes the line's own `!` / `?` / `...`), flag
+  `sound_spelled`: `text_tgt`, `text_tgt_short`, `text_tts*` and `text_plain*` are all that spelling and the stress step is skipped for it.
+  Left alone: a sound inside speech ("Brrr, it's cold."; synth respells the span), lexicon interjections (ja -> ru), imports, `same_lang`
+  scripts and text-only narration (shown on screen). The table path is `synth.sounds.table` (default `configs/sounds.yaml`; a missing or
+  invalid file only logs a warning). Summary: `sounds`, `sounds_spelled`. Cache protocol `TRANSLATE_PROTOCOL` is 3 (the prompt changed).
 - **Unvoiced speaker lines** (mode B): `translate.include_unvoiced` (default `auto` = on only when
   `synth.voice_unvoiced` is on, which the desktop app sets, so the CLI keeps translating voiced lines only; `on` =
   always; `off` = never) also translates speaker lines without original
@@ -315,7 +350,7 @@ Layers, merged rule -> cue -> llm (`vndub/text/delivery.py`):
    reduced when named emotions disagree. A plain `。` is no evidence: neutral, confidence 0.2. `！` alone without a named emotion gives
    `other` ("expressive") at intensity >= 0.5.
    **Laughter** (`vndub/text/laughter.py`, shared with synth): written laughter in the source text (any script: kana
-   `あはは` `えへへ` `ふふ` `くすくす` `くくく` `ぷっ`; Cyrillic `ха-ха` `хе-хе` `хи-хи` `муа-ха-ха` `пф-ф`; Latin `haha` `hehe` `hihi` `mwahaha`
+   `あはは` `えへへ` `ふふ` `くすくす` `くくく` `ぷっ`; Cyrillic `ха-ха` `хе-хе` `хи-хи` `муа-ха-ха` `пф-ф` `эхехе` (nervous) `ихихи` `уфуфу` `кукуку` `ня-хаха`; Latin `haha` `hehe` `hihi` `mwahaha`
    `ehehe...` `pfft`, also hyphenated / spaced `ha-ha`, `heh heh heh`) and in the translation gives the `laugh` event and a
    kind: `hearty`, `chuckle`, `giggle`, `evil`, `nervous` (a hearty laugh or chuckle trailing into `...`), `snort`. Per kind: emotion
    (hearty / chuckle / giggle `happy`, nervous `embarrassed`, evil and snort `other`; `other` names no direction, so it only wins
@@ -328,6 +363,16 @@ Layers, merged rule -> cue -> llm (`vndub/text/delivery.py`):
    `laugh_kind` (also `events: ["giggling"]`; an unknown word is ignored, the object stays valid); a kind from the rule pass
    (it read the actual text) wins over the LLM's. `text_emotion` stage `VERSION` is 2: passports of version 1 have no
    `delivery.laughter` and are rewritten (no model, cheap). How the laugh is then spoken is decided in synth.
+   **Non-speech sounds** work the same way (`vndub.text.sounds`): the rule pass finds them in the source line (after the laughter
+   pass, which masks laughs; bracketed `*yawns*`, `(храпит)`, `（あくび）` count at weight 0.65, spoken ones at 0.7) and in the
+   translation, adds the kind as an event (`delivery.events` also takes `snore kiss yawn gasp sneeze cough hum hmph shiver eat`; the
+   prompt's delivery object still lists only the five speech events) and a note (`snoring`, `a kiss`, `yawning` ...; `..., no words`
+   when the line is only the sound). Delivery by kind: snore = intensity 0.1, soft; yawn = intensity 0.2, slow; gasp = surprised 0.5;
+   hmph = angry 0.3; the rest vote for no emotion. `ZZZ` is never read as shouting (the capitals rule skips sound spans).
+   `delivery.sound = {kind, only, stage}` (`Delivery.to_dict` has the key only when a sound was found; `StyleSpec.sound` carries the
+   same dict when the style spec has that field); the LLM layer takes the `sound` of the translation record (the model's answer, else
+   translate's rule result) and a sound with no `delivery` object still makes an llm layer of its own (confidence 0.7). The earlier layer's
+   kind wins. `text_emotion` stage `VERSION` is 3 (passports of version 2 have no `delivery.sound`).
 2. **narration cues**: the narrator lines around the line (`narration_window`, +-3 lines, same scene) are scanned
    with the table `configs/delivery_cues.yaml` (`ja` entries: substrings, kana-insensitive; other languages: word
    stems matched as prefixes, so gender/tense forms match, reflexive `-ся/-сь` ignored; scanned in the source
@@ -433,6 +478,33 @@ elapsed_s, peak_vram_gb, pre_vc_wav, round).
   block per backend name (`mode`, `token` / `tokens`, `only`, `spelling`, `stage`, per-language overrides). The setting is left out
   of the synth cache hash (the spelled text and the laugh phrase are part of every candidate key), so enabling it, or editing the
   table, regenerates only the candidates of lines with a laugh.
+- **Non-speech sounds** (`synth.sounds`, `configs/sounds.yaml`, `text/sounds.py`): "ZZZ...", "Muah!", "Achoo!", `*yawns*` are letters to a
+  TTS. After the laughs, every sound of the TTS text (kana, Cyrillic, Latin) is written the way `sounds.render_for_backend` says for the
+  backend: `respell` (default) = the stand-in spelling of the target language per kind ("Хр-р-р... хр-р-р...", "Чмок!", "Апчхи!"),
+  `tag` = the backend event tag in front of the spelling (Fish `[snoring]`, Higgs `<|sfx:cough|>`), `inline` / `keep` as for laughter;
+  a stage direction is removed (`stage: remove`). The sounds pass runs before the acute conversion and after `unstress_laughs`-style
+  clean-up (marks inside a sound are dropped), so a stand-in never gets ruaccent marks. A project translated before the table still
+  carries "З-З-З..." / "Му-ах!" and no `sound` field: the regexes find those, and a line whose record says `sound.only` with a kind the
+  regexes cannot see ("Он спит") is replaced as a whole by the stand-in. A line that is only a sound always becomes the stand-in once
+  (built from one sound of its kind, so a two-word spelling is not rendered on top of itself). The kind reaches the style
+  (`StyleSpec.sound` = `{kind, n, only, stage}` plus the kind as an event, absent when empty so old candidate keys do not move): the
+  instruct says "snoring softly, no words" / "blowing a kiss" / "yawning" / "gasping" / "sneezing" / "coughing" / "humming" / "huffing in
+  annoyance" / "shivering" / "chewing", a sound-only line gets an instruction about the sound alone ("Only soft, even snoring, no words:
+  a real sound and not letters read out"), VoxCPM2 gets "(.., snoring softly)", and the Fish / Higgs prefix leaves its own `cough` tag
+  out when the text already carries the table's tag. The sidecar has `sound: {kind, n, mode, only, stage}` (absent without a sound),
+  `text_used` is what was sent, `text_plain` (the CER reference) the stand-in; the stage summary `sounds: {lines, modes, silent}`.
+  What a line that is nothing but a sound becomes is `synth.sounds.only` (no voice model really snores on request):
+  * `spell` (default): the stand-in is spoken, in the usual candidates;
+  * `sample`: no TTS call. The clip of `synth.sounds.samples.<kind>` (wav / ogg / mp3, a path relative to the repo or absolute) is
+    converted to mono (its own sample rate) and is the ONE candidate `sample_P_<k>.wav` (backend `sample`, sidecar
+    `sound.mode: "sample:<path>"`; no model, no VRAM). A kind without a clip, or a missing file, falls back to `spell` with one
+    warning per kind per run. Leftover TTS takes of the line are deleted, and the sample is deleted when the line is spoken again;
+  * `silent`: the line has no candidates (stale ones are deleted) and is counted in `sounds.silent`; score writes no selection for it
+    (neither a failure nor a review item), master never sees it, and pack lists it under `coverage.left_out_reasons.sound_silent`
+    (INSTALL.md: "N line(s) are only a sound ... left silent: `synth.sounds.only`"; the app's coverage callout has the label
+    `coverage.reason.sound_silent`).
+  `synth.sounds` is left out of the synth cache hash like `synth.laughter` (the spelled text and the sound phrase are part of every
+  candidate key), so enabling it or editing the table regenerates only the candidates of lines with a sound. `set_text` is sent as typed.
 - Russian stress: a backend with `stress_format: plus` is sent `text_tts_plus` as it is; `acute` (Chatterbox) turns it into U+0301
   marks after the laughs are written, without marks on a word with one vowel or on ё. Laughs lose their marks first, or the
   laugh patterns would not see them; `text_used` shows what was sent, `text_plain` (the CER reference) never has marks, a `set_text`
@@ -492,6 +564,11 @@ its failure text names the failing gate and says `laughter only, no words to che
 a laugh while the line has words is "the ASR heard no words" (unchecked gate), as before. The compared texts are stored
 on the candidate (`cer_ref`, `asr_text`, `cer_hyp` when a laugh was taken out of the transcript, `cer_rule`); a CER
 stored by an older run (no `cer_rule`) for a line that has laughter is recomputed on the next `score`.
+Non-speech sounds (snoring, kisses, yawns ...) follow the same rule: `cer_reference` and `cer_words` strip them from both sides (a
+stand-in inside speech never counts against the words), a line that is nothing but a sound has no CER gate (`cer` in `na`, note
+`sound: no words to check`, never "every take misreads the text"), and a stored CER of a line with a sound is recomputed once. A
+candidate of the `sample` backend (a recorded clip, `synth.sounds.only: sample`) is not measured: every metric is `na`, the note is
+`recorded sample`, it passes the gates and is selected `auto`. A line synth left silent on purpose (`only: silent`) gets no selection.
 Lines without original audio (route P): `emo_sim`, `adv_delta`, `prosody` and `dur_ratio` are not computed, so
 those terms are missing and the composite is renormalized over `utmos` / `pq` / `spk_sim` / `cer`; no gate needs a
 reference metric (gates of unavailable metrics are never evaluated). `spk_sim` is measured against the performer's
@@ -524,7 +601,8 @@ duration step: pitch / tempo pass for backends without a native knob (the reques
 Out: `out/<engine>/...` + `INSTALL.md` + `manifest_patch.json` (file, sha256, line_id,
 backend, route, status; `reason` for provisional lines). Both state what the patch covers: how many of the dubbed
 lines have a file, how many of those are provisional ("best take installed, check it in Review"), how many are LEFT
-OUT and why (`review` / `regen` with `include_review_lines: skip`, `no winner`, `not mastered`; each listed in
+OUT and why (`review` / `regen` with `include_review_lines: skip`, `no winner`, `not mastered`, `sound_silent` = a line that is only a
+sound and `synth.sounds.only` is `silent`; each listed in
 `manifest_patch.json` under `coverage.left_out_lines`), how many narration lines are never dubbed, and (Ren'Py) how
 many speaker lines are NOT INSTALLABLE because the script gives them a `voice` statement of their own (`own_voice`,
 `own_voice_lines`: `config.auto_voice` is never asked for them). INSTALL.md is rebuilt on every pack (its sections
@@ -552,6 +630,25 @@ no original voice; a bare `voice_mix: true|false` is `enabled`), `duck: 0.3` (1.
 `manifest_patch.json` carries a top-level `voice_mix` (`{rpy, key, keysym, duck, enabled}` or `null`), INSTALL.md the section
 "The voice track in the game", the pack summary `voice_mix: true|false`. A full pack removes a `vndub_voice_mix.rpy` it
 generated earlier when the feature is now off (same rule as the stale auto_voice script). See ENGINES.md.
+Ren'Py translated text: the voice patch alone leaves the on-screen text in the source language, so `pack` also writes the
+translation into Ren'Py's translation framework from `work/translation/lines.<tgt>.jsonl` (`text_tgt`, never `text_tts`):
+`game/tl/<language>/vndub_dialogue.rpy` with one `translate <language> <dialogue id>:` block per say line (the shape of
+`renpy translate`: original as a comment, then the say statement with the same speaker, attributes, `nointeract` / `id` /
+arguments and the group's `voice` statement) and a `translate <language> strings:` block for menu choices (`choices_tgt` of
+the menu's translation record) and captions, and `game/vndub_language.rpy` (`define config.language = "<language>"`, which beats
+the player's saved choice). `<language>` is Ren'Py's lowercase name of `project.tgt_lang` (ru -> russian, en -> english, ja ->
+japanese, zh, ko, de, fr, es, it, pt, uk; an unknown code is its own name). Config `pack.renpy.text`: `enabled: auto | true |
+false` (auto = the project has a translation file; a bare `text: true|false` is `enabled`), `language: ""` (override), `font: ""`
+(a .ttf / .otf inside `game/`, emitted as `translate <language> python:` setting `gui.text_font` for a game whose font lacks the
+alphabet). Left in the source language and listed in `manifest_patch.json` `text.skipped` (`{line_id, id, reason}`): "not
+translated", "interpolation lost" (the translation dropped `[name]`, `%(x)s` or a `{w}` / `{p}` / `{nw}` flow tag of the
+original), "own voice statement" (an expression voice or a missing file: the block would drop the group's voice), "choices not
+translated" (no `choices_tgt` of the right length), "markup in the choice", "duplicate identifier", and what the game's own
+`game/tl/<language>/*.rpy` already translates. `manifest_patch.json` carries a top-level `text` (`{rpy, language_rpy, language,
+lines, strings, skipped, skipped_count, skipped_reasons, font, enabled}` or `null`), INSTALL.md the section "The translated text"
+(how it works and how to undo it: delete `game/vndub_language.rpy` and `game/tl/<language>/vndub_dialogue.rpy` with their `.rpyc`
+twins), the pack summary `text`, `text_lines`, `text_strings`, `text_skipped`. A full pack removes both scripts (any language
+folder) when the feature is off. Not verified in a real Ren'Py (no SDK on the build machine).
 
 ### report
 Out: `work/report/index.html`, `work/report/report.md`: mapping coverage, per-character

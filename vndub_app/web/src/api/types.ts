@@ -122,6 +122,9 @@ export type ProgressEvent =
 
 // ---- project --------------------------------------------------------------------------------
 
+/** the protagonist the characters address as "you": m = male, f = female, unknown = not specified */
+export type PlayerGender = "m" | "f" | "unknown";
+
 export interface AppState {
   step: StepId;
   completed: StepId[];
@@ -133,6 +136,8 @@ export interface AppState {
     import_path: string;
     honorifics: "drop" | "keep" | "adapt";
     address_default: string;
+    /** missing in app_state files written before it existed: read as "unknown" */
+    player_gender?: PlayerGender;
   };
   advanced: { asr_check: boolean; [k: string]: unknown };
   config_overrides: Record<string, unknown>;
@@ -279,6 +284,7 @@ export interface TranslationSettings {
   import_path: string;
   honorifics: "drop" | "keep" | "adapt";
   address_default: string;
+  player_gender: PlayerGender;
   license_policy: string;
   llm_available: boolean;
   advanced: {

@@ -168,6 +168,12 @@ class TranslationRecord(Record):
     source: str = ""  # import | llm:<model> | mock
     glossary_hits: list[str] = Field(default_factory=list)
     flags: list[str] = Field(default_factory=list)
+    # a menu record (line flag `menu`, empty text): the translated choices, same order and length as LineRecord.choices.
+    # Narration / menu_caption lines translated for the text patch only carry the usual fields. None = not translated.
+    choices_tgt: list[str] | None = None
+    # a non-speech sound in the line (vndub.text.sounds): {kind: snore|kiss|yawn|gasp|sneeze|cough|hum|hmph|shiver|eat,
+    # only: the line is nothing but the sound, stage: it was a bracketed stage direction, source: llm|rule}. None = no sound.
+    sound: dict[str, Any] | None = None
 
 
 class SynthSidecar(Record):
@@ -187,6 +193,7 @@ class SynthSidecar(Record):
     pre_vc_wav: str | None = None
     round: int = 0
     wav: str = ""
+    sound: dict[str, Any] | None = None  # {kind, n, mode, only, stage}: how a non-speech sound of the text was handled (synth.sounds)
 
 
 class CandidateScore(Record):

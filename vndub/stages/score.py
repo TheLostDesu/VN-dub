@@ -41,6 +41,14 @@ on the other gates (``regen_hopeless`` never fires on them: there is no CER). A 
 words (only a laugh, or nothing) keeps the "the ASR heard no words" verdict, an unchecked gate. CER values stored before
 this rule (no ``cer_rule`` on the record) of a line that has laughter are recomputed on the next run.
 
+Non-speech sounds (``synth.sounds``, ``vndub.text.sounds``): the same rule as laughter. :func:`cer_reference` and
+:func:`cer_words` strip sounds ("Achoo!", "Хр-р-р", ``*yawns*``) from both sides, so a stand-in inside speech never counts against
+the words; a line that is nothing but a sound has no CER gate (``cer`` in ``na``, note :data:`SOUND_NOTE`, never hopeless). A
+candidate of the ``sample`` backend (a recorded clip that replaced the TTS, ``synth.sounds.only: sample``) is not measured at
+all: every metric is ``na``, the note is :data:`SAMPLE_NOTE`, it passes and is selected ``auto``. A line that synth left out
+on purpose (``synth.sounds.only: silent``) has no candidates and no selection: it is neither a failure nor a review item (``pack``
+lists it as ``sound_silent``).
+
 Resume: the metrics of a candidate whose scoring has not finished are kept in ``scores/_partial.json`` (see
 :class:`_Partial`: keyed by candidate id, valid for its file fingerprint and the metric key), written after every metric
 group and at most every ``PARTIAL_EVERY_S`` seconds while a group runs; ``run`` starts from them and ``Cand.needs``
@@ -73,7 +81,7 @@ from vndub.backends.score.speaker_sim import cosine
 from vndub.manifest.io import CandidateScore, LineRecord, SelectionRecord, SynthSidecar, load_overrides, read_json, write_json, write_jsonl
 from vndub.stages import genutil as gu
 from vndub.stages.common import StageError
-from vndub.text import laughter
+from vndub.text import laughter, sounds
 from vndub.util import file_fingerprint, hash_obj
 
 NAME = "score"
@@ -95,6 +103,11 @@ GATE_GROUPS = {"mos": "utmos", "speaker": "spk_sim", "cer": "cer"}
 GATE_LABELS = {"mos": "naturalness (utmos)", "speaker": "speaker similarity (spk_sim)", "cer": "speech intelligibility (cer)"}
 # the note of a candidate whose line is nothing but laughter: its CER gate is not applicable (``na``), not unchecked
 LAUGHTER_NOTE = "laughter: no words to check"
+# the note of a candidate whose line is nothing but a non-speech sound (snoring, a kiss ...): same treatment as laughter
+SOUND_NOTE = "sound: no words to check"
+# a recorded clip that replaced the TTS (backend "sample"): no metric applies, it passes unchecked
+SAMPLE_NOTE = "recorded sample"
+SAMPLE_NA = ["utmos", "pq", "spk_sim", "emo_sim", "adv_delta", "cer", "dur_ratio", "prosody"]
 # the rule a stored CER was computed under; absent = the old one (laughter counted as text)
 CER_RULE = "2"
 PARTIAL_FILE = "_partial.json"
@@ -217,9 +230,22 @@ def translation_problem(tr: Any) -> str:
     return ""
 
 
+def silent_sound_line(cfg: Any, tr: Any, line: Any = None) -> bool:
+    from vndub.stages.synth import silent_sound_line as _silent
+
+    return _silent(cfg, tr, line)
+
+
 def cer_reference(side: SynthSidecar | None, tr: Any, cont: list[Any]) -> str:
     """CER reference: the sidecar's text_plain (what synth actually used), else rebuilt
-    from the translation (text_plain_short for the short variant; sustain continuations joined)."""
+    from the translation (text_plain_short for the short variant; sustain continuations joined). Non-speech sounds are
+    taken out (:func:`raw_cer_reference` keeps them)."""
+    raw = raw_cer_reference(side, tr, cont)
+    return " ".join(sounds.strip_sounds(raw, "auto").split()) if sounds.has_sound(raw) else raw
+
+
+def raw_cer_reference(side: SynthSidecar | None, tr: Any, cont: list[Any]) -> str:
+    """:func:`cer_reference` before the sounds are taken out."""
     ref = (side.model_extra or {}).get("text_plain") if side is not None else None
     if ref:
         return str(ref)
@@ -237,7 +263,12 @@ def cer_reference(side: SynthSidecar | None, tr: Any, cont: list[Any]) -> str:
 def cer_words(ref: str, hyp: str) -> tuple[str, str]:
     """(reference, transcript) with the laughter taken out: the CER is about the words, a laugh is not text an ASR can spell
     (``"Haha, no way!"`` -> ``"no way!"``). Both sides are stripped in every script (``lang="auto"``)."""
-    return laughter.strip_laughter(ref or "", "auto"), laughter.strip_laughter(hyp or "", "auto")
+    return _strip_nonspeech(ref or ""), _strip_nonspeech(hyp or "")
+
+
+def _strip_nonspeech(text: str) -> str:
+    out = laughter.strip_laughter(text, "auto")
+    return " ".join(sounds.strip_sounds(out, "auto").split()) if sounds.has_sound(out) else out
 
 
 def cer_over_words(ref: str, hyp: str, words: tuple[str, str] | None = None) -> float:
@@ -255,7 +286,12 @@ def cer_over_words(ref: str, hyp: str, words: tuple[str, str] | None = None) -> 
 
 def is_laughter_line(c: CandidateScore) -> bool:
     """Is this candidate's line nothing but laughter (its CER gate is not applicable, see :data:`LAUGHTER_NOTE`)?"""
-    return LAUGHTER_NOTE in c.notes
+    return LAUGHTER_NOTE in c.notes or SOUND_NOTE in c.notes
+
+
+def is_sample(c: CandidateScore) -> bool:
+    """Is this candidate a recorded clip that replaced the TTS (``synth.sounds.only: sample``)?"""
+    return c.backend == "sample" or SAMPLE_NOTE in c.notes
 
 
 def spk_threshold(cfg: Any, calibration: dict[str, Any] | None) -> tuple[float, str]:
@@ -268,6 +304,11 @@ def spk_threshold(cfg: Any, calibration: dict[str, Any] | None) -> tuple[float, 
 
 
 def apply_scores(c: CandidateScore, cfg: Any, thr: float, interjection: bool) -> CandidateScore:
+    if is_sample(c):  # a recording, not a synthesis: nothing to measure, nothing to gate
+        c.composite, c.gates, c.passed = None, {}, True
+        setattr(c, "missing", [])
+        setattr(c, "failures", "")
+        return c
     comp, missing = composite(c.metrics, cfg.score.weights)
     c.composite = comp
     gates = cfg.score.gates
@@ -364,7 +405,7 @@ def select(
         return rec(best, "review", f"no gate could be evaluated: nothing to judge the takes by{unavail_note}")
     why = (best.model_extra or {}).get("failures") or "no gate could be evaluated"
     if is_laughter_line(best):
-        why += " (laughter only, no words to check)"
+        why += " (laughter only, no words to check)" if LAUGHTER_NOTE in best.notes else " (only a sound, no words to check)"
     if best.metrics.get("dur_ratio") is not None and float(best.metrics["dur_ratio"]) > 1.25:
         why += "; try text_tgt_short"
     if rnd < regen_rounds:
@@ -571,6 +612,10 @@ def run(ctx: Any) -> dict[str, Any]:
             else:
                 record = CandidateScore(line_id=line.line_id, wav=rel, backend=side.backend, route=side.route, metrics={})
                 setattr(record, "na", ["cer"] if side.route == "orig" else [])
+            if side.backend == "sample":
+                setattr(record, "na", list(SAMPLE_NA))
+                if SAMPLE_NOTE not in record.notes:
+                    record.notes = [*record.notes, SAMPLE_NOTE]
             setattr(record, "fp", fp)
             setattr(record, "mkey", mkey)
             setattr(record, "round", side.round)
@@ -590,6 +635,8 @@ def run(ctx: Any) -> dict[str, Any]:
     for line in lines:
         lst = per_line.get(line.line_id, [])
         tr = trs.get(line.line_id)
+        if not lst and silent_sound_line(cfg, tr, line) and not any(o.action in ("set_text", "accept", "keep_original") for o in overrides.get(line.line_id, [])):
+            continue  # synth.sounds.only: silent -- left out on purpose: no selection, no review item (pack lists it)
         interj = bool(tr and "interjection" in tr.flags)
         for c in lst:
             apply_scores(c.rec, cfg, thr, interj)
@@ -679,6 +726,12 @@ def line_cer_reference(c: Cand, trs: dict[str, Any]) -> str:
     return cer_reference(c.side, c.tr, [x for x in cont if x is not None])
 
 
+def line_raw_cer_reference(c: Cand, trs: dict[str, Any]) -> str:
+    """:func:`line_cer_reference` with the sounds still in it."""
+    cont = [trs.get(x) for x in ((c.line.model_extra or {}).get("sustain_lines") or [])]
+    return raw_cer_reference(c.side, c.tr, [x for x in cont if x is not None])
+
+
 def _laughter_lines(cands: list[Cand], trs: dict[str, Any], partial: _Partial) -> None:
     """Decide the CER of every candidate whose text has laughter, before any model runs.
 
@@ -688,24 +741,29 @@ def _laughter_lines(cands: list[Cand], trs: dict[str, Any], partial: _Partial) -
     * the text has words and laughter and its CER was computed before laughter was taken out (no ``cer_rule``): recomputed.
     """
     for c in cands:
-        if c.rec.route == "orig":
+        if c.rec.route == "orig" or is_sample(c.rec):
             continue
         ref = line_cer_reference(c, trs)
         changed = False
-        if laughter.is_laughter_only(ref):
+        note = LAUGHTER_NOTE if laughter.is_laughter_only(ref) else (SOUND_NOTE if sounds.is_sound_only(line_raw_cer_reference(c, trs)) else None)
+        if note is not None:
             if "cer" not in c.na:
                 c.rec.na = [*c.na, "cer"]  # type: ignore[attr-defined]
                 changed = True
             stale = [c.rec.metrics.pop("cer", None), (c.rec.model_extra or {}).pop("asr_text", None)]
             changed = changed or any(x is not None for x in stale)
-            if LAUGHTER_NOTE not in c.rec.notes:
-                c.rec.notes = [*c.rec.notes, LAUGHTER_NOTE]
+            stale_notes = [n for n in c.rec.notes if n in (LAUGHTER_NOTE, SOUND_NOTE) and n != note]
+            if stale_notes:
+                c.rec.notes = [n for n in c.rec.notes if n not in stale_notes]
+                changed = True
+            if note not in c.rec.notes:
+                c.rec.notes = [*c.rec.notes, note]
                 changed = True
         elif is_laughter_line(c.rec):
             c.rec.na = [x for x in c.na if x != "cer"]  # type: ignore[attr-defined]
-            c.rec.notes = [n for n in c.rec.notes if n != LAUGHTER_NOTE]
+            c.rec.notes = [n for n in c.rec.notes if n not in (LAUGHTER_NOTE, SOUND_NOTE)]
             changed = True
-        elif c.rec.metrics.get("cer") is not None and (c.rec.model_extra or {}).get("cer_rule") != CER_RULE and laughter.has_laughter(ref):
+        elif c.rec.metrics.get("cer") is not None and (c.rec.model_extra or {}).get("cer_rule") != CER_RULE and (laughter.has_laughter(ref) or sounds.has_sound(line_raw_cer_reference(c, trs))):
             c.rec.metrics.pop("cer")
             changed = True
         if changed:
@@ -1007,7 +1065,7 @@ def _compute_groups(ctx: Any, cands: list[Cand], unavailable: dict[str, str], pa
         partial.checkpoint(force=True)
     # duration + prosody (core DSP, F0 via the configured f0 backend)
     for c in cands:
-        if c.rec.metrics.get("dur_ratio") is None:
+        if c.rec.metrics.get("dur_ratio") is None and "dur_ratio" not in c.na:
             src_d = gu.src_duration(ctx, c.line, c.passport) / native_speed(c.side)  # a speed the backend applied is expected
             if src_d > 0:
                 c.rec.metrics["dur_ratio"] = round(features.duration(c.wav) / src_d, 4)
