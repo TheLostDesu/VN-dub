@@ -9,7 +9,7 @@ script folds every part into the main tables:
   that exists in the main table with a different text is reported as a conflict and ignored;
 * keys are appended in part-file order, so the diff stays readable;
 * after the merge it reports keys that exist in one language only (the i18n test fails on them);
-* ``--delete`` removes the part files that were merged (the lead does this once, at the end);
+* ``--delete`` removes the part files that were merged (done once, at the end);
 * ``--dry-run`` only reports.
 
     uv run python scripts/merge_i18n.py              # merge, keep the part files

@@ -115,7 +115,7 @@ def data_dir() -> Path:
 def set_data_dir(path: Path) -> Path:
     """Persist a new data folder location (takes effect for new paths immediately).
 
-    Existing data is not moved (DECISIONS: "Desktop app").
+    Existing data is not moved.
     """
     path = Path(path).resolve()
     path.mkdir(parents=True, exist_ok=True)

@@ -166,7 +166,7 @@ def display_name(sid: str, chars: dict[str, Any]) -> str:
 def status_of(sel: Any | None) -> str:
     """Review status of a selection record: ``ok`` | ``check`` | ``failed``.
 
-    Mapping (documented in docs/decisions/S.md): selection ``auto`` and ``override`` ->
+    Mapping: selection ``auto`` and ``override`` ->
     ``ok`` (the user decided or the gates passed); ``review`` and ``regen`` -> ``check``;
     a record without a winner (nothing could be synthesized / translation failed) -> ``failed``.
     """
