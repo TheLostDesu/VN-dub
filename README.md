@@ -1,5 +1,20 @@
 # VN-dub
 
+## Contributors
+
+<a href="https://github.com/TheLostDesu/VN-dub/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=TheLostDesu/VN-dub" alt="Contributors" />
+</a>
+
+| | Contributor | Contribution |
+|---|---|---|
+| <img src="https://github.com/TheLostDesu.png?size=64" width="64" alt="TheLostDesu"> | [**TheLostDesu**](https://github.com/TheLostDesu) | idea, research lead, architecture, AI-agent direction * |
+| <img src="https://github.com/AZLik.png?size=64" width="64" alt="AZLik"> | [**AZLik**](https://github.com/AZLik) | lead tester: real GPU, real games |
+
+<i>* The code and the tests were written by AI coding agents (Claude Code) under that direction.</i>
+
+## What this is
+
 Fully local AI dubbing for visual novels: game assets -> who says which line with which voice file -> a measured
 "expression passport" of every original line -> translation -> expressive speech in the target language (Russian by
 default) in the same character's voice -> automatic scoring and selection -> a patch in the game's own format.
@@ -70,15 +85,6 @@ powershell -File packaging/build_app.ps1                   # dist/VNDub/VNDub.ex
 | [docs/APP.md](docs/APP.md) | Desktop app user manual (Russian, with screenshots) |
 | [vndub_app/API.md](vndub_app/API.md) | Desktop app internals: REST and WebSocket API, jobs, i18n |
 | [CHANGELOG.md](CHANGELOG.md) | What every release changed |
-
-## Contributors
-
-| | Contributor | Contribution |
-|---|---|---|
-| <img src="https://github.com/TheLostDesu.png?size=64" width="64" alt="TheLostDesu"> | [**TheLostDesu**](https://github.com/TheLostDesu) | author of the idea; research lead (engines, speech models, metrics), product and architecture decisions, specifications, direction and review of the AI coding agents, releases |
-| <img src="https://github.com/AZLik.png?size=64" width="64" alt="AZLik"> | [**AZLik**](https://github.com/AZLik) | lead tester: runs every release on a real GPU machine and real games, and reports what is wrong by ear and in the game |
-
-The code and the tests were written by AI coding agents (Claude Code) under that direction.
 
 ## Status and limits
 
