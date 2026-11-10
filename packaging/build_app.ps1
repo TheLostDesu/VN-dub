@@ -32,7 +32,7 @@
                               Visual Studio 2022 Build Tools with the C++ workload:
                               winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
   A missing Node.js or Inno Setup is a warning, not an error: the SPA is then the "not built" page / the
-  installer step is skipped. The lead rebuilds after the SPA lands. With -InstallerOnly a missing Inno
+  installer step is skipped. With -InstallerOnly a missing Inno
   Setup is an error (that is all the run is for).
   Inno Setup 6.3+ (ISCC.exe) is found via -Iscc, PATH, the registry or the usual folders, the per-user
   one (%LOCALAPPDATA%\Programs\Inno Setup 6) included:

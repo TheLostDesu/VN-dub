@@ -19,7 +19,7 @@ no display text. ``fix.action`` is either one of the fix actions above (button l
 ``doctor.fix.<action>``) or a navigation action from ``errors.ACTIONS`` (``open_tools`` /
 ``open_models``, label ``actions.<action>``).
 
-Thresholds (also in docs/decisions/O.md):
+Thresholds:
 
 * VRAM (nvidia-smi MiB / 1024): green >= 7.9 GB (an "8 GB" card reports 8188..8192 MiB), yellow
   5.9..7.9 GB, red below or without an NVIDIA GPU.

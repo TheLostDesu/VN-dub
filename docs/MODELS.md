@@ -102,7 +102,7 @@ only when the real one is unusable, and every substitution is logged and reporte
 ## Verified on the build machine (2026-10-21)
 
 Machine: Windows 11 Pro, Intel Core i7-1185G7, 48 GB RAM, Intel Iris Xe -- **no NVIDIA GPU**, so
-everything below ran on CPU and `peak_vram_gb` is `null`. Raw output: [selftest_results.json](selftest_results.json).
+everything below ran on CPU and `peak_vram_gb` is `null`.
 
 Environments created with `scripts/make_envs.ps1 -Cpu`:
 

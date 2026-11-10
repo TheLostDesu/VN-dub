@@ -49,7 +49,7 @@ adapter is restarted once and the call retried; timeouts kill the process. An ad
 the items of a `run` call one by one (`op_<name>`) or, where the library takes a batch, all at
 once (`batch_<name>` built on `rpc.run_in_batches`: sub-batches of `options.batch_size`, a
 failing sub-batch redone item by item, results in item order; SenseVoice, anime-SER, Qwen3-ASR,
-the Qwen3 aligner and UTMOSv2 do, see DECISIONS.md "Batched adapters"). Role operations:
+the Qwen3 aligner and UTMOSv2 do). Role operations:
 
 | role | op | item -> result |
 |---|---|---|

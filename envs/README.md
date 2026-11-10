@@ -33,7 +33,7 @@ $env:VNDUB_ENVS_DIR = "D:ndub-envs"; scripts\make_envs.ps1 -Env main  # creates
 
 The desktop app also keeps uv's managed Pythons and its wheel cache next to the envs (`<envs>/_uv/python`, `<envs>/_uv/cache`,
 `UV_PYTHON_INSTALL_DIR` / `UV_CACHE_DIR` set for every uv it runs) so that a wheel two envs share is downloaded once and hardlinked, and
-passes the concrete interpreter (`-Python <path>`) instead of a version; see `vndub_app/installer.py` and decision 16 in docs/DECISIONS.md.
+passes the concrete interpreter (`-Python <path>`) instead of a version; see `vndub_app/installer.py`.
 From the command line the plain `make_envs` calls above use uv's defaults.
 
 ### Build record and health checks

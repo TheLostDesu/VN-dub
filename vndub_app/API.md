@@ -1,9 +1,7 @@
 # VNDub desktop app — internal contract (API, data, pipeline hooks)
 
-This file was the single agreement between the app's parts while they were built in parallel: the pipeline (`vndub/`), the
-backend (`vndub_app/`), the SPA (`vndub_app/web/`) and packaging. Spec:
-the desktop app specification. If you need to
-change a shape below, keep it backward compatible and note it in your final report.
+This file is the agreement between the app's parts: the pipeline (`vndub/`), the backend (`vndub_app/`), the SPA
+(`vndub_app/web/`) and packaging. If you need to change a shape below, keep it backward compatible.
 
 ## 0. Shared core (already written — use, do not rewrite)
 
@@ -106,7 +104,7 @@ before any translation), and again after `translate` (merges the LLM layer).
   them; pack places them (Ren'Py: generated `voice` statements file; other engines: `out/<engine>/unvoiced/`
   + INSTALL.md note — manual).
 * Stars: `stars = clamp(round(1 + 4 * (spk_sim - thr_lo) / (thr_hi - thr_lo)), 1, 5)` with the calibrated
-  threshold as the 3-star point (document the exact mapping in DECISIONS).
+  threshold as the 3-star point.
 
 ## 3. HTTP API (FastAPI, `127.0.0.1:<port>`, JSON; errors per `errors.py`)
 
@@ -294,7 +292,7 @@ Stage names for progress labels: i18n `stages.<name>`.
 The implementation follows this contract with backward-compatible additions (extra fields such as
 review `counts`/`total`, summary `no_text_sample`/`recover_offer`, doctor `params.reason` variants,
 tool/model row extras, `GET /api/progress/sse` as an SSE twin of the WebSocket, `?slug=` on the install
-routes). They are listed with their rationale in `docs/DECISIONS.md`, section "Desktop app". Review
+routes). Review
 action payloads: accept/reject `{candidate: <candidate id = work-relative wav>}` (or `{label}`), regen
 `{text, style_prompt}`, set_ref `{ref: <refs[].path>}`, set_src_text `{text}`, tuning = tuning dict.
 
@@ -302,4 +300,4 @@ Models by Hugging Face link (`vndub_app/hf_custom.py`): file bytes of every Hugg
 streamed by `vndub_app/downloads.py` after `huggingface_hub` has resolved the pre-signed link, size and sha256
 (`models_api.HfHub.fetch`), so a cancel acts within a second and a half-downloaded file continues from `<file>.part`;
 `huggingface_hub` 2.x does not resume across calls and `hf_xet` swallows exceptions raised by progress callbacks.
-`downloads.fetch(identity=...)` keeps a `.part` valid although the signed URL changes. Details: `docs/DECISIONS.md`, "HF links".
+`downloads.fetch(identity=...)` keeps a `.part` valid although the signed URL changes.

@@ -39,13 +39,9 @@ Documentation:
 | [docs/PIPELINE.md](docs/PIPELINE.md) | Stages, inputs/outputs, data contracts, config keys |
 | [docs/ENGINES.md](docs/ENGINES.md) | Per-engine extraction / parsing / packing, external tools |
 | [docs/MODELS.md](docs/MODELS.md) | Every model: id, role, VRAM, license, fallback |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | Decisions taken where the spec left room |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common failures and fixes |
-| [docs/BUILD_REPORT.md](docs/BUILD_REPORT.md) | What was built and verified on the build machine |
 | [docs/APP.md](docs/APP.md) | Desktop app user manual (Russian, with screenshots) |
 | [vndub_app/API.md](vndub_app/API.md) | Desktop app internals: REST/WebSocket API, jobs, i18n, pipeline hooks |
-| [docs/APP_BUILD_REPORT.md](docs/APP_BUILD_REPORT.md) | What was built and verified for the desktop app |
-| [docs/APP_ROUND2_REPORT.md](docs/APP_ROUND2_REPORT.md) | Round 2 (in Russian): off-screen voices in casting, committed SPA build, Hugging Face links, installer |
 
 ## Legal note
 

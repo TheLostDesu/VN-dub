@@ -15,7 +15,7 @@ code, details}`` or ``null``.
 
 Presets: ``recommended`` = the ``default`` profile of the registry; ``all`` = every real backend (default
 and optional); ``min`` = :data:`PRESET_MIN` (one TTS family for casting and synthesis, one translation LLM,
-the cheapest analysis and scoring models), see docs/decisions/O.md.
+the cheapest analysis and scoring models).
 """
 
 from __future__ import annotations
