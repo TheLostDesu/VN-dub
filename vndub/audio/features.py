@@ -124,7 +124,7 @@ def snr_db(energy_db: np.ndarray, speech_mask: np.ndarray) -> float | None:
     if sp.size == 0:
         return None
     if ns.size < 5:
-        return 40.0  # no measurable noise floor: tightly trimmed clean clip
+        return None  # no measurable noise floor (a tightly trimmed clip, or a music bed under all of it): unknown, not the old 40 dB "perfect"
     p_sp = np.mean(10 ** (sp / 10))
     p_ns = np.mean(10 ** (ns / 10))
     return float(10 * np.log10(max(p_sp, 1e-12) / max(p_ns, 1e-12)))

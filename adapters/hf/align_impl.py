@@ -27,6 +27,8 @@ def _split_unit(text: str, t0: float, t1: float) -> list[dict[str, Any]]:
 class Qwen3Aligner(ModelImpl):
     selftest_op = "align"
 
+    probe_imports = ("torch", "qwen_asr")  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         import torch
         from qwen_asr import Qwen3ForcedAligner
@@ -87,6 +89,8 @@ class Qwen3Aligner(ModelImpl):
 
 class CTCAligner(ModelImpl):
     selftest_op = "align"
+
+    probe_imports = ("torch", "transformers")  # what load() imports (ModelImpl.probe)
 
     def load(self) -> dict[str, Any]:
         import torch

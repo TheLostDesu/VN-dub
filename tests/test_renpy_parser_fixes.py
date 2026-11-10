@@ -219,6 +219,14 @@ def test_ids_ignore_voice_statements_from_renpy_8_6(tmp_path: Path, make_ctx) ->
     assert any("8.6.0" in n and "ignore" in n for n in res.notes)
 
 
+def test_ids_ignore_voice_statements_from_renpy_8_5_1(tmp_path: Path, make_ctx) -> None:
+    """Round 18, checked in the 8.5.3 SDK: `renpy translate` writes the id of the say alone for a voice + say pair."""
+    game = _versioned_game(tmp_path, {"vc_version.py": b'version = "8.5.3.26051504"\n'})
+    _, _, _, res = detect_and_parse(make_ctx(game))
+    assert _first_id(res) == "start_636ae3f5"
+    assert any("8.5.3" in n and "ignore" in n for n in res.notes)
+
+
 def test_ids_include_voice_statements_before_renpy_8_6(tmp_path: Path, make_ctx) -> None:
     game = _versioned_game(tmp_path, {"__init__.py": b"version_tuple = (8, 3, 4, vc_version)\n"})
     _, _, _, res = detect_and_parse(make_ctx(game))

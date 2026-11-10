@@ -76,7 +76,7 @@ export function VoiceTuningPanel({
             ))}
           </div>
 
-          <TextField label={t("tuning.note")} value={value.character_note} onChange={(v) => set({ character_note: v })} placeholder={t("tuning.note_placeholder")} testid={`${prefix}-note`} />
+          <TextField label={t("tuning.note")} value={value.character_note} onChange={(v) => set({ character_note: v.slice(0, 200) })} placeholder={t("tuning.note_placeholder")} testid={`${prefix}-note`} />
 
           {children}
 

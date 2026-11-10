@@ -41,6 +41,15 @@ on the other gates (``regen_hopeless`` never fires on them: there is no CER). A 
 words (only a laugh, or nothing) keeps the "the ASR heard no words" verdict, an unchecked gate. CER values stored before
 this rule (no ``cer_rule`` on the record) of a line that has laughter are recomputed on the next run.
 
+Comparable sides (CER rule 3): the reference is spelled out by translate, GigaAM writes digits, so :func:`comparable` runs the
+Russian number / abbreviation expansion on both sides and then turns every run of number words into one digit token (compared by
+value: "тремя" and "3" agree); Latin words are transliterated (``ru.translit_latin``) or dropped; a laugh syllable the ASR wrote
+for a laugh taken out of the reference is dropped. A reference under ``score.cer_short_chars`` letters tolerates one wrong
+character (:func:`cer_gate`). A CER stored under an older rule is recomputed once from the stored transcript (``asr_text``): no
+ASR, no synthesis. A take the ASR heard no words in does not pass when another take of the line has a measured CER
+(:func:`demote_unheard`); without a passing take the provisional winner is the one closest to passing (:func:`_provisional_rank`).
+A take whose sidecar text is not a text the line can have now (:func:`stale_take`) is skipped.
+
 Non-speech sounds (``synth.sounds``, ``vndub.text.sounds``): the same rule as laughter. :func:`cer_reference` and
 :func:`cer_words` strip sounds ("Achoo!", "Хр-р-р", ``*yawns*``) from both sides, so a stand-in inside speech never counts against
 the words; a line that is nothing but a sound has no CER gate (``cer`` in ``na``, note :data:`SOUND_NOTE`, never hopeless). A
@@ -77,11 +86,12 @@ from vndub.audio import features, vad
 from vndub.backends.base import BackendUnavailable
 from vndub.backends.score import prosody as pros
 from vndub.backends.score.cer import cer as cer_fn
+from vndub.backends.score.cer import normalize_for_cer, numbers_to_digits
 from vndub.backends.score.speaker_sim import cosine
 from vndub.manifest.io import CandidateScore, LineRecord, SelectionRecord, SynthSidecar, load_overrides, read_json, write_json, write_jsonl
 from vndub.stages import genutil as gu
 from vndub.stages.common import StageError
-from vndub.text import laughter, sounds
+from vndub.text import laughter, ru, sounds
 from vndub.util import file_fingerprint, hash_obj
 
 NAME = "score"
@@ -108,8 +118,13 @@ SOUND_NOTE = "sound: no words to check"
 # a recorded clip that replaced the TTS (backend "sample"): no metric applies, it passes unchecked
 SAMPLE_NOTE = "recorded sample"
 SAMPLE_NA = ["utmos", "pq", "spk_sim", "emo_sim", "adv_delta", "cer", "dur_ratio", "prosody"]
-# the rule a stored CER was computed under; absent = the old one (laughter counted as text)
-CER_RULE = "2"
+# the rule a stored CER was computed under; absent = the old one (laughter counted as text); "2" = laughter out;
+# "3" = both sides made comparable (numbers by value, Latin words, laugh syllables): an older value is recomputed from the
+# stored transcript (``asr_text``), no ASR and no synthesis needed
+CER_RULE = "3"
+# the note of a take the ASR heard no words in: its CER gate is unchecked
+NO_WORDS = "the ASR heard no words in this take"
+NO_WORDS_NOTE = f"cer failed: {NO_WORDS}"
 PARTIAL_FILE = "_partial.json"
 PARTIAL_EVERY_S = 15.0  # at most this often while a metric group runs (it is also written when a group ends)
 
@@ -271,17 +286,77 @@ def _strip_nonspeech(text: str) -> str:
     return " ".join(sounds.strip_sounds(out, "auto").split()) if sounds.has_sound(out) else out
 
 
-def cer_over_words(ref: str, hyp: str, words: tuple[str, str] | None = None) -> float:
-    """CER over the words of the line, never worse than the plain CER of the same texts.
+_LATIN_WORD = re.compile(r"\b[A-Za-z]+(?:'[A-Za-z]+)?\b")  # a whole Latin word ("дa" with a Latin "a" is not one)
+_CYR = re.compile(r"[а-яёА-ЯЁ]")
+# a laugh syllable as the ASR writes it once normalized ("ха", "хаха", "хех", "hah")
+_LAUGH_SYLLABLE = re.compile(r"^(?:[хxh][аеиоэыaeio])+[хxh]?$")
 
-    The laughs are taken out of both sides (:func:`cer_words`); an ASR that heard a laugh as a stray syllable ("ха да ну" for
-    "Ха-ха, да ну!") leaves a fragment no pattern recognizes, which then counts against the words. When a laugh was taken out
-    the reading that keeps it is computed too and the better of the two wins, so a laugh is never held against the line."""
-    ref_w, hyp_w = words or cer_words(ref, hyp)
-    value = cer_fn(ref_w, hyp_w)
-    if value > 0 and (ref_w != ref or hyp_w != hyp):
-        value = min(value, cer_fn(ref, hyp))
+
+def comparable(text: str, lang: str = "ru") -> str:
+    """A text as the CER compares it, the same transform on the reference and on the transcript.
+
+    For Russian: abbreviations and numbers are expanded (the reference was spelled out by translate, GigaAM writes "16",
+    "10:30", "100%"), then every run of number words becomes one digit token (:func:`numbers_to_digits`: "тремя" and the
+    ASR's "3" -> "три" then compare by value, not by case ending), and a Latin word is transliterated (``ru.translit_latin``)
+    or, without it, dropped from both sides (a name the translator left in Latin, the ASR writes in Cyrillic)."""
+    t = text or ""
+    if lang != "ru":
+        return normalize_for_cer(t)
+    try:
+        t = ru.normalize_numbers(ru.expand_abbreviations(t))
+    except Exception:  # never let a normalization quirk end the scoring: compare what there is
+        pass
+    if _LATIN_WORD.search(t):
+        translit = getattr(ru, "translit_latin", None)
+        if translit is not None:
+            t = translit(t)
+        elif _CYR.search(_LATIN_WORD.sub(" ", t)):  # a line that is all Latin keeps its words: there would be nothing left
+            t = _LATIN_WORD.sub(" ", t)
+    return numbers_to_digits(normalize_for_cer(t))
+
+
+def cer_texts(ref: str, hyp: str, lang: str = "ru") -> tuple[str, str]:
+    """(reference, transcript) exactly as the CER compares them: laughs and sounds out (:func:`cer_words`), both made
+    :func:`comparable`, and when a laugh was taken out of the reference, the laugh syllables the ASR wrote for it ("ха")."""
+    ref_w, hyp_w = cer_words(ref, hyp)
+    r, h = comparable(ref_w, lang), comparable(hyp_w, lang)
+    if laughter.has_laughter(ref or ""):
+        h = " ".join(w for w in h.split() if not _LAUGH_SYLLABLE.match(w))
+    if lang == "ru" and getattr(ru, "translit_latin", None) is None and _CYR.search(_LATIN_WORD.sub(" ", ref_w)):
+        # no transliteration: the Latin words left the reference, so as many transcript words that the reference does not
+        # have (the ASR wrote the name in Cyrillic) leave the transcript; at most that many, so a misread elsewhere still counts
+        k = len(_LATIN_WORD.findall(ref_w))
+        known = set(r.split())
+        out = []
+        for w in h.split():
+            if k > 0 and w not in known:
+                k -= 1
+                continue
+            out.append(w)
+        h = " ".join(out)
+    return r, h
+
+
+def cer_over_words(ref: str, hyp: str, words: tuple[str, str] | None = None, lang: str = "ru") -> float:
+    """CER over the words of the line, never worse than the CER of the same texts with the laughs kept.
+
+    ``words`` is the pair :func:`cer_texts` returns. The laughs are taken out of both sides; an ASR that heard a laugh as a
+    stray syllable ("ха да ну" for "Ха-ха, да ну!") has that syllable dropped too. The reading that keeps the laughs is the
+    floor, so a laugh is never held against the line."""
+    r, h = words or cer_texts(ref, hyp, lang)
+    value = cer_fn(r, h)
+    if value > 0:
+        value = min(value, cer_fn(comparable(ref, lang), comparable(hyp, lang)))
     return value
+
+
+def cer_gate(cer_max: float, ref: str, short_chars: int) -> float:
+    """The CER gate of a line: a reference under ``short_chars`` letters tolerates one wrong character ("Да." with one
+    letter off is 0.5, which no 0.10 gate passes)."""
+    n = len(normalize_for_cer(ref).replace(" ", ""))
+    if short_chars > 0 and 0 < n < short_chars:
+        return max(cer_max, round(1.0 / n, 4))
+    return cer_max
 
 
 def is_laughter_line(c: CandidateScore) -> bool:
@@ -313,12 +388,64 @@ def apply_scores(c: CandidateScore, cfg: Any, thr: float, interjection: bool) ->
     c.composite = comp
     gates = cfg.score.gates
     cer_max = cfg.score.interjection_cer_max if interjection else gates.cer_max
+    ref = (c.model_extra or {}).get("cer_ref")
+    if ref:
+        cer_max = cer_gate(float(cer_max), str(ref), int(getattr(cfg.score, "cer_short_chars", 0) or 0))
     g = evaluate_gates(c.metrics, gates, thr, cer_max, c.route)
     c.gates = g
     c.passed = bool(g) and all(g.values()) and comp is not None
     setattr(c, "missing", sorted(set(missing)))
     setattr(c, "failures", describe_failures(c.metrics, g, gates, thr, cer_max))
+    setattr(c, "deficit", gate_deficit(c.metrics, g, gates, thr, cer_max))
     return c
+
+
+def gate_deficit(m: dict[str, Any], g: dict[str, bool], gates: Any, spk_thr: float, cer_max: float) -> float:
+    """How far the worst failed gate misses, relative to its threshold (0 = every gate passes): ranks the takes of a line
+    none of which passes, so the provisional winner is the one closest to passing, not the prettiest garble."""
+    worst = 0.0
+    for k, ok in g.items():
+        if ok:
+            continue
+        if k == "utmos":
+            d = (gates.utmos_min - float(m["utmos"])) / max(float(gates.utmos_min), 1e-6)
+        elif k == "cer":
+            d = (float(m["cer"]) - cer_max) / max(float(cer_max), 0.01)
+        elif k == "spk_sim":
+            d = (spk_thr - float(m["spk_sim"])) / max(abs(spk_thr), 1e-6)
+        elif k == "dur":
+            lo, hi = gates.dur_ratio
+            r = float(m["dur_ratio"])
+            d = (lo - r) / max(lo, 1e-6) if r < lo else (r - hi) / max(hi, 1e-6)
+        else:
+            continue
+        worst = max(worst, d)
+    return round(worst, 4)
+
+
+def unheard(c: CandidateScore) -> bool:
+    """Did the ASR hear no words in this take (its CER gate is unchecked, not measured)?"""
+    return c.metrics.get("cer") is None and NO_WORDS_NOTE in c.notes
+
+
+def demote_unheard(pool: list[CandidateScore]) -> None:
+    """A take the ASR heard no words in does not pass when another take of the line has a measured CER: the empty transcript
+    removed its CER gate, which made silence or garble beat a take that narrowly failed (and stopped the regen rounds)."""
+    if not any(c.metrics.get("cer") is not None for c in pool):
+        return  # every take is unchecked: the "gate not checked" review stays
+    for c in pool:
+        if c.passed and unheard(c) and not is_sample(c):
+            c.passed = False
+            prev = (c.model_extra or {}).get("failures") or ""
+            setattr(c, "failures", ", ".join(x for x in (prev, "cer: the ASR heard no words") if x))
+
+
+def _provisional_rank(c: CandidateScore) -> tuple[Any, ...]:
+    """Order of the takes of a line that has no passing take: measured before unheard, judged before unjudged, then fewer
+    failed gates, then the smaller worst deficit, the composite last."""
+    g = c.gates or {}
+    deficit = (c.model_extra or {}).get("deficit")
+    return (not unheard(c), bool(g), -sum(1 for ok in g.values() if not ok), -float(deficit or 0.0), c.composite if c.composite is not None else -1.0)
 
 
 def regen_hopeless(pool: list[CandidateScore], best: CandidateScore, cer_ceiling: float | None) -> str | None:
@@ -387,7 +514,8 @@ def select(
             return rec(best, "regen", f"override {last.action} pending")
     if not pool:
         return rec(None, "review", f"no candidates{f' ({n_failed} failed generations)' if n_failed else ''}{unavail_note}")
-    passing = [c for c in pool if c.passed]
+    measured = any(c.metrics.get("cer") is not None for c in pool)  # (run() also marks the records: demote_unheard)
+    passing = [c for c in pool if c.passed and not (measured and unheard(c) and not is_sample(c))]
     if passing:
         # a take whose gate could not be checked has a composite renormalised without that term, so it can outrank a take
         # that passed every gate: rank the fully checked takes first, the composite only decides among equals
@@ -399,7 +527,7 @@ def select(
             what = "; ".join(f"{GATE_LABELS[g]}: {r[:100]}" for g, r in skipped.items())
             return rec(best, "review", f"best of {len(passing)} passing, but not accepted automatically: gate not checked ({what})")
         return rec(best, "auto", f"best of {len(passing)} passing{unavail_note}")
-    best = max(pool, key=lambda c: c.composite if c.composite is not None else -1.0)
+    best = max(pool, key=_provisional_rank)
     if not best.gates:
         # not one gate ran (every metric group unavailable, no reference audio): a new take cannot be judged either
         return rec(best, "review", f"no gate could be evaluated: nothing to judge the takes by{unavail_note}")
@@ -584,7 +712,7 @@ def run(ctx: Any) -> dict[str, Any]:
     per_line: dict[str, list[Cand]] = {}
     sidecars: dict[str, dict[str, SynthSidecar | None]] = {}
     failed_counts: dict[str, int] = {}
-    restored = 0
+    restored = stale = 0
     for line in lines:
         old = {c.wav: c for c in gu.load_scores(ctx, line.line_id)}
         passport = gu.load_passport(ctx, line.line_id) or {}
@@ -597,8 +725,14 @@ def run(ctx: Any) -> dict[str, Any]:
             if d.get("error"):
                 n_failed += 1
         failed_counts[line.line_id] = n_failed
+        cont = [trs[x] for x in ((line.model_extra or {}).get("sustain_lines") or []) if trs.get(x) is not None]
+        set_texts = [o for o in overrides.get(line.line_id, []) if o.action == "set_text" and o.payload.get("text")]
+        cur_text = gu.strip_stress(str(set_texts[-1].payload["text"])) if set_texts else None
         for wav, side in gu.candidate_files(ctx, line.line_id):
             if side is None or (side.model_extra or {}).get("error"):
+                continue
+            if stale_take(side, tr, cont, cur_text):
+                stale += 1  # a take of an older text: never measured, never selected (synth deletes it on its next run)
                 continue
             rel = ctx.paths.rel(wav)
             fp = file_fingerprint(wav)
@@ -626,9 +760,13 @@ def run(ctx: Any) -> dict[str, Any]:
         cands += lst
     if restored:
         ctx.log.info("score: %d candidate(s) resumed from %s", restored, PARTIAL_FILE)
+    if stale:
+        ctx.log.warning("score: %d take(s) of an older text skipped (not scored, not selectable)", stale)
 
     if not reweight and cands:
         _compute(ctx, cands, unavailable, partial)
+    elif cands:  # no model: an older CER is still re-derived from its stored transcript
+        _refresh_cer(cands, trs, cfg.project.tgt_lang, partial, drop=False)
 
     # ---- composite, gates, selection ------------------------------------------
     selections: list[SelectionRecord] = []
@@ -640,6 +778,7 @@ def run(ctx: Any) -> dict[str, Any]:
         interj = bool(tr and "interjection" in tr.flags)
         for c in lst:
             apply_scores(c.rec, cfg, thr, interj)
+        demote_unheard([c.rec for c in lst])
         write_jsonl(ctx.paths.scores(line.line_id), [c.rec for c in lst])
         tr_problem = translation_problem(tr)
         if tr_problem and not any(c.rec.route == "orig" for c in lst):
@@ -679,6 +818,8 @@ def run(ctx: Any) -> dict[str, Any]:
     }
     if restored:
         summary["resumed_candidates"] = restored
+    if stale:
+        summary["stale_candidates_skipped"] = stale
     if unavailable:
         summary["metrics_unavailable"] = unavailable
     unchecked = sum(1 for x in selections if x.status == "review" and ("gate not checked" in x.reason or "no gate could be evaluated" in x.reason))
@@ -724,6 +865,84 @@ def line_cer_reference(c: Cand, trs: dict[str, Any]) -> str:
     """The CER reference of a candidate: what synth said, or the translation of the line and of its sustain continuations."""
     cont = [trs.get(x) for x in ((c.line.model_extra or {}).get("sustain_lines") or [])]
     return cer_reference(c.side, c.tr, [x for x in cont if x is not None])
+
+
+def _set_cer(c: Cand, ref: str, hyp: str, lang: str) -> bool:
+    """Store the CER of ``hyp`` (the ASR's transcript) against ``ref`` under the current rule; False when the transcript holds
+    no words to compare (nothing stored)."""
+    ref_w, hyp_w = cer_words(ref, hyp)  # the words only: an ASR cannot spell a laugh
+    words = cer_texts(ref, hyp, lang)
+    if ref_w.strip() and not words[1].strip():
+        return False
+    c.rec.metrics["cer"] = round(cer_over_words(ref, hyp, words, lang), 4)
+    setattr(c.rec, "asr_text", hyp)
+    setattr(c.rec, "cer_ref", ref_w)
+    if hyp_w != " ".join(hyp.split()):
+        setattr(c.rec, "cer_hyp", hyp_w)  # the transcript as compared, when a laugh was taken out of it
+    elif c.rec.model_extra:
+        c.rec.model_extra.pop("cer_hyp", None)
+    setattr(c.rec, "cer_rule", CER_RULE)
+    return True
+
+
+def _refresh_cer(cands: list[Cand], trs: dict[str, Any], lang: str, partial: _Partial, drop: bool) -> int:
+    """CER values stored under an older rule are recomputed from the stored transcript (no ASR, no synthesis); one without a
+    transcript is dropped so the ASR runs again (``drop``; a reweight never asks a model and keeps it). Returns how many changed."""
+    n = 0
+    for c in cands:
+        ex = c.rec.model_extra or {}
+        if c.rec.route == "orig" or is_sample(c.rec) or "cer" in c.na or c.rec.metrics.get("cer") is None or ex.get("cer_rule") == CER_RULE:
+            continue
+        hyp = ex.get("asr_text")
+        if hyp is None:
+            if drop:
+                c.rec.metrics.pop("cer")
+                partial.touch(c)
+                n += 1
+            continue
+        if not _set_cer(c, line_cer_reference(c, trs), str(hyp), lang):
+            c.rec.metrics.pop("cer")
+            if NO_WORDS_NOTE not in c.rec.notes:
+                c.rec.notes = [*c.rec.notes, NO_WORDS_NOTE]
+        partial.touch(c)
+        n += 1
+    return n
+
+
+def _text_sig(text: str | None) -> str:
+    return normalize_for_cer(_strip_nonspeech(gu.strip_stress(text or "")))
+
+
+def stale_take(side: SynthSidecar | None, tr: Any, cont: list[Any], set_text: str | None) -> bool:
+    """Is this take of an older text (the translation was edited, a review ``set_text`` came or went) than any reference the
+    line can have now: the full or the short text of the current translation (with and without its sustain continuations), or
+    the current ``set_text``? Synth purges such takes; this keeps one that survived from competing (it would be measured against
+    its own old text, pass and win). Whatever cannot be told safely is kept: no text in the sidecar (``orig``, samples), a sound
+    stand-in (its reference is rendered), no usable translation."""
+    if side is None or side.route == "orig" or side.backend == "sample":
+        return False
+    ex = side.model_extra or {}
+    plain = ex.get("text_plain")
+    if not plain or side.text_variant in ("sound", "orig") or ex.get("sound") or sounds.has_sound(str(plain)):
+        return False
+    allowed: list[str] = []
+    if set_text:
+        allowed.append(set_text)
+    if tr is not None and translation_problem(tr) == "":
+        if sounds.has_sound(tr.text_plain or tr.text_tgt or ""):
+            return False
+        for recs in ([tr, *cont], [tr]) if cont else ([tr],):
+            for short in (False, True):
+                parts = []
+                for r in recs:
+                    rex = r.model_extra or {}
+                    if short:
+                        parts.append(rex.get("text_plain_short") or gu.strip_stress(r.text_tgt_short or r.text_tts_short or r.text_tts or ""))
+                    else:
+                        parts.append(r.text_plain or gu.strip_stress(r.text_tgt or ""))
+                allowed.append(" ".join(p.strip() for p in parts if p and p.strip()))
+    sigs = {_text_sig(a) for a in allowed if a and a.strip()}
+    return bool(sigs) and _text_sig(str(plain)) not in sigs
 
 
 def line_raw_cer_reference(c: Cand, trs: dict[str, Any]) -> str:
@@ -778,7 +997,9 @@ def _compute(ctx: Any, cands: list[Cand], unavailable: dict[str, str], partial: 
     partial = partial or _Partial.open(ctx)
     for c in cands:  # reasons from an earlier run are rewritten below when they still hold
         c.rec.notes = [n for n in c.rec.notes if not _STALE_NOTE.match(n)]
-    _laughter_lines(cands, gu.load_translations(ctx), partial)
+    trs = gu.load_translations(ctx)
+    _refresh_cer(cands, trs, ctx.cfg.project.tgt_lang, partial, drop=True)  # before the laughter rule: it reads the new values
+    _laughter_lines(cands, trs, partial)
     off: set[str] = set()
     if not ctx.cfg.score.aesthetics:
         off.add("pq")
@@ -1044,18 +1265,11 @@ def _compute_groups(ctx: Any, cands: list[Cand], unavailable: dict[str, str], pa
                         continue
                     ref = line_cer_reference(c, trs)
                     hyp = str(r.get("text", "") or "")
-                    ref_w, hyp_w = cer_words(ref, hyp)  # the words only: an ASR cannot spell a laugh
-                    if not hyp_w.strip() and ref_w.strip():
+                    if not _set_cer(c, ref, hyp, tgt):
                         # the model heard no words (a clip too short or too odd for it, or only a laugh): not a CER of 1.0 for
-                        # regen rounds to chase, but a gate that could not be checked, so the line goes to a person
-                        failed(c, "cer", "the ASR heard no words in this take")
+                        # regen rounds to chase, but a gate that could not be checked (and a take that loses to a measured one)
+                        failed(c, "cer", NO_WORDS)
                         continue
-                    c.rec.metrics["cer"] = round(cer_over_words(ref, hyp, (ref_w, hyp_w)), 4)
-                    setattr(c.rec, "asr_text", hyp)
-                    setattr(c.rec, "cer_ref", ref_w)
-                    if hyp_w != " ".join(hyp.split()):
-                        setattr(c.rec, "cer_hyp", hyp_w)  # the transcript as compared, when a laugh was taken out of it
-                    setattr(c.rec, "cer_rule", CER_RULE)
                     partial.touch(c)
                 prog.chunk(part)
                 partial.checkpoint()

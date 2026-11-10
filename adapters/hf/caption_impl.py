@@ -21,6 +21,8 @@ class Qwen2AudioCaptioner(ModelImpl):
     selftest_op = "caption"
     selftest_kwargs = {"prompt": DEFAULT_PROMPT}
 
+    probe_imports = ("torch", "transformers")  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         import torch
         from transformers import AutoProcessor, Qwen2AudioForConditionalGeneration

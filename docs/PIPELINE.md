@@ -258,6 +258,16 @@ source import|llm:<model>|mock, glossary_hits, flags).
 - **Player character**: glossary `player: {name, gender: m|f|unknown, notes}` (`--seed-glossary` adds it with `unknown`; the app's
   Step 2 sets the gender). The prompt says that words said to or about the player (you, darling, dear ...) agree with the player's gender
   ("ты вернулся, дорогой" / "ты вернулась, дорогая"); unknown = wordings that do not reveal it, the masculine when impossible.
+- **Round 18** (cache protocol 4, one retranslation): a batch is keyed by the glossary slice its prompt shows, so a glossary edit
+  retranslates only the lines it reaches, and a partial answer is cached; every line (voiced or not) is translated in script order
+  in the regular batches with the rolling source + target context, `want_delivery` on the rows that need a delivery; narration
+  and the protagonist's lines (`player.speaker_id` in the glossary, or a speaker whose name is an interpolation) take the
+  player's gender; `translate.gender_pass` (default on) asks the model once for the gender of characters nobody set and writes
+  it to `characters.yaml` with `gender_source: guess` (never over `gender_source: user`); new checks `omitted`, `lost_number`,
+  `lost_token`, a Latin name in a Cyrillic target, and a glossary miss (flag `glossary_miss`), each re-asked once in the batched
+  recheck; summary keys `glossary_miss_ids`, `check_failed_ids`, `gender_guessed`; auto terms live in `work/glossary_auto.yaml`
+  as `{terms, deleted}`. TTS text (never the screen text): Latin words are transliterated (`ru.translit_latin`), `[variable]`
+  interpolations are dropped, years and numbers after prepositions are declined, decorations (`♪ ♥ ~`) are removed.
 - **Names pass** (`translate.names_pass`, default on): before the first batch ONE request asks the model for the canonical target spelling of the
   script's proper nouns (candidates: capitalised words not at a sentence start, or seen twice, minus a stop list, lower-case words and character
   names; the game title and the character sheet go with it). Answers become glossary `terms` with `notes: auto` (in memory, a copy in
@@ -550,7 +560,12 @@ Composite = weighted sum (`score.weights`, renormalized over available metrics).
 `score.gates.*` (spk_sim from the EER calibration). Best gate-passing candidate -> `auto`;
 otherwise `regen` (up to `regen_rounds`) then `review`. Overrides are honoured. A line whose most intelligible take
 still misreads the text by more than `score.regen_cer_max` (0.2, never below the line's CER gate) goes to `review` at
-once ("a new take would not help"): a new seed changes the delivery, not the words. A take the ASR heard no words in
+once ("a new take would not help"): a new seed changes the delivery, not the words. Round 18 (`CER_RULE` 3, recomputed from
+the stored transcripts): both sides get the same number and abbreviation normalization and number words are compared by value,
+laugh syllables are dropped where the reference had a laugh, Latin words are transliterated, and a reference under
+`score.cer_short_chars` (8) letters has a gate of max(`cer_max`, 1 / letters); a take the ASR heard no words in does not pass
+while another take of the line was measured; with no passing take the provisional winner is the one with the fewest failed
+gates and the smallest miss; a take whose sidecar text is not a text the line has now is skipped (`stale_candidates_skipped`). A take the ASR heard no words in
 gets no CER (note `cer failed: the ASR heard no words in this take`): the gate counts as not checked, never as a CER
 of 1.0.
 **Laughter** (`vndub.text.laughter`) is not text an ASR can spell, so the CER is computed over the words only: laughs
@@ -638,8 +653,9 @@ arguments and the group's `voice` statement) and a `translate <language> strings
 the menu's translation record) and captions, and `game/vndub_language.rpy` (`define config.language = "<language>"`, which beats
 the player's saved choice). `<language>` is Ren'Py's lowercase name of `project.tgt_lang` (ru -> russian, en -> english, ja ->
 japanese, zh, ko, de, fr, es, it, pt, uk; an unknown code is its own name). Config `pack.renpy.text`: `enabled: auto | true |
-false` (auto = the project has a translation file; a bare `text: true|false` is `enabled`), `language: ""` (override), `font: ""`
-(a .ttf / .otf inside `game/`, emitted as `translate <language> python:` setting `gui.text_font` for a game whose font lacks the
+false` (auto = the project has a translation file; a bare `text: true|false` is `enabled`), `language: ""` (override), `font: auto`
+(round 18: `auto` reads the `cmap` of the fonts the game's scripts name and switches the translated language to `DejaVuSans.ttf`
+when one lacks Cyrillic, recorded as `text.font_check` in the manifest; `""` / `false` switch the check off; or a path: a .ttf / .otf inside `game/`, emitted as `translate <language> python:` setting `gui.text_font` for a game whose font lacks the
 alphabet). Left in the source language and listed in `manifest_patch.json` `text.skipped` (`{line_id, id, reason}`): "not
 translated", "interpolation lost" (the translation dropped `[name]`, `%(x)s` or a `{w}` / `{p}` / `{nw}` flow tag of the
 original), "own voice statement" (an expression voice or a missing file: the block would drop the group's voice), "choices not

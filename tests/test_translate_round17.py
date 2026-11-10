@@ -101,7 +101,8 @@ def test_check_translation():
     assert chk("Hello you", "Привет there", "ru", "en") == "latin_run"
     assert chk("Call the iPhone", "Позвони на iPhone", "ru", "en") == ""  # a Latin word that the source has
     assert chk("Hello there my friend", "Hello there my friend", "ru", "en") == "untranslated"
-    assert chk("Sakuya", "Sakuya", "ru", "en") == ""  # a lone word may be a name
+    # round 18: a name left in Latin is a defect for a Cyrillic target (the TTS reads it as Latin, the CER check fails the take)
+    assert chk("Sakuya", "Sakuya", "ru", "en") == "untranslated"
     assert chk("Muah!", "Чмок!", "ru", "en") == ""
     assert chk("Hello there", "Hello there", "en", "en") == ""  # same language is not "untranslated"
     terms = [{"src": "Gensokyo", "tgt": "Генсокё"}]
@@ -150,7 +151,8 @@ class _Script:
         batch = json.loads(messages[-1]["content"].split("\n", 1)[1])
         rows = []
         for b in batch:
-            ans = self.tr.get(b["text"], f"перевод {b['id']}")
+            # as long as the source (round 18: a much shorter answer is "omitted" and asked again)
+            ans = self.tr.get(b["text"], f"перевод {b['id']} " + " ".join(["слово"] * len(b["text"].split())))
             if isinstance(ans, tuple):
                 ans = ans[1] if "previous_answer" in b else ans[0]
             rows.append({"id": b["id"], "ru": ans, "ru_short": "", "notes": ""})

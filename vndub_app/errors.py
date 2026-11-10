@@ -93,15 +93,58 @@ def error_from_exception(e: BaseException, *, stage: str | None = None) -> AppEr
     if re.search(r"env '[\w+.-]+' not created", msg):
         m = re.search(r"env '([\w+.-]+)'", msg)
         return AppError("env_missing", params={**params, "env": m.group(1) if m else ""}, action="open_tools", details=details)
+    # contract C6: the real cause, one line, next to the hint (the traceback stays behind "details")
+    reason = _short(f"{msg}" if msg else type(e).__name__, REASON_MAX)
+    low = msg.lower()
+    if "winerror 1455" in low or "paging file is too small" in low or "файл подкачки" in low:
+        return AppError("paging_file_small", params={**params, "reason": reason}, action="open_doctor", details=details)
+    from vndub.stages.genutil import is_vram_error
+
+    if is_vram_error(msg) and not isinstance(e, (MemoryError, BackendUnavailable)):  # "does not fit the VRAM budget" is a refusal, not an OOM
+        return AppError("cuda_oom", params={**params, "reason": reason}, action="open_settings", details=details)
+    env = _import_failure_env(e, msg)
+    if env is not None:  # the model's code does not import in its environment: a broken env, not a missing download
+        return AppError("env_import_failed", params={**params, "env": env, "reason": reason}, action="open_doctor", details=details)
     if isinstance(e, BackendUnavailable):
-        return AppError("backend_unavailable", params=params, action="open_models", details=details)
+        return AppError("backend_unavailable", params={**params, "reason": reason}, action="open_models", details=details)
     if isinstance(e, StageError):
-        return AppError("stage_failed", params=params, action="retry", details=details)
+        return AppError("stage_failed", params={**params, "reason": reason}, action="retry", details=details)
     if isinstance(e, FileNotFoundError):
         return AppError("file_not_found", params={**params, "path": getattr(e, "filename", "") or ""}, action="retry", details=details)
     if isinstance(e, PermissionError):
         return AppError("permission_denied", params={**params, "path": getattr(e, "filename", "") or ""}, action="open_data_dir", details=details)
-    return AppError("internal", params=params, action="report_problem", details=details, status=500)
+    return AppError("internal", params={**params, "reason": reason}, action="report_problem", details=details, status=500)
+
+
+REASON_MAX = 300
+_IMPORT_RE = re.compile(r"\b(ModuleNotFoundError|ImportError|ErrorDuringImport|No module named|cannot import name|DLL load failed|import failed in env)\b", re.I)
+
+
+def _import_failure_env(e: BaseException, msg: str) -> str | None:
+    """The environment whose adapter failed to import (``""`` when the env is not named), else ``None``.
+
+    Only errors that come from an adapter (``AdapterError`` / ``BackendUnavailable``) or that name an env count: an
+    ``ImportError`` of the app itself is an internal error, not a broken backend environment."""
+    from vndub.backends.base import BackendUnavailable
+
+    try:
+        from vndub.backends.runner import AdapterError
+    except Exception:  # pragma: no cover
+        AdapterError = ()  # type: ignore[assignment]
+    if not _IMPORT_RE.search(msg):
+        return None
+    m = re.search(r"env '([\w+.-]+)'", msg)
+    if m:
+        return m.group(1)
+    if isinstance(e, (BackendUnavailable, AdapterError)):  # type: ignore[arg-type]
+        backend = getattr(e, "backend", None) or getattr(e, "name", None) or (e.args[0] if e.args else "")
+        try:
+            from vndub.backends import registry
+
+            return registry.get(str(backend)).env or ""
+        except Exception:
+            return ""
+    return None
 
 
 def _short(text: str | None, limit: int = 200) -> str:

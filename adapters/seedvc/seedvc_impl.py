@@ -42,6 +42,14 @@ def _wrapper(d: Path, device: str):
 
 class SeedVC(ModelImpl):
     selftest_op = "convert"
+    probe_imports = ("torch", "seed_vc_wrapper")  # what _wrapper() imports (ModelImpl.probe)
+
+    @classmethod
+    def probe_setup(cls, params: dict[str, Any]) -> None:
+        d = repo_dir(params.get("options") or {})
+        os.chdir(d)  # as _wrapper: the probe runs in a process of its own
+        if str(d) not in sys.path:
+            sys.path.insert(0, str(d))
 
     def load(self) -> dict[str, Any]:
         weight_dir(self.params, 0)  # marker of `models pull seedvc`

@@ -27,7 +27,10 @@ class Probe:
 
 
 def _run(args: list[str], timeout: float = 300) -> subprocess.CompletedProcess[str]:
-    r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as e:  # one error type for every tool failure: callers catch AudioToolError per file
+        raise AudioToolError(f"{Path(args[0]).name} timed out after {timeout:.0f} s") from e
     if r.returncode != 0:
         raise AudioToolError(f"{Path(args[0]).name} failed ({r.returncode}): {r.stderr.strip()[-800:]}")
     return r

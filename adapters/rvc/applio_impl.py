@@ -60,8 +60,21 @@ def run_job(d: Path, job: dict[str, Any], logs_dir: Path | None, log_file: Path,
         os.unlink(job_path)
 
 
+def _applio_on_path(options: dict[str, Any]) -> None:
+    """What a load does before importing Applio's modules: chdir into the checkout and put it on sys.path."""
+    d = applio_dir(options)
+    os.chdir(d)
+    if str(d) not in sys.path:
+        sys.path.insert(0, str(d))
+
+
 class ApplioRVC(ModelImpl):
     selftest_op = "convert"
+    probe_imports = ("core",)  # what load() imports (ModelImpl.probe)
+
+    @classmethod
+    def probe_setup(cls, params: dict[str, Any]) -> None:
+        _applio_on_path(params.get("options") or {})
 
     def load(self) -> dict[str, Any]:
         weight_dir(self.params, 0)  # marker of `models pull rvc`
@@ -177,6 +190,11 @@ class ApplioRVC(ModelImpl):
 
 class RMVPEF0(ModelImpl):
     selftest_op = "f0"
+    probe_imports = ("rvc.lib.predictors.RMVPE",)  # what load() imports (ModelImpl.probe)
+
+    @classmethod
+    def probe_setup(cls, params: dict[str, Any]) -> None:
+        _applio_on_path(params.get("options") or {})
 
     def load(self) -> dict[str, Any]:
         weight_dir(self.params, 0)

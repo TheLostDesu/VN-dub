@@ -7,8 +7,13 @@ imported only when a model is loaded, so a missing package surfaces as a clear
 "backend unavailable" error for that model instead of breaking the whole env.
 
 The core process (``vndub.backends.runner``) sends ``load`` / ``run`` /
-``unload`` / ``selftest`` / ``peak_vram`` / ``pull`` / ``shutdown`` requests, one
-JSON object per line.
+``unload`` / ``selftest`` / ``probe`` / ``peak_vram`` / ``pull`` / ``shutdown`` requests, one
+JSON object per line. Responses never carry NaN / Infinity (:func:`json_safe`): those are not JSON
+and the core's parser would refuse the whole line.
+
+``--probe [keys]`` (and the ``probe`` request) imports what each implementation's ``load`` imports, with
+its shims, but no weights and no device (:meth:`ModelImpl.probe`): a broken or stale env shows in seconds
+instead of after minutes of weight loading (rounds 11, 13 and 14 each failed inside a vendor import).
 
 Only the standard library is imported at module level so this file works in
 every env; torch is imported lazily for VRAM accounting.
@@ -23,6 +28,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
 import sys
 import time
@@ -369,6 +375,27 @@ class ModelImpl:
     #: op used by the default selftest and its extra kwargs
     selftest_op: str = ""
     selftest_kwargs: dict[str, Any] = {}
+    #: vendor modules :meth:`load` imports; :meth:`probe` imports them without weights (keep in step with ``load``)
+    probe_imports: tuple[str, ...] = ()
+
+    @classmethod
+    def probe_setup(cls, params: dict[str, Any]) -> None:
+        """What ``load`` does before its imports (a checkout on sys.path, compat shims). Default: nothing."""
+
+    @classmethod
+    def probe_checks(cls, params: dict[str, Any]) -> dict[str, Any] | None:
+        """Checks beyond plain imports (a vendor that swallows an ImportError, a config parser). Default: none."""
+        return None
+
+    @classmethod
+    def probe(cls, params: dict[str, Any]) -> dict[str, Any]:
+        """Import what a load imports, no weights, no device: ``{"ok": True, "s", "imports", ...}``; raises on a broken env."""
+        t0 = time.perf_counter()
+        cls.probe_setup(params)
+        for mod in cls.probe_imports:
+            importlib.import_module(mod)
+        extra = cls.probe_checks(params) or {}
+        return {"ok": True, "s": round(time.perf_counter() - t0, 2), "imports": list(cls.probe_imports), **extra}
 
     def __init__(self, params: dict[str, Any]) -> None:
         self.params = params
@@ -532,6 +559,9 @@ class LazyImpl:
     def pull(self, params: dict[str, Any]) -> dict[str, Any]:
         return self.cls().pull(params)
 
+    def probe(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self.cls().probe(params)  # importing the implementation module is part of the check
+
 
 def lazy_table(table: dict[str, str]) -> dict[str, LazyImpl]:
     return {k: LazyImpl(v) for k, v in table.items()}
@@ -546,6 +576,29 @@ def _error(rid: Any, code: int, message: str, data: Any = None) -> dict[str, Any
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message, "data": data}}
 
 
+def json_safe(obj: Any) -> Any:
+    """``obj`` with every non-finite float (NaN, +-Infinity, numpy's included) replaced by ``None``.
+
+    ``json.dumps`` writes them as the bare words ``NaN`` / ``Infinity``, which are not JSON: a single silent clip
+    (a pitch track of NaN, a score of -inf) made the core refuse the whole response line."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    kind = getattr(getattr(obj, "dtype", None), "kind", None)
+    if kind == "f" and getattr(obj, "ndim", None) == 0:  # a numpy float scalar (np.float32 is no float subclass)
+        v = float(obj)
+        return v if math.isfinite(v) else None
+    return obj
+
+
+def _env_hint(env: str) -> str:
+    """The way out of a broken env, for app users first (the hint reaches the app's error panel), then the command line."""
+    return f"rebuild the environment '{env}' (in the app: Diagnostics -> Rebuild environments, or Models -> Environments; command line: scripts/make_envs.ps1 -Env {env})"
+
+
 def serve(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> None:
     proto = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
@@ -553,7 +606,7 @@ def serve(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> 
     current: ModelImpl | None = None
 
     def send(msg: dict[str, Any]) -> None:
-        proto.write(json.dumps(msg, ensure_ascii=False, default=str) + "\n")
+        proto.write(json.dumps(json_safe(msg), ensure_ascii=False, default=str) + "\n")
         proto.flush()
 
     def impl_for(params: dict[str, Any]) -> ModelImpl:
@@ -605,6 +658,14 @@ def serve(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> 
             elif method == "selftest":
                 impl = impl_for(params)
                 send({"jsonrpc": "2.0", "id": rid, "result": impl.selftest()})
+            elif method == "probe":
+                key = params.get("model")
+                if key not in table:
+                    raise UnavailableError(f"env '{env}' has no adapter '{key}'")
+                probe = getattr(table[key], "probe", None)
+                if probe is None:
+                    raise UnavailableError(f"adapter '{key}' of env '{env}' has no probe")
+                send({"jsonrpc": "2.0", "id": rid, "result": probe(params)})
             elif method == "pull":
                 key = params.get("model")
                 if key not in table:
@@ -619,7 +680,7 @@ def serve(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> 
         except UnavailableError as e:
             send(_error(rid, ERR_UNAVAILABLE, str(e), {"hint": e.hint}))
         except ImportError as e:
-            send(_error(rid, ERR_UNAVAILABLE, f"import failed in env '{env}': {e}", {"hint": f"recreate the env: scripts/make_envs.ps1 -Env {env}"}))
+            send(_error(rid, ERR_UNAVAILABLE, f"import failed in env '{env}': {e}", {"hint": _env_hint(env)}))
         except Exception as e:
             tb = traceback.format_exc()
             sys.stderr.write(tb)
@@ -631,12 +692,23 @@ def serve(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> 
 
 
 def main(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> None:
-    """Entry point: JSON-RPC server, or ``--selftest [keys]`` from the command line."""
+    """Entry point: JSON-RPC server, ``--selftest [keys]`` or ``--probe [keys]`` from the command line."""
     ap = argparse.ArgumentParser(prog=f"python -m adapters.{env}.main")
     ap.add_argument("--selftest", nargs="*", metavar="ADAPTER", help="run selftests (all adapters if none given)")
+    ap.add_argument("--probe", nargs="*", metavar="ADAPTER", help="import-level check of each adapter, no weights (all adapters if none given)")
     ap.add_argument("--models-dir", default=os.environ.get("VNDUB_MODELS_DIR", str(Path(__file__).resolve().parents[2] / "models")))
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
+    if args.probe is not None:
+        # as in serve: what the vendor packages print at import (even from C) goes to stderr, the result is one JSON line
+        out = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8")
+        sys.stdout.flush()
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+        sys.stdout = sys.stderr
+        results_p = run_probes(table, env, args.probe or sorted(table), Path(args.models_dir))
+        out.write(json.dumps(json_safe(results_p), ensure_ascii=False, default=str) + "\n")
+        out.flush()
+        sys.exit(0 if all(r.get("ok") for r in results_p.values()) else 1)
     if args.selftest is None:
         serve(table, env)
         return
@@ -663,6 +735,23 @@ def main(table: dict[str, Callable[[dict[str, Any]], ModelImpl]], env: str) -> N
             results[key] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     print(json.dumps(results, ensure_ascii=False, indent=2, default=str))
     sys.exit(0 if all(r.get("ok") for r in results.values()) else 1)
+
+
+def run_probes(table: dict[str, Any], env: str, keys: list[str], mdir: Path) -> dict[str, dict[str, Any]]:
+    """``{adapter: {"ok", "s", ...} | {"ok": False, "error"}}``: :meth:`ModelImpl.probe` of each key, never raises."""
+    results: dict[str, dict[str, Any]] = {}
+    for key in keys:
+        t0 = time.perf_counter()
+        if key not in table:
+            results[key] = {"ok": False, "error": f"env '{env}' has no adapter '{key}'"}
+            continue
+        params = {"name": key, "model": key, "options": {}, "device": "cpu", "models_dir": str(mdir), "weights": []}
+        try:
+            results[key] = table[key].probe(params)
+        except Exception as e:  # ErrorDuringImport (pydoc), TypeError from a vendor that hid its ImportError ...
+            sys.stderr.write(traceback.format_exc())
+            results[key] = {"ok": False, "s": round(time.perf_counter() - t0, 2), "error": f"{type(e).__name__}: {e}"}
+    return results
 
 
 def _cli_params(key: str, env: str, mdir: Path, device: str) -> dict[str, Any]:

@@ -30,6 +30,8 @@ def _find(root: Path, pattern: str) -> Path | None:
 class F5Russian(TTSImpl):
     selftest_text = "Прив+ет! Это кор+откая пров+ерка с+интеза р+ечи."
 
+    probe_imports = ("f5_tts.api",)  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         from f5_tts.api import F5TTS
 

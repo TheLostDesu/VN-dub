@@ -33,6 +33,13 @@ def require_watermarker() -> None:
 
 
 class ChatterboxML(TTSImpl):
+    probe_imports = ("chatterbox.models.tokenizers.tokenizer", "chatterbox.mtl_tts")  # what load() imports (ModelImpl.probe)
+
+    @classmethod
+    def probe_setup(cls, params: dict[str, Any]) -> None:
+        ensure_pkg_resources()
+        require_watermarker()  # round 14: perth hides this ImportError; the real load met it after 249 s of weights
+
     def load(self) -> dict[str, Any]:
         ensure_pkg_resources()  # resemble-perth 1.0.1 imports pkg_resources, which uv envs / setuptools >= 82 lack
         require_watermarker()

@@ -321,3 +321,26 @@ def test_designs_json_does_not_keep_designs_whose_files_were_deleted(vb, monkeyp
     voicebank.run(ctx)
     assert dz.load_designs(ctx, sid) == []  # their wavs were deleted above; the list used to keep them
     assert not any((ctx.paths.vb(sid) / "designs" / d["design_id"]).exists() for d in before)
+
+
+def test_relaxed_refs_never_admit_music_or_extreme_lengths_and_say_why():
+    lines = [_line(i) for i in range(6)]
+    pps = {
+        "l0": _pp(35, 4, "neutral"), "l1": _pp(33, 5, "happy"),
+        "l2": _pp(40, 6, "sad", bgm=True),   # music under the voice
+        "l3": _pp(30, 0.5, "angry"),         # a half-second "eh?"
+        "l4": _pp(28, 30.0, "surprised"),    # a monologue
+        "l5": _pp(9, 4, "fearful"),          # noisy but usable when few clips pass
+    }
+    chosen, relaxed = select_refs(lines, pps, min_snr_db=25, min_sec=3, max_sec=10, per_emotion=2, max_total=10, min_refs=5)
+    ids = {c["line"].line_id for c in chosen}
+    assert relaxed and ids == {"l0", "l1", "l5"}
+    by = {c["line"].line_id: c for c in chosen}
+    assert by["l0"]["relaxed_reasons"] == [] and any("snr" in r for r in by["l5"]["relaxed_reasons"])
+
+
+def test_a_clip_without_a_measured_noise_floor_is_unknown_not_bad():
+    lines = [_line(i) for i in range(5)]
+    pps = {f"l{i}": {**_pp(30, 4, "neutral"), "snr_db": None} for i in range(5)}
+    chosen, relaxed = select_refs(lines, pps, min_snr_db=25, min_sec=3, max_sec=10, per_emotion=5, max_total=10, min_refs=5)
+    assert not relaxed and len(chosen) == 5

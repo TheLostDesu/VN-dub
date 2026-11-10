@@ -5,22 +5,25 @@ import type { ErrorInfo } from "../api/types";
 export type SaveStatus = "idle" | "saving" | "saved" | "error";
 
 /**
- * Debounced saving of a whole value. `schedule(v)` restarts the timer, `flush()` saves at once
- * (await it before starting a job that depends on the saved values). Pending changes are written
- * when the component unmounts.
+ * Debounced saving of a whole value. `schedule(v)` restarts the timer, `flush()` saves at once and says whether the
+ * values are on the server (await it before starting a job that depends on the saved values: `false` = the save failed,
+ * do not start). Pending changes are written when the component unmounts; a failure then has no screen to show it, so
+ * `onLeaveError` (a toast) is called instead.
  */
-export function useAutosave<T>(save: (value: T) => Promise<unknown>, delay = 700) {
+export function useAutosave<T>(save: (value: T) => Promise<unknown>, delay = 700, onLeaveError?: () => void) {
   const [status, setStatus] = useState<SaveStatus>("idle");
   const [error, setError] = useState<ErrorInfo | null>(null);
   const pending = useRef<{ value: T } | null>(null);
   const timer = useRef<number | null>(null);
   const saveRef = useRef(save);
   saveRef.current = save;
+  const leaveErrorRef = useRef(onLeaveError);
+  leaveErrorRef.current = onLeaveError;
   const mounted = useRef(true);
 
-  const run = useCallback(async () => {
+  const run = useCallback(async (): Promise<boolean> => {
     const p = pending.current;
-    if (!p) return;
+    if (!p) return true;
     pending.current = null;
     if (mounted.current) setStatus("saving");
     try {
@@ -29,11 +32,15 @@ export function useAutosave<T>(save: (value: T) => Promise<unknown>, delay = 700
         setStatus("saved");
         setError(null);
       }
+      return true;
     } catch (e) {
+      // keep the value (unless a newer one arrived) so that flush() and the save on leave try it again
+      if (!pending.current) pending.current = p;
       if (mounted.current) {
         setStatus("error");
         setError(toErrorInfo(e));
       }
+      return false;
     }
   }, []);
 
@@ -49,12 +56,12 @@ export function useAutosave<T>(save: (value: T) => Promise<unknown>, delay = 700
     [delay, run],
   );
 
-  const flush = useCallback(async () => {
+  const flush = useCallback(async (): Promise<boolean> => {
     if (timer.current !== null) {
       window.clearTimeout(timer.current);
       timer.current = null;
     }
-    await run();
+    return run();
   }, [run]);
 
   useEffect(() => {
@@ -65,7 +72,7 @@ export function useAutosave<T>(save: (value: T) => Promise<unknown>, delay = 700
       const p = pending.current;
       if (p) {
         pending.current = null;
-        void saveRef.current(p.value).catch(() => undefined);
+        void saveRef.current(p.value).catch(() => leaveErrorRef.current?.());
       }
     };
   }, []);

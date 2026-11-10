@@ -20,8 +20,10 @@ What a run skipped or substituted is not silent: :func:`pipeline_ctx` collects t
 
 from __future__ import annotations
 
+import json
 import logging
 import random
+import sys
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -76,6 +78,8 @@ def submit(kind: str, slug: str | None, params: dict[str, Any] | None = None) ->
     if fl is None:
         raise AppError("bad_request", params={"field": "kind", "value": kind}, status=422)
     params = dict(params or {})
+    if kind in ENV_CHECK_SECTIONS and slug:
+        check_envs(slug, kind)
     runner = jobs.runner()
     guard = None
     if fl.project and slug:
@@ -90,6 +94,70 @@ def submit(kind: str, slug: str | None, params: dict[str, Any] | None = None) ->
             return next((j for j in active if j.kind == kind and _same_params(j.params, params)), None)
     fn = fl.build(slug or "", params)
     return runner.submit(kind, fn, params=params, project=slug if fl.project else None, gpu=fl.gpu, settings=_snapshot(slug if fl.project else None), guard=guard)
+
+
+# the config sections whose backends a job loads (None = the whole config): the translate job needs only its LLM
+ENV_CHECK_SECTIONS: dict[str, tuple[str, ...] | None] = {"translate": ("translate", "text_emotion"), "preview": None, "full": None}
+
+
+def job_envs(cfg: Any, sections: tuple[str, ...] | None = None) -> list[str]:
+    """The backend environments a job with this config may start: every string in the config (or in ``sections``) that
+    names a registry backend, plus the enabled synth backends, mapped to ``spec.env`` (``None`` = runs in the app)."""
+    from vndub.backends import registry
+
+    dump = cfg.model_dump(mode="json", by_alias=True)
+    if sections is not None:
+        dump = {k: dump.get(k) for k in sections}
+    names: list[str] = []
+
+    def walk(v: Any) -> None:
+        if isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+        elif isinstance(v, str) and 0 < len(v) < 80 and "/" not in v and "\\" not in v:
+            names.append(v)
+
+    walk(dump)
+    if sections is None or "synth" in sections:
+        names += list(cfg.enabled_backends())
+    envs: list[str] = []
+    for n in dict.fromkeys(names):
+        try:
+            spec = registry.get(n)
+        except Exception:
+            continue
+        if spec.env and spec.env not in envs:
+            envs.append(spec.env)
+    return envs
+
+
+def check_envs(slug: str, kind: str) -> None:
+    """Refuse a preview / full run / translation up front (``env_broken``, action ``open_doctor``) when an environment it
+    needs is known to be broken (``installer.env_problems``, error level only), instead of failing after minutes of weight
+    loading. Anything that goes wrong in the check itself lets the job run: the job reports the real problem then."""
+    from vndub_app import installer
+
+    problems_fn = getattr(installer, "env_problems", None)
+    if not callable(problems_fn):
+        return
+    try:
+        cfg = session.read_ctx(appdirs.project_handle(slug)).cfg
+        envs = job_envs(cfg, ENV_CHECK_SECTIONS.get(kind))
+        problems = list(problems_fn(envs, "error")) if envs else []
+    except Exception as e:
+        log.warning("environment check before %s skipped: %s", kind, e)
+        return
+    if problems:
+        p = problems[0]
+        detail = "; ".join(f"{q.get('env')}: {q.get('code')} {q.get('detail') or ''}".strip() for q in problems)[:600]
+        log.warning("%s refused: broken environment(s): %s", kind, detail)
+        raise AppError(
+            "env_broken", params={"env": p.get("env") or "", "code": p.get("code") or "", "detail": str(p.get("detail") or "")[:300], "envs": sorted({str(q.get("env")) for q in problems})},
+            action="open_doctor", details=detail, status=409,
+        )
 
 
 def _snapshot(slug: str | None) -> dict[str, Any]:
@@ -248,6 +316,28 @@ def models_used_warning(summary: Any) -> list[dict[str, str]]:
         return []
     ranked = sorted(real.items(), key=lambda kv: (-(kv[1] if isinstance(kv[1], (int, float)) else 0), kv[0]))
     return [{"kind": "mixed_models", "models": ", ".join(f"{k}: {v}" for k, v in ranked)}]
+
+
+def translate_warnings(summary: Any) -> list[dict[str, Any]]:
+    """What the translate stage left for the user to check (contract C3), as ``result.warnings`` items: lines that miss a
+    glossary term (``glossary_misses``), lines the self-check could not fix (``check_failed``), Russian text without
+    stress marks (``stress_missing``). ``reason`` is a plain technical fallback for a client that does not know the kind."""
+    if not isinstance(summary, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for kind, ids_key, what in (("glossary_misses", "glossary_miss_ids", "lines miss a glossary term"), ("check_failed", "check_failed_ids", "lines failed the translation check")):
+        try:
+            n = int(summary.get(kind) or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            ids = [str(x) for x in (summary.get(ids_key) or [])][:10]
+            out.append({"kind": kind, "count": n, "line_ids": ids, "reason": f"{n} {what}" + (f": {', '.join(ids)}" if ids else "")})
+    stress = str(summary.get("stress") or "")
+    why = stress[4:].strip(" ()") if stress.startswith("none") else ""
+    if stress.startswith("none") and why != "not russian":  # no stress marks are needed for another target language
+        out.append({"kind": "stress_missing", "detail": why, "reason": f"no stress marks: {why}" if why else "no stress marks"})
+    return out
 
 
 class _FirstSubstitution(list):  # type: ignore[type-arg]
@@ -495,8 +585,9 @@ def _build_translate(slug: str, p: dict[str, Any]) -> FlowFn:
         with pipeline_ctx(h, job, force=bool(p.get("force"))) as ctx:
             res = run_stages(ctx, job, names)
         t = res.get("translate") or {}
-        job.add_warnings(models_used_warning(t))
-        return {k: t[k] for k in ("lines", "failed", "missing", "backend") if k in t}
+        job.add_warnings(models_used_warning(t) + translate_warnings(t))
+        keep = ("lines", "failed", "missing", "backend", "glossary_misses", "glossary_miss_ids", "check_failed", "check_failed_ids", "stress", "gender_guessed")
+        return {k: t[k] for k in keep if k in t}
 
     return run
 
@@ -513,7 +604,7 @@ def _build_stage(slug: str, p: dict[str, Any]) -> FlowFn:
         with pipeline_ctx(h, job, only=p.get("only") or None, limit=p.get("limit"), force=bool(p.get("force")), sets=p.get("sets")) as ctx:
             res = run_stages(ctx, job, names)
         if name == "translate":
-            job.add_warnings(models_used_warning(res.get(name)))
+            job.add_warnings(models_used_warning(res.get(name)) + translate_warnings(res.get(name)))
         return {"summary": res.get(name) or {}}
 
     return run
@@ -621,11 +712,13 @@ def _build_review_apply(slug: str, p: dict[str, Any]) -> FlowFn:
 
             pack_error = error_from_exception(e, stage="pack").to_dict()
             log.warning("pack after review apply failed: %s", e)
+        def _done(st: dict[str, Any]) -> None:
+            rv = st.setdefault("review", {})
+            rv["touched"] = [x for x in rv.get("touched", []) if x not in set(ids)]
+            rv["last_apply"] = {"changed": len(changed), "lines": changed, "at": now_iso()}
+
         with session.STATE_LOCK:
-            st = appdirs.read_app_state(h)
-            st["review"]["touched"] = [x for x in st["review"].get("touched", []) if x not in set(ids)]
-            st["review"]["last_apply"] = {"changed": len(changed), "lines": changed, "at": now_iso()}
-            appdirs.write_app_state(h, st)
+            appdirs.update_app_state(h, _done)
         res: dict[str, Any] = {"changed": len(changed), "lines": changed}
         if pack_error:
             res["pack_error"] = pack_error
@@ -681,6 +774,27 @@ def maybe_train_rvc(h: appdirs.ProjectHandle, sid: str) -> None:
     submit("rvc_train", h.slug, {"speaker_id": sid})
 
 
+def _call_auto_cast(auto: Callable[..., Any], ctx: Any) -> Any:
+    """``auto_cast(ctx, overwrite=False)`` (contract C8: the voices the user chose stay); an older build without the
+    keyword is called the old way."""
+    import inspect
+
+    try:
+        params = inspect.signature(auto).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "overwrite" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return auto(ctx, overwrite=False)
+    return auto(ctx)
+
+
+def _auto_cast_result(res: Any) -> tuple[dict[str, str], list[str]]:
+    """``(chosen, kept)`` from either shape of ``auto_cast``: ``{"chosen": {...}, "kept": [...]}`` or a plain ``{sid: design}``."""
+    if isinstance(res, dict) and isinstance(res.get("chosen"), dict):
+        return dict(res["chosen"]), [str(x) for x in res.get("kept") or []]
+    return dict(res or {}), []
+
+
 @flow("casting_auto")
 def _build_casting_auto(slug: str, p: dict[str, Any]) -> FlowFn:
     """"Автоматический кастинг": propose designs for every character that has none yet, then
@@ -693,7 +807,9 @@ def _build_casting_auto(slug: str, p: dict[str, Any]) -> FlowFn:
         propose = _voicebank_fn("propose_designs")
         list_designs = _voicebank_fn("list_designs")
         auto = _voicebank_fn("auto_cast")
-        sids = [c["speaker_id"] for c in casting.characters_view(h)]
+        view = casting.characters_view(h)
+        sids = [c["speaker_id"] for c in view]
+        unvoiced = {c["speaker_id"] for c in view if not c.get("voiced_lines")}
         job.set_stages(["voicebank"], len(sids))
         job.begin_stage("voicebank")
         generated: list[str] = []
@@ -703,14 +819,15 @@ def _build_casting_auto(slug: str, p: dict[str, Any]) -> FlowFn:
             todo = [sid for sid in sids if not list_designs(ctx, sid)]
             for i, sid in enumerate(todo):
                 job.progress(i, len(todo), sid)
-                propose(ctx, sid, n=n, description=None, sample_line_ids=None)
+                # a character without voiced lines: auto_cast takes the first design anyway, so one instead of n (round 18)
+                propose(ctx, sid, n=1 if sid in unvoiced else n, description=None, sample_line_ids=None)
                 generated.append(sid)
             job.progress(len(todo), len(todo))
-            chosen = dict(auto(ctx))
+            chosen, kept = _auto_cast_result(_call_auto_cast(auto, ctx))
         viewdata.clear_cache(h.slug)
         for sid in chosen:
             maybe_train_rvc(h, sid)
-        return {"chosen": chosen, "generated": generated}
+        return {"chosen": chosen, "kept": kept, "generated": generated}
 
     return run
 
@@ -818,6 +935,38 @@ REPORT_MAX_FILE = 5 * 1024 * 1024
 REPORT_JOB_LOGS = 5  # the newest per-job log files (logs/jobs/) that go into the report
 
 
+def report_environment() -> dict[str, Any]:
+    """``environment.json`` of the problem report: what a remote helper would otherwise ask for one screenshot at a time
+    (app version, the Diagnostics rows, each backend environment's state, the model self-tests, the tools). Every part is
+    guarded on its own: a failing probe leaves ``{"error": ...}`` in its place."""
+    from vndub_app import __version__, installer
+
+    def safe(fn: Callable[[], Any]) -> Any:
+        try:
+            return fn()
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    def doctor_rows() -> Any:
+        from vndub_app import doctor
+
+        return doctor.run_doctor()
+
+    states = getattr(installer, "env_states", None)
+    selftests = appdirs.data_dir() / "model_selftests.json"
+    return {
+        "app_version": __version__,
+        "at": now_iso(),
+        "platform": sys.platform,
+        "python": sys.version.split()[0],
+        "profile": safe(lambda: appdirs.load_settings().profile),
+        "doctor": safe(doctor_rows),
+        "envs": safe(states) if callable(states) else None,
+        "model_selftests": safe(lambda: appdirs.read_json(selftests, None)) if selftests.exists() else None,
+        "tools": safe(lambda: [{k: t.get(k) for k in ("name", "version", "present", "path")} for t in installer.list_tools()]),
+    }
+
+
 def build_report_zip(slug: str | None, dest_dir: Path | None = None) -> Path:
     """Zip logs (``app.log*``, the newest 5 per-job logs) + ``stage_status.json`` + ``project.yaml`` + ``app_state.json`` (no audio, no game data)."""
     dest_dir = dest_dir or appdirs.sub("reports")
@@ -844,6 +993,10 @@ def build_report_zip(slug: str | None, dest_dir: Path | None = None) -> Path:
         for f in sorted(job_logs.glob("*.log"), key=lambda p: p.name)[-REPORT_JOB_LOGS:] if job_logs.exists() else []:
             add(zf, f, f"logs/jobs/{f.name}")
         add(zf, appdirs.settings_file(), "settings.json")
+        try:
+            zf.writestr("environment.json", json.dumps(report_environment(), ensure_ascii=False, indent=2, default=str))
+        except Exception as e:  # the report itself must never fail on a probe
+            log.warning("problem report: environment.json failed: %s", e)
         if slug:
             h = appdirs.project_handle(slug)
             add(zf, h.work / "stage_status.json", "stage_status.json")

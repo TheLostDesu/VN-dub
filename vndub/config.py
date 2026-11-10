@@ -99,10 +99,11 @@ class RenpyOpts(_Section):
     dialogue_tab: str = ""
     # Overrides config.auto_voice detected in the scripts, e.g. "voice/{id}.ogg".
     auto_voice: str = ""
-    # Ren'Py >= 8.5.1 config.tlid_only_considers_say (default True in 8.6): voice
-    # statements do not enter the dialogue identifier. None = by the Ren'Py version
-    # the game ships (renpy/vc_version.py, renpy/__init__.py): True from 8.6, False
-    # when older or when the version cannot be read; true / false force it.
+    # Voice statements do not enter the dialogue identifier (Ren'Py's
+    # config.tlid_only_considers_say). None = by the Ren'Py version the game ships
+    # (renpy/vc_version.py, renpy/__init__.py): True from 8.5.1 (its translate code
+    # hashes only the say statement, checked in the 8.5.3 SDK), False when older or
+    # when the version cannot be read; true / false force it.
     tlid_only_considers_say: bool | None = None
 
 
@@ -251,6 +252,10 @@ class TranslateSection(_Section):
     # uses (places, people who are no characters, ...); the answers become glossary terms (note "auto") for the lines that
     # contain them. A term the user wrote is never overwritten. Cached like the scene summaries. false = skip.
     names_pass: bool = True
+    # Gender pass (round 18): with the names pass the LLM is asked ONCE for the gender of every character whose gender is still
+    # unknown (name, how others refer to them, a few lines); the answer goes to characters.yaml with gender_source "guess", never over
+    # a gender the user set. Cached like the names pass. false = skip.
+    gender_pass: bool = True
     # Narration (lines of the narrator without a voice) is translated too, as TEXT ONLY: it gives the model context and feeds
     # the Ren'Py text patch, but is never synthesized / scored / mastered. auto = on when the engine is renpy and
     # pack.renpy.text.enabled is not false | on | off. Menu choices (record flag `menu`) follow: translated when this resolves to
@@ -400,6 +405,9 @@ class ScoreSection(_Section):
     regen_cer_max: float = 0.2
     # interjections get a softer CER gate
     interjection_cer_max: float = 0.5
+    # a reference shorter than this many letters (after normalization) tolerates one wrong character: its gate is
+    # max(cer_max, 1/letters), so "Да." is not failed for a single letter; 0 = off
+    cer_short_chars: int = 8
 
 
 class StretchOpts(_Section):

@@ -72,7 +72,8 @@ def test_selection_auto_regen_review():
     assert s.status == "auto" and s.winner == "b.wav" and s.scores["composite"] == better.composite
     long = apply_scores(_c("d.wav", utmos=4.0, cer=0.02, dur_ratio=1.6, spk_sim=0.6), CFG, 0.3, False)
     s = _sel([bad, long], rounds=0)
-    assert s.status == "regen" and "cer" in s.reason
+    # round 18: no take passes -> the one closest to passing is the provisional winner (a slightly long take, not the garble)
+    assert s.status == "regen" and s.winner == "d.wav" and "dur_ratio" in s.reason
     s = _sel([long], rounds=2)
     assert s.status == "review" and "text_tgt_short" in s.reason and s.winner == "d.wav"
     s = _sel([])
@@ -406,9 +407,9 @@ def test_cer_words_takes_the_laughter_out_of_both_sides():
     assert cer("Ха-ха, ты серьёзно?", "ты серьёзно") > CFG.score.gates.cer_max
     assert cer(*score.cer_words("Ха-ха, ты серьёзно?", "ты серьёзно")) == 0.0
     assert cer(*score.cer_words("Haha, no way!", "haha no way")) == 0.0
-    # a laugh the ASR heard as one stray syllable is not a recognizable laugh: the plain reading is the floor
+    # a laugh the ASR heard as one stray syllable is not a recognizable laugh: round 18 drops the syllable from the transcript
     assert cer(*score.cer_words("Ха-ха, да ну!", "ха да ну")) > cer("Ха-ха, да ну!", "ха да ну")
-    assert score.cer_over_words("Ха-ха, да ну!", "ха да ну") == pytest.approx(cer("Ха-ха, да ну!", "ха да ну"))
+    assert score.cer_over_words("Ха-ха, да ну!", "ха да ну") == 0.0
     assert score.cer_over_words("Ха-ха, да ну!", "да ну") == 0.0 and score.cer_over_words("Haha, no way!", "no way") == 0.0
     assert score.cer_over_words("Привет, это тест.", "привет это тест") == 0.0
     assert score.cer_over_words("Привет, это тест.", "совсем другое") == pytest.approx(cer("Привет, это тест.", "совсем другое"))
@@ -549,8 +550,10 @@ def test_stage_recomputes_a_cer_stored_before_laughter_was_taken_out(make_ctx, t
             r.notes = [n for n in r.notes if n != score.LAUGHTER_NOTE]
         write_jsonl(ctx.paths.scores(lid), rows)
     score.run(ctx)
+    # round 18: an old CER is re-derived from the stored transcript (no ASR call), under the current rule
     for r in _tts_rows(ctx, words_id):
-        assert r.metrics["cer"] == 0.0 and r.model_extra["cer_rule"] == score.CER_RULE and r.model_extra["asr_text"] != "стёртый"
+        assert r.metrics["cer"] > 0.5 and r.model_extra["cer_rule"] == score.CER_RULE and r.model_extra["asr_text"] == "стёртый"
+        assert r.model_extra["cer_ref"] == "ты серьёзно?"
     for r in _tts_rows(ctx, only_id):
         assert r.metrics.get("cer") is None and "cer" in r.model_extra["na"] and score.LAUGHTER_NOTE in r.notes
         assert "asr_text" not in r.model_extra and "cer" not in r.gates
@@ -566,7 +569,8 @@ def test_select_prefers_a_fully_checked_take_over_a_higher_composite_that_skippe
     full = apply_scores(_c("b.wav", utmos=3.6, cer=0.05, dur_ratio=1.0, spk_sim=0.5), CFG, 0.3, False)
     assert blind.passed and full.passed and blind.composite > full.composite
     s = _sel([blind, full])
-    assert s.status == "auto" and s.winner == "b.wav" and s.reason == "best of 2 passing"
+    # round 18: the take the ASR heard nothing in no longer passes next to a measured one
+    assert s.status == "auto" and s.winner == "b.wav" and s.reason == "best of 1 passing"
     # the same through the run-wide reason (the group was unavailable for one take only is not a thing, but the order must not matter)
     assert _sel([full, blind]).winner == "b.wav"
     # every passing take has an unchecked gate: a person decides, on the best of them

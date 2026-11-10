@@ -1,14 +1,16 @@
 import type { Glossary } from "../api/types";
 import { useT } from "../i18n";
-import { Button } from "./ui";
+import { GuessChip, isGuessed, type GenderInfo } from "./GenderNote";
+import { Button, Chip } from "./ui";
 
 /** Table of character names (target spelling, gender) and free glossary terms. */
-export function GlossaryEditor({ value, onChange }: { value: Glossary; onChange: (g: Glossary) => void }) {
+export function GlossaryEditor({ value, onChange, genderInfo }: { value: Glossary; onChange: (g: Glossary) => void; genderInfo?: GenderInfo }) {
   const t = useT();
   const setChar = (i: number, patch: Partial<Glossary["characters"][number]>) =>
     onChange({ ...value, characters: value.characters.map((c, j) => (j === i ? { ...c, ...patch } : c)) });
   const setTerm = (i: number, patch: Partial<Glossary["terms"][number]>) =>
-    onChange({ ...value, terms: value.terms.map((c, j) => (j === i ? { ...c, ...patch } : c)) });
+    // an edit makes an auto-found term the user's own: saving it without the flag is what the backend reads as "mine"
+    onChange({ ...value, terms: value.terms.map((c, j) => (j === i ? { ...c, ...patch, auto: false } : c)) });
 
   return (
     <div className="glossary" data-testid="glossary">
@@ -41,6 +43,7 @@ export function GlossaryEditor({ value, onChange }: { value: Glossary; onChange:
                     <option value="f">{t("gender.f")}</option>
                     <option value="unknown">{t("gender.unknown")}</option>
                   </select>
+                  {genderInfo && isGuessed(genderInfo, c.speaker_id, c.gender) ? <GuessChip testid={`glossary-gender-guessed-${c.speaker_id}`} /> : null}
                 </td>
               </tr>
             ))}
@@ -74,6 +77,11 @@ export function GlossaryEditor({ value, onChange }: { value: Glossary; onChange:
                 <tr key={i}>
                   <td>
                     <input type="text" value={term.src} aria-label={t("glossary.src")} onChange={(e) => setTerm(i, { src: e.target.value })} data-testid={`glossary-term-src-${i}`} />
+                    {term.auto ? (
+                      <Chip tone="info" title={t("glossary.auto_title")} testid={`glossary-term-auto-${i}`}>
+                        {t("glossary.auto")}
+                      </Chip>
+                    ) : null}
                   </td>
                   <td>
                     <input type="text" value={term.tgt} aria-label={t("glossary.tgt")} onChange={(e) => setTerm(i, { tgt: e.target.value })} data-testid={`glossary-term-tgt-${i}`} />

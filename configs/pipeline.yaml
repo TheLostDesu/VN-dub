@@ -125,6 +125,8 @@ translate:
                                  # These lines also get an LLM `delivery` (see text_emotion.llm).
   # names_pass: true             # ONE extra LLM request before the first batch: the canonical target spelling of the script's proper nouns (Gensokyo, Patchouli ...),
                                  # added to the glossary terms (note "auto"; a term you wrote is never overwritten) so every batch spells a name the same way. Cached; false = skip.
+  # gender_pass: true            # ONE extra LLM request with the names pass: the gender (m/f) of every character whose gender is still unknown, from the name, their lines
+                                 # and how others refer to them; written to characters.yaml with gender_source "guess" (never over a gender you set). Cached; false = skip.
   # include_narration: auto      # auto | on | off: translate narration (lines of the narrator without audio) as TEXT-ONLY lines: context for the model and text for the Ren'Py
                                  # text patch, never synthesized. auto = on when the engine is renpy and pack.renpy.text.enabled is not false. Menu choices (translation record
                                  # `choices_tgt`) are translated when this is on OR the engine is renpy.
@@ -257,6 +259,7 @@ score:
   regen_rounds: 2
   regen_cer_max: 0.2             # the most intelligible take misreads more than this -> review at once, no regen rounds (0 = off)
   interjection_cer_max: 0.5
+  cer_short_chars: 8             # a reference under this many letters tolerates one wrong character (0 = off)
 
 master:
   stretch:
@@ -285,12 +288,14 @@ pack:
                                  #            a voiced game keeps its own mix) | true = always | false = no script (a stale one is removed by a full pack)
                                  #   duck: music / sfx volume while a line plays, 0.3 = 30 % (about -10 dB), 1.0 = no ducking
                                  #   key: Ren'Py key name that opens the panel (K_F8); the panel is also a button in the top right corner of the preferences screen
-                                 # + text: {enabled: auto, language: "", font: ""}   (generated game/tl/<language>/vndub_dialogue.rpy + game/vndub_language.rpy:
+                                 # + text: {enabled: auto, language: "", font: auto}   (generated game/tl/<language>/vndub_dialogue.rpy + game/vndub_language.rpy:
                                  #   the translated text on screen, one `translate <language> <id>:` block per say line and a `strings` block for menu choices;
                                  #   a bare `text: true|false` is `enabled`)
                                  #   enabled: auto = on when the project has a translation file | true | false = no script (a stale one is removed by a full pack)
                                  #   language: Ren'Py language name = the folder under game/tl/ ("" = from project.tgt_lang: ru -> russian, en -> english, ja -> japanese ...)
-                                 #   font: a .ttf / .otf inside game/ for a game whose own font lacks the alphabet (`translate <language> python:` sets gui.text_font); "" = none
+                                 #   font: auto (default) = check the fonts the game's scripts name and, when one has no Cyrillic letters, switch the game's fonts to the engine's
+                                 #         DejaVuSans.ttf (`translate <language> python:` sets gui.text_font; an old GUI also gets `translate <language> style default:`);
+                                 #         a .ttf / .otf inside game/ = use that one (wins over the check); "" or false = no check, no font block
   nscripter: {mode: loose}
   unity: {mode: unitypy_script}
   other: {}

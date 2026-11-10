@@ -51,7 +51,7 @@ def test_prompt_has_the_sound_rule():
                    "hum (mmm", "hmph", "shiver (brr", "eat (nom nom", "stage direction", "Laughter is not a sound"):
         assert needle in p, needle
     assert "standard Russian spelling" in p
-    assert translate.TRANSLATE_PROTOCOL == "3"
+    assert translate.TRANSLATE_PROTOCOL == "4"
 
 
 def test_delivery_prompt_does_not_offer_sound_events():
@@ -113,13 +113,14 @@ def test_stage_run_flags_spells_and_summarises(make_ctx, tmp_path):
     z = recs["l2"]
     assert z.sound == {"kind": "snore", "only": True, "stage": False, "source": "rule"}
     assert z.flags == ["sound", "interjection", "sound_spelled"]
-    assert z.text_tgt == z.text_tgt_short == "Хр-р-р... хр-р-р..."
+    # round 18: the screen text (text_tgt, the Ren'Py text patch) keeps the model's translation; only the TTS fields are spelled
+    assert z.text_tgt == z.text_tgt_short == "З-З-З..." and z.model_extra["sound_spelling"] == "Хр-р-р... хр-р-р..."
     assert z.text_tts == z.text_tts_short == z.text_plain == "Хр-р-р... хр-р-р..."
     assert "́" not in z.text_tts and "+" not in z.text_tts
     # Muah! -> kiss, the line's "!" survives
     k = recs["l3"]
     assert k.sound["kind"] == "kiss" and k.sound["only"] is True
-    assert k.text_tgt == "Чмок!" and "sound_spelled" in k.flags and "interjection" in k.flags
+    assert k.text_tgt == "Му-ах!" and k.text_tts == "Чмок!" and "sound_spelled" in k.flags and "interjection" in k.flags
     # a sound inside speech: flagged, the model's translation is left alone
     b = recs["l4"]
     assert b.sound["kind"] == "shiver" and b.sound["only"] is False

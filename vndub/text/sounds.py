@@ -68,7 +68,8 @@ _LAT_SPOKEN = re.compile(
     + r"|(?P<sneeze>a+h?[\-]?t?ch+o+o*|hatch+i+|atish+o+o*)"
     + r"|(?P<cough>a+h?hem|c+ough(?:" + _SEP + r"cough)*|khe+(?:" + _SEP + r"khe+)*)"
     + r"|(?P<hmph>h+m+p+h*|hu+mph|humf)"
-    + r"|(?P<hum>m+[\-~]h+m+|m{2,}h?m*|h+m{1,})"
+    # "Hmm" (hesitation) and "Mm-hmm" / "Mhm" / "Uh-huh" (agreement) are speech, only a run of three m is a hum
+    + r"|(?P<hum>(?:m[\-~]*){3,})"
     + r"|(?P<shiver>b+r{2,})"
     + r"|(?P<eat>nom(?:" + _SEP + r"nom)+|sl+u+r+p+|gulp|munch(?:" + _SEP + r"munch)*|om+(?:" + _SEP + r"nom)+)"
     + r"|(?P<gasp>gasp)"
@@ -97,7 +98,7 @@ _RU_SPOKEN = re.compile(
     + r"|(?P<sneeze>а+п(?:" + _SEP + r"ч+х+и+)|апчх+и+)"
     + r"|(?P<cough>к[хэ]е+(?:" + _SEP + r"к[хэ]е+)*|кха+(?:" + _SEP + r"кха+)*|кхм+)"
     + r"|(?P<hmph>хм+ф+|хмпф+)"
-    + r"|(?P<hum>м+(?:[\-~]м+)+|м{2,}|хм+)"
+    + r"|(?P<hum>(?:м[\-~]*){3,})"  # "Хм", "Мм" (hesitation / agreement) are speech; "М-м-м", "Ммм" hum
     + r"|(?P<shiver>бр+(?:" + _SEP + r"р+)+|бр{2,})"
     + r"|(?P<eat>ням+(?:" + _SEP + r"ням+)*|хрум+(?:" + _SEP + r"хрум+)*|хлюп+(?:" + _SEP + r"хлюп+)*|чавк+(?:" + _SEP + r"чавк+)*)"
     + r")"

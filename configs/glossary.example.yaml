@@ -42,13 +42,17 @@ characters:
 
 # The player: the protagonist the characters address as "you" (darling, dear ...). Its gender decides grammatical agreement of the words said
 # to or about the player (ru: "ty vernulsya, dorogoi" for m, "ty vernulas, dorogaya" for f). m | f | unknown (unknown: wordings that do not reveal it,
-# the masculine when impossible).
+# the masculine when impossible). Narration and the protagonist's own lines take this gender too; speaker_id names the protagonist's
+# speaker (optional: a speaker whose name in the script is an interpolation, Character("[player_name]"), counts without it).
 player:
   name: ""
   gender: unknown
   notes: ""
+  speaker_id: ""
 
-# Proper nouns the model should spell one way. The names pass (translate.names_pass) adds the ones it finds with notes "auto"; a term written here wins.
+# Proper nouns the model should spell one way. The names pass (translate.names_pass) adds the ones it finds with notes "auto" (kept in
+# work/glossary_auto.yaml; the app lists them as found automatically, and one deleted there is not added again); a term written here wins.
+# Terms match whole words, case-insensitive ("Ann" is not in "Annoying"); Japanese terms match anywhere.
 terms:
   - {src: 放課後, tgt: после уроков}
   - {src: 校門, tgt: школьные ворота}
@@ -57,4 +61,3 @@ style_rules:
   - "Keep the register and the emotional tone of the original line."
   - "Interjections must sound natural in Russian (えっ -> «а?», うん -> «угу»), not literal."
   - "Do not add explanations or notes into the translated text."
-  - "Keep names exactly as listed in the glossary."

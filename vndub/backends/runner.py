@@ -62,6 +62,21 @@ class AdapterAborted(AdapterCrashed):
     """The adapter was killed by :meth:`AdapterProcess.abort` (cancel / app exit): not a crash, never restarted."""
 
 
+def _lenient_reply(raw: bytes) -> dict[str, Any] | None:
+    """A reply that orjson rejects only because the adapter's ``json.dumps`` wrote ``NaN`` / ``Infinity`` (a MOS or a cosine
+    of a silent take): parsed with the standard library, the non-finite numbers as ``None``. It used to be logged as noise and
+    the call waited for its timeout (82 minutes for a chunk of 16), then lost the whole chunk."""
+    if not raw.startswith(b'{"jsonrpc"'):
+        return None
+    import json
+
+    try:
+        msg = json.loads(raw.decode("utf-8", "replace"), parse_constant=lambda _c: None)
+    except ValueError:
+        return None
+    return msg if isinstance(msg, dict) else None
+
+
 def envs_root(root: Path | None = None) -> Path:
     """Directory that holds the backend virtual environments.
 
@@ -190,7 +205,11 @@ class AdapterProcess:
                 try:
                     self._responses.put(orjson.loads(raw))
                 except orjson.JSONDecodeError:
-                    self._log(b"[non-protocol stdout] " + raw)
+                    msg = _lenient_reply(raw)
+                    if msg is not None:
+                        self._responses.put(msg)
+                    else:
+                        self._log(b"[non-protocol stdout] " + raw)
         except (OSError, ValueError):  # close() shut the pipe under the reader
             pass
         self._responses.put(None)  # EOF marker

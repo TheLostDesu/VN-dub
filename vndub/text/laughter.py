@@ -84,7 +84,7 @@ _RU_UKH = re.compile(_RU_B + r"у[\-~]?(?P<units>ху(?:" + _RU_SEP + r"ху)+)�
 # so three units).
 _RU_SINGLES = re.compile(
     _RU_B
-    + r"(?:(?P<heh>хех)|(?P<eh>э[\-~]?х[еэ])|(?P<fufu>у(?:" + _RU_SEP + r"?фу){2,}|фу(?:" + _RU_SEP + r"фу){2,})|(?P<kuku>к[уе](?:" + _RU_SEP + r"к[уе]){2,})|(?P<gy>гы(?:" + _RU_SEP + r"гы)+)|(?P<buga>буга(?:" + _RU_SEP + r"га)+\w*)"
+    + r"(?:(?P<heh>хех)|(?P<eh>э[\-~]?х[еэ])|(?P<fufu>у(?:" + _RU_SEP + r"?фу){2,}|фу(?:" + _RU_SEP + r"фу){2,})|(?P<kuku>к[уе](?:" + _RU_SEP + r"к[уе]){2,})|(?P<gy>гы(?:" + _RU_SEP + r"гы)+)|(?P<buga>бу[\-~]?га(?:" + _RU_SEP + r"га)+\w*)|(?P<hah>а?хах)"
     r"|(?P<pff>пф{1,4}(?:[\-~]ф+)*|пхах?|фыр))" + _RU_E,
     re.I,
 )

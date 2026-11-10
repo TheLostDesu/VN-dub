@@ -27,6 +27,10 @@ def o_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     fresh_runner()
     # install_envs / ensure_pytools first make sure of a managed Python (uv python install): not in these tests
     monkeypatch.setattr(installer, "ensure_python", lambda version, ctx: Path("python"))
+    # round 18: the import probe after a build runs the env's python (none in the fake envs) and the free-space check
+    # looks at the real drive: both have their own tests in test_env_health_r18.py
+    monkeypatch.setattr(installer, "probe_env", lambda name, ctx=None, timeout=0: {"ok": True, "s": 0.0, "results": {}})
+    monkeypatch.setattr(installer, "_check_env_space", lambda names, path: None)
     yield data
     installer.set_manifest_override(None)
     doctor.set_probes(None)

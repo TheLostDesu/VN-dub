@@ -175,6 +175,24 @@ export function useProgressState(): ProgressState {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
+/**
+ * False once the progress socket has been without contact for `graceMs` (a reconnect within the grace period is invisible).
+ * While it is false every number on screen is the last one received, not the current one.
+ */
+export function useConnected(graceMs = 5000): boolean {
+  const { connected } = useProgressState();
+  const [lost, setLost] = useState(false);
+  useEffect(() => {
+    if (connected) {
+      setLost(false);
+      return;
+    }
+    const id = window.setTimeout(() => setLost(true), graceMs);
+    return () => window.clearTimeout(id);
+  }, [connected, graceMs]);
+  return !lost;
+}
+
 /** A live job: from the store, refreshed by polling when the socket is down or quiet. */
 export function useJob(id: string | null | undefined, initial?: JobInfo | null): JobInfo | null {
   const s = useProgressState();

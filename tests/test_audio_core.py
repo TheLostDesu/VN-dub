@@ -117,3 +117,13 @@ def test_cer_normalization() -> None:
     assert cer.cer("Привет, мир!", "привет мир") == 0.0
     assert cer.cer("абв", "") == 1.0
     assert 0 < cer.cer("кошка", "кошки") < 0.5
+
+
+def test_snr_is_unknown_without_a_noise_floor() -> None:
+    import numpy as np
+
+    from vndub.audio import features
+
+    e = np.full(300, -30.0)
+    assert features.snr_db(e, np.ones(300, dtype=bool)) is None  # was a 40 dB "perfect" that hid a music bed
+    assert features.snr_db(np.r_[np.full(100, -20.0), np.full(50, -60.0)], np.r_[np.ones(100, bool), np.zeros(50, bool)]) > 30

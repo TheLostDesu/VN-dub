@@ -257,4 +257,29 @@ def why_items(
         items.append({"gate": "spk_sim", "key": key, "params": {"value": _r(_num(m["spk_sim"])), "min": _r(th.spk_min)}})
     if g.get("dur") is False and _num(m.get("dur_ratio")) is not None:
         items.append({"gate": "dur", "key": "dur_ratio", "params": {"value": _r(_num(m["dur_ratio"])), "min": _r(th.dur_lo), "max": _r(th.dur_hi)}})
+    if selection_status in ("review", "regen") and not (selection_reason or "").startswith("override") and not any(it["gate"] in GATE_KEYS for it in items):
+        sel = selection_item(selection_reason)  # contract C7: the line was flagged and no failing gate says why
+        if sel is not None:
+            items.append(sel)
     return items
+
+
+GATE_KEYS = ("cer", "utmos", "spk_sim", "dur")
+# the reason prefixes of ``vndub.stages.score.select`` (and their spots inside a longer reason)
+_UNCHECKED_MARKERS = ("gate not checked", "no gate could be evaluated")
+_HOPELESS_MARKERS = ("a new take would not help",)
+
+
+def selection_item(reason: str) -> dict[str, Any] | None:
+    """The why item of a selection reason: ``why.gate_unchecked`` / ``why.regen_hopeless`` with the part after the first
+    colon as detail, else the raw reason as ``why.selection_reason``; ``None`` for an empty reason."""
+    text = (reason or "").strip()
+    if not text:
+        return None
+    low = text.lower()
+    detail = text.split(":", 1)[1].strip() if ":" in text else text
+    if any(mk in low for mk in _HOPELESS_MARKERS):
+        return {"gate": "selection", "key": "why.regen_hopeless", "params": {"detail": detail}}
+    if any(mk in low for mk in _UNCHECKED_MARKERS):
+        return {"gate": "selection", "key": "why.gate_unchecked", "params": {"detail": detail}}
+    return {"gate": "selection", "key": "why.selection_reason", "params": {"detail": text}}

@@ -42,6 +42,8 @@ export interface Settings {
   translation_llm?: string;
   /** write DEBUG lines to <data>/logs (absent until the backend knows the setting: read it as `?? false`) */
   debug_log?: boolean;
+  /** Hugging Face mirror, e.g. https://hf-mirror.com; "" = huggingface.co (absent on an older server) */
+  hf_endpoint?: string;
   data_dir?: string;
   [extra: string]: unknown;
 }
@@ -103,6 +105,10 @@ export interface JobWarning {
   reason?: string;
   models?: string;
   keys?: string;
+  /** `glossary_misses` / `check_failed`: how many lines */
+  count?: number;
+  /** `stress_missing`: why the text has no stress marks */
+  detail?: string;
 }
 
 /** GET /api/jobs/{id}/log: the whole per-job log file (or the tail the server keeps when the file is gone). */
@@ -304,7 +310,8 @@ export interface ImportPreview {
 
 export interface Glossary {
   characters: { speaker_id: string; src: string; tgt: string; gender: "m" | "f" | "unknown" }[];
-  terms: { src: string; tgt: string; note: string }[];
+  /** `auto`: found by the names pass of the translation (absent on an older server); editing a term makes it the user's */
+  terms: { src: string; tgt: string; note: string; auto?: boolean }[];
 }
 
 // ---- casting --------------------------------------------------------------------------------

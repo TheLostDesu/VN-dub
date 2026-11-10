@@ -11,6 +11,7 @@
   packaging\build_app.ps1 -InstallerOnly   # only installer\VNDub-Setup.exe, from the existing dist\VNDub
                                            # (no SPA, no PyInstaller, no self-check, no uv)
   packaging\build_app.ps1 -RefreshRedist   # download vc_redist.x64.exe again (the cached copy is the "latest" of its day)
+  packaging\build_app.ps1 -SkipEnvProbe "no envs on this box"   # without the release gate on the backend envs
 
 .NOTES
   Needs uv (bundled into the app as bin\uv.exe; found via -Uv, PATH or ~\.local\bin) and the dev group
@@ -46,7 +47,8 @@ param(
     [switch]$Clean,
     [switch]$RefreshRedist,
     [string]$Uv = "",
-    [string]$Iscc = ""
+    [string]$Iscc = "",
+    [string]$SkipEnvProbe = ""   # a reason: build without the release gate on the backend envs (see "backend environments")
 )
 
 $ErrorActionPreference = "Stop"
@@ -388,6 +390,21 @@ if ($InstallerOnly) {
     }
     if (-not $uvExe) { throw "uv not found (pass -Uv <path>, put it on PATH, or install it: https://docs.astral.sh/uv/)" }
     Write-Host "using $uvExe"
+
+    # -- release gate: the build machine's backend envs ---------------------------------------------------
+    # every env built in .venvs must be complete, meet every pin of envs\*.txt and pass the import probe
+    # (adapters.<env>.main --probe, no weights). 0.7.1, 1.0.1 and 1.0.2 fixed envs that broke inside a vendor import: the
+    # first two failures were already in this machine's envs. Passing without it needs a reason: -SkipEnvProbe "<reason>".
+    Step "backend environments (.venvs): pins and import check"
+    if ($SkipEnvProbe) {
+        Warn "environment check skipped: $SkipEnvProbe"
+    } else {
+        $prevEnvs = $env:VNDUB_ENVS_DIR
+        $env:VNDUB_ENVS_DIR = Join-Path $Root ".venvs"
+        try {
+            Run "environment check (pass -SkipEnvProbe `"<reason>`" to build anyway)" { & $uvExe run python -c "import sys; from vndub_app import installer; sys.exit(min(installer.release_gate(), 100))" }
+        } finally { $env:VNDUB_ENVS_DIR = $prevEnvs }
+    }
 
     # -- SPA ---------------------------------------------------------------------------------------------
     Step "SPA (vndub_app\web)"

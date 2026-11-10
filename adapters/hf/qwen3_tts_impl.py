@@ -39,6 +39,8 @@ def _max_new_tokens(text: str, margin: float, target: float | None) -> int:
 
 
 class _QwenBase(TTSImpl):
+    probe_imports = ("torch", "qwen_tts")  # what _load_model() imports (ModelImpl.probe)
+
     def _load_model(self, path: str):
         import torch
         from qwen_tts import Qwen3TTSModel

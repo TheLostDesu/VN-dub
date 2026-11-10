@@ -15,6 +15,8 @@ class AnimeSER(ModelImpl):
 
     selftest_op = "emotion"
 
+    probe_imports = ("transformers",)  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         from transformers import pipeline
 
@@ -118,6 +120,8 @@ class AudeeringADV(ModelImpl):
     """Arousal / dominance / valence (~0..1). Batch size 1 by design (known batching issue)."""
 
     selftest_op = "adv"
+
+    probe_imports = ("torch", "transformers")  # what load() imports (ModelImpl.probe)
 
     def load(self) -> dict[str, Any]:
         import torch

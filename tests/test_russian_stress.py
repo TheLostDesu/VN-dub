@@ -137,7 +137,9 @@ def test_the_option_overrides_the_caps(make_ctx, tmp_path, monkeypatch):
     assert {s["text_used"] for s in _sides(ctx, line.line_id)} == {"Она видит замок."} and not asked
 
 
-def test_a_user_text_goes_as_written_whatever_the_format(proj, monkeypatch):
+def test_a_user_text_keeps_its_own_marks_in_the_backend_format(proj, monkeypatch):
+    """Round 18: a Review text is prepared like a translation. Marks the user typed are kept (no stresser), in the form the
+    backend takes: the acute format drops the mark of a one-vowel word."""
     from vndub.review.app import write_override
 
     ctx = proj
@@ -148,7 +150,7 @@ def test_a_user_text_goes_as_written_whatever_the_format(proj, monkeypatch):
     write_override(ctx.paths, line.line_id, "set_text", {"text": "Д+а, зам+ок."})
     synth.run(ctx)
     over = [s for s in _sides(ctx, line.line_id) if s["text_variant"] == "override"]
-    assert over and all(s["text_used"] == "Д+а, зам+ок." for s in over)
+    assert over and all(s["text_used"] == "Да, замо́к." for s in over)
 
 
 def test_another_target_language_gets_no_marks(make_ctx, tmp_path, monkeypatch):

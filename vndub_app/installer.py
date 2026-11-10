@@ -1300,6 +1300,7 @@ def list_envs(with_size: bool = True) -> list[dict[str, Any]]:
         if s.env:
             users.setdefault(s.env, []).append(s.name)
     rows = []
+    states = env_states()
     for name in env_names():
         present = env_exists(name)
         size = None
@@ -1319,9 +1320,292 @@ def list_envs(with_size: bool = True) -> list[dict[str, Any]]:
                 "torch": _env_torch(name) if present else None,
                 "needs_git": env_needs_git(name),
                 "backends": sorted(users.get(name, [])),
+                # round 18: the env's health (env_states): complete build, pins met, import check
+                "complete": bool((states.get(name) or {}).get("complete")),
+                "problems": [p for p in (states.get(name) or {}).get("problems") or [] if p.get("code") != "env_missing"],
             }
         )
     return rows
+
+
+# ----------------------------------------------------------------------------
+# environment health: build record, pin drift, import probe (round 18)
+# ----------------------------------------------------------------------------
+
+RECORD_FILE = "vndub_env.json"  # written by scripts/make_envs.* through adapters/common/envrecord.py
+PROBE_FILE = "vndub_probe.json"  # written by probe_env after an install and by the Diagnostics check
+PROBE_TIMEOUT_S = 900.0  # cosyvoice3 + chatterbox imports took 43 / 56 s cold on the build machine
+_PIN_LINE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9_.\-]*)(\[[^\]]*\])?\s*==\s*([^\s;#,]+)")
+_TORCH_LINE = re.compile(r"^\s*#\s*@torch\s+(.+)$")
+_GIT_LINE = re.compile(r"^\s*#\s*@git\s+(\S+)\s+(\S+)\s+(\S+)")
+_ENVRECORD: Any = None
+
+
+def envrecord() -> Any:
+    """``adapters/common/envrecord.py`` loaded by path: the one copy of the requirement hash and the torch-tag rules
+    (the env builds run it with their own interpreter; in the packaged app it lives under ``backend/adapters``)."""
+    global _ENVRECORD
+    if _ENVRECORD is None:
+        import importlib.util
+
+        p = appdirs.resource("adapters", "common", "envrecord.py")
+        if not p.exists():
+            p = appdirs.resource("backend", "adapters", "common", "envrecord.py")
+        spec = importlib.util.spec_from_file_location("vndub_envrecord", p)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        _ENVRECORD = mod
+    return _ENVRECORD
+
+
+def _read_json_file(p: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _req_pins(files: list[Path]) -> list[tuple[str, str, str]]:
+    """``(file name, project, version)`` of every ``==`` pin, the ``# @torch`` line included."""
+    out = []
+    for f in files:
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            m = _TORCH_LINE.match(line)
+            reqs = m.group(1).split() if m else ([] if line.lstrip().startswith("#") else [line])
+            for r in reqs:
+                p = _PIN_LINE.match(r)
+                if p:
+                    out.append((f.name, p.group(1), p.group(3)))
+    return out
+
+
+def _empty_state(present: bool = False) -> dict[str, Any]:
+    return {"present": present, "complete": False, "drift": [], "req_changed": False, "extras_failed": [], "torch_kind": None,
+            "probe": None, "packages": [], "problems": [], "git_mismatch": [], "record": None}
+
+
+def env_state(name: str, root: Path | None = None) -> dict[str, Any]:
+    """Health of one env from files only (no interpreter is started; about 20 ms). See :func:`env_states`."""
+    er = envrecord()
+    path = (root or resolve_envs_dir()) / name
+    py = path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    present = py.exists() and (path / "pyvenv.cfg").exists()
+    st = _empty_state(present)
+    problems: list[dict[str, str]] = st["problems"]
+    if not present:
+        problems.append({"level": "error", "code": "env_missing", "detail": f"{path} is not built"})
+        return st
+    rec = _read_json_file(path / RECORD_FILE)
+    probe = _read_json_file(path / PROBE_FILE)
+    have = er.installed(path)
+    st.update(record=rec, complete=rec is not None, probe=probe, packages=sorted(f"{n}=={v}" for n, v in have.items()), torch_kind=er.torch_kind(path, have))
+    req_dir = appdirs.resource("envs")
+    files = er.req_files(req_dir, name)
+    failed = [str(x) for x in ((rec or {}).get("extras_failed") or []) if x] if isinstance((rec or {}).get("extras_failed"), list) else [x for x in str((rec or {}).get("extras_failed") or "").replace(",", " ").split() if x]
+    st["extras_failed"] = failed
+    st["drift"] = [
+        f"{fn}: {pkg}=={want} installed {have.get(er.norm_name(pkg)) or 'none'}"
+        for fn, pkg, want in _req_pins([f for f in files if f.name not in failed])  # a failed extra is its own problem
+        if (have.get(er.norm_name(pkg)) or "").split("+")[0] != want
+    ]
+    heads = er.git_heads(path)
+    for f in files:
+        if f.name in failed:
+            continue
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            g = _GIT_LINE.match(line)
+            if g and re.fullmatch(r"[0-9a-f]{40}", g.group(3)) and g.group(1) in heads and heads[g.group(1)] != g.group(3):
+                st["git_mismatch"].append(f"{g.group(1)}: {heads[g.group(1)][:12]} instead of {g.group(3)[:12]}")
+    built_hash = (rec or {}).get("req_sha256")
+    st["req_changed"] = bool(built_hash) and built_hash != er.req_sha256(req_dir, name) and not st["drift"]
+    if rec is None:
+        problems.append({"level": "error", "code": "env_incomplete", "detail": f"{name}: no build record ({RECORD_FILE}): the last build did not finish"})
+    if probe is not None and not probe.get("ok"):
+        problems.append({"level": "error", "code": "env_broken", "detail": _probe_failures(probe)[:600] or "the import check failed"})
+    if st["drift"] or st["git_mismatch"]:
+        problems.append({"level": "warn", "code": "env_stale", "detail": "; ".join((st["drift"] + st["git_mismatch"])[:4]) + (f" (+{len(st['drift']) + len(st['git_mismatch']) - 4} more)" if len(st["drift"]) + len(st["git_mismatch"]) > 4 else "")})
+    elif st["req_changed"]:
+        problems.append({"level": "warn", "code": "env_stale", "detail": f"{name}: the requirement files changed since the build"})
+    if failed:
+        problems.append({"level": "warn", "code": "env_extras_failed", "detail": ", ".join(failed)})
+    from vndub_app import __version__
+
+    if rec is not None and (probe is None or probe.get("app_version") != __version__ or probe.get("req_sha256") != er.req_sha256(req_dir, name)):
+        problems.append({"level": "warn", "code": "env_unchecked", "detail": f"{name}: not checked by this version ({__version__})"})
+    return st
+
+
+def env_states() -> dict[str, dict[str, Any]]:
+    """``{env: state}`` for every env of ``envs/*.txt`` (contract C4): pure file reads, well under a second, never raises.
+
+    ``state`` = ``{present, complete, drift: [str], req_changed, extras_failed: [str], torch_kind: cpu|cuda|None,
+    probe: {ok, at, app_version, results}|None, packages: [name==version], problems: [{level, code, detail}]}`` (+
+    ``git_mismatch``, ``record``). ``complete``: the build record exists (a build deletes it when it starts). ``drift``:
+    ``==`` pins the installed packages do not meet. ``req_changed``: the requirement files differ from the ones the env was
+    built from although every pin is met (a ``# @git`` / ``@cuda`` change). Problem codes: ``env_missing``,
+    ``env_incomplete``, ``env_broken`` (errors); ``env_stale``, ``env_extras_failed``, ``env_unchecked`` (warnings)."""
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        names = env_names()
+        root = resolve_envs_dir()
+    except Exception as e:  # a broken bundle must not break a run's preflight or the problem report
+        log.warning("env_states: %s", e)
+        return out
+    for n in names:
+        try:
+            out[n] = env_state(n, root)
+        except Exception as e:
+            st = _empty_state()
+            st["problems"].append({"level": "warn", "code": "env_state_failed", "detail": f"{type(e).__name__}: {e}"})
+            out[n] = st
+    return out
+
+
+def env_problems(names: Any, level: str = "error") -> list[dict[str, str]]:
+    """Problems of the envs ``names`` (contract C4), each with an ``env`` key. ``level="error"``: errors only;
+    ``"warn"``: warnings too. An env name that is not in ``envs/*.txt`` has none (nothing to build)."""
+    keep = ("error",) if level == "error" else ("error", "warn")
+    states = env_states()
+    out = []
+    for n in dict.fromkeys(names or []):
+        for p in (states.get(n) or {}).get("problems") or []:
+            if p.get("level") in keep:
+                out.append({**p, "env": n})
+    return out
+
+
+def _probe_command(name: str) -> tuple[list[str], Path]:
+    from vndub.backends.runner import adapters_root, env_python
+
+    return [str(env_python(name)), "-B", "-m", f"adapters.{name}.main", "--probe"], adapters_root()
+
+
+def probe_env(name: str, ctx: JobContext | None = None, timeout: float = PROBE_TIMEOUT_S) -> dict[str, Any]:
+    """Run ``adapters.<env>.main --probe`` in the env, store ``<env>/vndub_probe.json`` and return it.
+
+    ``{"ok", "at", "app_version", "req_sha256", "s", "results": {adapter: {ok, s, error?}}}``. A probe that cannot start,
+    times out or prints no JSON is a failed probe with the reason under ``results["_process"]``."""
+    from vndub_app import __version__
+
+    cmd, cwd = _probe_command(name)
+    env = _child_env({"PYTHONPATH": str(cwd), "VNDUB_APP_VERSION": __version__})
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    t0 = time.monotonic()
+    results: dict[str, Any]
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", creationflags=flags)
+    except OSError as e:
+        results = {"_process": {"ok": False, "error": f"cannot start {cmd[0]}: {e}"}}
+    else:
+        unwatch = ctx.watch_process(proc) if ctx is not None else (lambda: None)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            winproc.kill_tree(proc)
+            out, err = proc.communicate()
+            results = {"_process": {"ok": False, "error": f"no answer within {int(timeout)} s"}}
+        else:
+            last = next((l for l in reversed((out or "").splitlines()) if l.strip().startswith("{")), "")
+            try:
+                results = json.loads(last) if last else {}
+            except ValueError:
+                results = {}
+            if not results:
+                tail = " | ".join(l for l in (err or "").splitlines()[-5:] if l.strip())
+                results = {"_process": {"ok": False, "error": f"exit code {proc.returncode}, no result: {tail[-400:]}"}}
+        finally:
+            unwatch()
+        if ctx is not None:
+            for line in (err or "").splitlines()[-20:]:
+                if line.strip() and ("Error" in line or "error" in line):
+                    ctx.log(f"   {line.strip()[:300]}")
+            if ctx.cancelled:
+                raise JobCancelled("cancelled by user")
+    # adapters of an optional extra that failed to install are a warning of their own (env_extras_failed), not a broken env
+    rec_build = _read_json_file(resolve_envs_dir() / name / RECORD_FILE) or {}
+    failed_x = rec_build.get("extras_failed") if isinstance(rec_build.get("extras_failed"), list) else []
+    skip = {a for x in failed_x for a in EXTRA_ADAPTERS.get(str(x).split("+", 1)[-1].rsplit(".", 1)[0].lower(), ())}
+    for k in skip & set(results):
+        if isinstance(results[k], dict) and not results[k].get("ok"):
+            results[k]["skipped"] = "its optional part was not installed"
+    ok = bool(results) and all(isinstance(v, dict) and (v.get("ok") or v.get("skipped")) for v in results.values())
+    from vndub.util import now_iso
+
+    rec = {"ok": ok, "at": now_iso(), "app_version": __version__,
+           "req_sha256": envrecord().req_sha256(appdirs.resource("envs"), name), "s": round(time.monotonic() - t0, 1), "results": results}
+    try:
+        appdirs.write_json_atomic(resolve_envs_dir() / name / PROBE_FILE, rec)
+    except Exception as e:  # bookkeeping: the caller still gets the verdict
+        log.warning("cannot store the probe of %s: %s", name, e)
+    return rec
+
+
+def _probe_failures(rec: dict[str, Any]) -> str:
+    return "; ".join(f"{k}: {v.get('error', '')}" for k, v in (rec.get("results") or {}).items() if isinstance(v, dict) and not v.get("ok") and not v.get("skipped"))[:800]
+
+
+def check_envs(names: list[str] | None, ctx: JobContext) -> dict[str, Any]:
+    """Job body of the Diagnostics fix ``check_envs``: the import probe of each built env (default: every built one)."""
+    states = env_states()
+    todo = [n for n in (names or list(states)) if (states.get(n) or {}).get("present")]
+    rows = _Rows(ctx)
+    row_by = {n: rows.add(f"env:{n}", n, n) for n in todo}
+    broken: dict[str, str] = {}
+    for i, n in enumerate(todo):
+        ctx.checkpoint()
+        ctx.message("installer.msg.env_check", env=n)
+        ctx.progress(i, len(todo), n)
+        rows.set(row_by[n], force=True, state="installing")
+        rec = probe_env(n, ctx)
+        if rec["ok"]:
+            ctx.log(f"{n}: import check ok in {rec['s']} s")
+            rows.set(row_by[n], force=True, state="done")
+        else:
+            broken[n] = _probe_failures(rec)
+            ctx.log(f"{n}: import check FAILED: {broken[n]}")
+            rows.set(row_by[n], force=True, state="failed", error="env_broken")
+    ctx.progress(len(todo), len(todo), None)
+    ctx.set_result(files=[dict(r) for r in rows.rows], checked=todo, broken=sorted(broken))
+    if broken:
+        first = next(iter(broken))
+        raise AppError("env_broken", params={"env": ", ".join(broken), "detail": broken[first][:300]}, action="retry", details="\n".join(f"{k}: {v}" for k, v in broken.items()))
+    return {"checked": todo, "broken": []}
+
+
+def release_gate(out: Callable[[str], None] = print) -> int:
+    """``packaging/build_app.ps1``'s check of the build machine's envs (``VNDUB_ENVS_DIR``): every env that is built must be
+    complete, meet every pin of the requirement files and pass the import probe. Returns the number of failing envs.
+
+    0.7.1, 1.0.1 and 1.0.2 shipped fixes for envs that broke inside a vendor import; the first two failures were already in
+    the build machine's own envs, the third env had never been built there."""
+    states = env_states()
+    bad = 0
+    missing = [n for n, s in states.items() if not s.get("present")]
+    if missing:
+        out(f"WARNING: not built on this machine, not checked: {', '.join(missing)}")
+    for n, s in states.items():
+        if not s.get("present"):
+            continue
+        why = []
+        if not s.get("complete"):
+            why.append("no build record (the last build did not finish)")
+        why += s.get("drift") or []
+        why += s.get("git_mismatch") or []
+        if not why:
+            rec = probe_env(n)
+            if not rec["ok"]:
+                why.append(f"import check: {_probe_failures(rec)}")
+            else:
+                out(f"{n}: ok ({len(s.get('packages') or [])} packages, import check {rec['s']} s)")
+        if why:
+            bad += 1
+            out(f"{n}: FAILED: " + "; ".join(why))
+    return bad
 
 
 def resolve_torch(choice: str) -> str:
@@ -1377,6 +1661,7 @@ def install_envs(envs: list[str], torch: str, ctx: JobContext) -> dict[str, Any]
         raise AppError("tool_missing", params={"tool": "uv"}, action="show_manual", details="uv was not found (not bundled, not on PATH)")
     path = envs_dir()
     path.mkdir(parents=True, exist_ok=True)
+    _check_env_space(names, path)
     base_python = ensure_python(ENVS_PYTHON, ctx)  # a real folder, not uv's junction: see ensure_python
     free_folders([path / n for n in names], ctx, "the environment is being reinstalled")
     rows = _Rows(ctx)
@@ -1396,8 +1681,12 @@ def install_envs(envs: list[str], torch: str, ctx: JobContext) -> dict[str, Any]
             ctx.message("installer.msg.env", env=m.group(1))
             ctx.progress(names.index(m.group(1)), len(names), m.group(1))
 
-    rc, tail = run_stream(cmd, ctx, env=_child_env(extra), on_line=on_line)
-    created = [n for n in names if env_exists(n)]
+    from vndub_app import __version__
+
+    rc, tail = run_stream(cmd, ctx, env=_child_env({**extra, "VNDUB_APP_VERSION": __version__}), on_line=on_line)
+    # built = the interpreter AND the build record: make_envs deletes the record when an env's build starts, so an env whose
+    # build stopped half-way is not counted although its pyvenv.cfg exists
+    created = [n for n in names if env_exists(n) and (rc == 0 or (path / n / RECORD_FILE).exists())]
     for n in names:
         rows.set(row_by[n], force=True, state="done" if n in created else "failed", error=None if n in created else "env_install_failed")
     ctx.set_result(files=[dict(r) for r in rows.rows], envs=created, torch=torch_kind)
@@ -1406,11 +1695,93 @@ def install_envs(envs: list[str], torch: str, ctx: JobContext) -> dict[str, Any]
         junction = _junction_error(tail, Path(uv_dirs()["UV_PYTHON_INSTALL_DIR"]))
         if junction is not None:
             raise junction
+        if _looks_like_disk_full(tail):
+            raise AppError("disk_full", params={"need_gb": round(_env_space_need_gb(names), 1), "free_gb": round(downloads.free_space_gb(path), 1), "path": str(path)}, action="open_data_dir", details="\n".join(tail))
         if _looks_like_network(tail):
             raise AppError("download_unreachable", params={"url": "https://download.pytorch.org/whl/", "filename": ", ".join(names), "target_dir": str(path)}, action="show_manual", details="\n".join(tail))
         raise AppError("env_install_failed", params={"env": current[0] or ",".join(names), "exit_code": rc}, action="retry", details="\n".join(tail))
+    lost = _extras_warnings(created, path, ctx, rows, row_by)
+    broken = _probe_built(created, ctx, rows, row_by)
+    ctx.set_result(files=[dict(r) for r in rows.rows], envs=created, torch=torch_kind, extras_failed=lost)
     ctx.progress(len(names), len(names), None)
-    return {"envs": created, "torch": torch_kind}
+    if broken:
+        first = next(iter(broken))
+        raise AppError("env_broken", params={"env": ", ".join(broken), "detail": broken[first][:300]}, action="retry", details="\n".join(f"{k}: {v}" for k, v in broken.items()))
+    return {"envs": created, "torch": torch_kind, "extras_failed": lost}
+
+
+# adapter keys (adapters/<env>/table.py) whose packages come only from an optional extra envs/<env>+<extra>.txt
+EXTRA_ADAPTERS = {"aligner": ("qwen3_aligner", "qwen3_asr"), "voxcpm": ("voxcpm2",), "caption": ("qwen2_audio",), "utmosv2": ("utmosv2", "audiobox"), "cosyvoice": ("cosyvoice3",)}
+_DISK_ERR = re.compile(r"os error 112|not enough space|no space left|errno 28|disk is full|ENOSPC", re.I)
+
+
+def _looks_like_disk_full(lines: list[str]) -> bool:
+    return any(_DISK_ERR.search(l) for l in lines)
+
+
+def _env_space_need_gb(names: list[str]) -> float:
+    """What a build of the envs ``names`` that are not built yet takes (Diagnostics' estimates, the uv cache included)."""
+    from vndub.backends.runner import env_exists
+    from vndub_app import doctor
+
+    return sum(doctor.ENV_ESTIMATE_BY_NAME_GB.get(n, doctor.ENV_ESTIMATE_GB) for n in names if not env_exists(n))
+
+
+def _check_env_space(names: list[str], path: Path) -> None:
+    """``disk_full`` before anything is downloaded: a build that runs out of space halfway leaves a broken env behind."""
+    need = _env_space_need_gb(names)
+    if need <= 0:
+        return
+    free = downloads.free_space_gb(path)
+    if free < need:
+        raise AppError("disk_full", params={"need_gb": round(need, 1), "free_gb": round(free, 1), "path": str(path)}, action="open_data_dir", details=f"{path}: {free:.1f} GB free, about {need:.1f} GB needed for {', '.join(names)}")
+
+
+def _extra_backends(env: str, extra_file: str) -> list[str]:
+    """Registry backends of ``env`` that live in the optional extra ``<env>+<x>.txt`` (by the adapter key in the file name)."""
+    from vndub.backends import registry
+
+    x = extra_file.split("+", 1)[-1].rsplit(".", 1)[0].lower()
+    adapters = EXTRA_ADAPTERS.get(x, (x,))
+    return sorted(s.name for s in registry.all_specs().values() if s.env == env and (s.adapter or "") in adapters)
+
+
+def _extras_warnings(created: list[str], path: Path, ctx: JobContext, rows: "_Rows", row_by: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Failed optional extras (make_envs reports them in the build record and exits 0): the row is done with warnings,
+    the job gets one warning per extra naming the backends that went with it."""
+    lost = []
+    for n in created:
+        rec = _read_json_file(path / n / RECORD_FILE) or {}
+        failed = rec.get("extras_failed") or []
+        failed = failed if isinstance(failed, list) else str(failed).replace(",", " ").split()
+        for x in [str(f) for f in failed if f]:
+            backends = _extra_backends(n, x)
+            lost.append({"env": n, "extra": x, "backends": backends})
+            ctx.log(f"WARNING: {n}: the optional part {x} was not installed; unavailable: {', '.join(backends) or '-'}")
+        if failed:
+            rows.set(row_by[n], force=True, state="done", warnings=[f"{x}" for x in failed])
+    if lost:
+        ctx.add_warnings([{"kind": "unavailable", "stage": f"env {w['env']}", "group": ", ".join(w["backends"]) or w["extra"], "reason": f"the optional part {w['extra']} of the environment was not installed."} for w in lost])
+    return lost
+
+
+def _probe_built(created: list[str], ctx: JobContext, rows: "_Rows", row_by: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """The import probe of every env just built (seconds, no weights): a failure fails that row with ``env_broken``."""
+    broken: dict[str, str] = {}
+    for n in created:
+        ctx.checkpoint()
+        if not (resolve_envs_dir() / n / RECORD_FILE).exists():  # a builder that writes no record (an old script): Diagnostics offers the check
+            ctx.log(f"{n}: no build record, the import check is left to Diagnostics")
+            continue
+        ctx.message("installer.msg.env_check", env=n)
+        rec = probe_env(n, ctx)
+        if rec["ok"]:
+            ctx.log(f"{n}: import check ok in {rec['s']} s")
+        else:
+            broken[n] = _probe_failures(rec)
+            ctx.log(f"{n}: import check FAILED: {broken[n]}")
+            rows.set(row_by[n], force=True, state="failed", error="env_broken")
+    return broken
 
 
 # ----------------------------------------------------------------------------

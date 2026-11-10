@@ -33,6 +33,8 @@ def _style_prefix(item: dict[str, Any]) -> str:
 
 
 class VoxCPM2TTS(TTSImpl):
+    probe_imports = ("voxcpm",)  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         from voxcpm import VoxCPM
 

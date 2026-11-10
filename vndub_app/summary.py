@@ -139,6 +139,9 @@ def build(h: appdirs.ProjectHandle) -> dict[str, Any]:
             "speaker_id": sid, "name_src": (c.names.get("src") if c is not None else "") or sid, "name_tgt": (c.names.get("tgt") if c is not None else "") or "",
             "lines": n, "voiced_lines": v, "unvoiced_lines": n - v, "minutes": round(secs / 60.0, 2),
             "mode": "voiced" if v and v >= n else ("unvoiced" if not v else "mixed"),
+            # contract C10: the SPA marks a gender the translation model guessed ("guess") or the user set ("user")
+            "gender": (c.gender if c is not None else "unknown") or "unknown",
+            "gender_source": ((c.model_extra or {}).get("gender_source") if c is not None else None) or None,
         })
 
     link_s = viewdata.stage_summary(status, "link")
@@ -163,6 +166,14 @@ def build(h: appdirs.ProjectHandle) -> dict[str, Any]:
                          "voice_file": line.voice_file if line else None, "signals": r.get("signals")})
 
     extract_s = viewdata.stage_summary(status, "extract")
+    de = extract_s.get("decode_errors")  # {"count", "samples", "missing_tools"} (absent before round 18)
+    de = de if isinstance(de, dict) else {"count": de} if isinstance(de, int) else {}
+    try:
+        decode_errors = int(de.get("count") or 0)
+    except (TypeError, ValueError):
+        decode_errors = 0
+    if decode_errors:  # voice files the extract stage could not decode: those lines have no original voice
+        engine["warnings"] = [*engine["warnings"], "decode_errors"]
     voice_files = extract_s.get("voice_files")
     if voice_files is None:
         voice_files = len(read_jsonl(ctx.paths.audio_index)) if ctx.paths.audio_index.exists() else 0
@@ -189,6 +200,7 @@ def build(h: appdirs.ProjectHandle) -> dict[str, Any]:
         "languages": languages,
         "tools_missing": tools_missing(ctx, proj),
         "voice_files": int(voice_files or 0),
+        "decode_errors": {"count": decode_errors, "samples": [str(x) for x in de.get("samples") or []][:3], "missing_tools": [str(x) for x in de.get("missing_tools") or []]},
         "lines_total": len(snap.lines),
         "voiced": len(snap.voiced),
         "unvoiced": len(snap.lines) - len(snap.voiced),

@@ -215,3 +215,14 @@ first visit. A page reload keeps only jobs that are still active on the server.
 `settings-gpu`, `settings-gpu-budget`, `settings-translation-llm` (card), `settings-translation-llm-select` (value `""` = default, a built-in `llm` backend name or `hf_<slug>`), `settings-license`, `settings-license-policy`, `settings-license-research`,
 `settings-license-commercial`, `settings-report`, `settings-log` (the Log card: `settings-debug-log` checkbox, `settings-open-logs`), `settings-version`;
 `help-title`, `help-nav`, `help-doc-<id>`, `help-body`, `help-markdown`.
+
+## Added in round 18
+
+Settings: `settings-hf` (card), `settings-hf-endpoint` (text field, saved on blur / Enter; empty = huggingface.co).
+Shell: `connection-banner` (shown after 5 s without the progress socket); the progress card of the Run screen gets the class `is-stale` meanwhile.
+Errors: `error-cause` (the "Причина" line under the hint: `params.reason`, else the first line of the details); failed jobs: `job-open-logs`.
+Run: `run-cancelled` (note after a cancelled run; the start button then reads "Продолжить прогон").
+Review: `review-unapplied` (callout, `review-unapplied-apply`), `review-unapplied-dialog` (`review-unapplied-stay`, `review-unapplied-skip`,
+`review-unapplied-apply-continue`; shown by "Next" while edits are unapplied), `review-prefer-a-speaker` (visible with a character filter);
+the status select has two more values, `touched` and `provisional` (client-side views). Install: `install-unapplied` (`install-unapplied-go`).
+Translate / Casting: `gender-missing-note`, `glossary-gender-guessed-<speaker>`, `char-gender-guessed-<speaker>`, `glossary-term-auto-<i>`.

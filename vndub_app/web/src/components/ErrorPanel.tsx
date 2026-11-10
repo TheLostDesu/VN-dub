@@ -77,6 +77,26 @@ function enrichParams(raw: Record<string, unknown>, t: Tr, has: (k: string) => b
   return p;
 }
 
+/**
+ * The one line that says what really went wrong: `params.reason` when the backend gave one (contract: a short line, no
+ * traceback), else the first meaningful line of `details` (the exception's `Type: message`). Empty when there is nothing
+ * readable, so the panel shows nothing instead of a stack frame.
+ */
+export function causeOf(error: ErrorInfo): string {
+  const r = error.params?.reason;
+  if (typeof r === "string" && r.trim()) return clip(r.trim());
+  for (const raw of (error.details ?? "").split("\n")) {
+    const line = raw.trim();
+    if (!line || /^traceback/i.test(line) || /^File "/.test(line) || /^HTTP \d{3}\b/.test(line) || /^\^+$/.test(line)) continue;
+    return clip(line);
+  }
+  return "";
+}
+
+function clip(s: string): string {
+  return s.length > 300 ? `${s.slice(0, 297)}...` : s;
+}
+
 /** Manual download card: shown when a tool or model cannot be fetched automatically. */
 export function ManualDownloadCard({ url, filename, targetDir }: { url: string; filename: string; targetDir?: string }) {
   const t = useI18n().t;
@@ -137,6 +157,7 @@ export function ErrorPanel({
   const title = t(`errors.${code}.title`, params);
   const hint = has(`errors.${code}.hint`) ? t(`errors.${code}.hint`, params) : "";
   const action = error.action || "none";
+  const cause = causeOf(error);
   const hasAction = action !== "none" && !(action === "retry" && !onRetry) && has(`actions.${action}`);
   const details = [error.details, known ? "" : `code: ${error.code}`].filter(Boolean).join("\n");
   const manual =
@@ -153,6 +174,11 @@ export function ErrorPanel({
         {hint ? (
           <p className="error-hint" data-testid="error-hint">
             {hint}
+          </p>
+        ) : null}
+        {cause && cause !== title ? (
+          <p className="error-cause" data-testid="error-cause">
+            {t("errors.reason")}: <code>{cause}</code>
           </p>
         ) : null}
       </div>

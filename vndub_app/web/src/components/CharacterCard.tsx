@@ -7,6 +7,7 @@ import { useI18n } from "../i18n";
 import { useJobTracker } from "../state/progress";
 import { fmtMinutes, fmtNumber } from "../util/format";
 import { ErrorPanel } from "./ErrorPanel";
+import { GuessChip } from "./GenderNote";
 import { JobProgress } from "./JobProgress";
 import { VoiceTuningPanel, withDefaults } from "./VoiceTuning";
 import { ABPlayer, WavePlayer } from "./WavePlayer";
@@ -48,9 +49,11 @@ interface Props {
   refreshKey: number;
   /** automatic casting is running: do not start a generation of our own */
   suspendAutoGen?: boolean;
+  /** the gender shown is still the model's guess (a mark next to the field) */
+  genderGuessed?: boolean;
 }
 
-export function CharacterCard({ c, expanded, onToggle, onChanged, allNames, refreshKey, suspendAutoGen }: Props) {
+export function CharacterCard({ c, expanded, onToggle, onChanged, allNames, refreshKey, suspendAutoGen, genderGuessed }: Props) {
   const { t } = useI18n();
   const toast = useToast();
   const sid = c.speaker_id;
@@ -202,6 +205,7 @@ export function CharacterCard({ c, expanded, onToggle, onChanged, allNames, refr
                   ]}
                   onChange={(v) => void saveChar({ gender: v })}
                   testid={`char-gender-${sid}`}
+                  hint={genderGuessed ? <GuessChip testid={`char-gender-guessed-${sid}`} /> : undefined}
                 />
                 <TextField label={t("casting.age")} value={age} onChange={setAge} onBlur={() => age !== (c.age_hint ?? "") && void saveChar({ age_hint: age })} placeholder={t("casting.age_placeholder")} testid={`char-age-${sid}`} />
               </div>

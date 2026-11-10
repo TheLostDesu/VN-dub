@@ -4,6 +4,7 @@ import { toErrorInfo } from "../api/client";
 import type { Character, ErrorInfo } from "../api/types";
 import { CharacterCard } from "../components/CharacterCard";
 import { ErrorPanel } from "../components/ErrorPanel";
+import { GenderMissingNote, isGuessed, useGenderInfo } from "../components/GenderNote";
 import { StepFooter } from "../components/StepFooter";
 import { VoiceLibrary } from "../components/VoiceLibrary";
 import { JobProgress } from "../components/JobProgress";
@@ -26,6 +27,7 @@ export default function CastingScreen() {
   const [refreshKeys, setRefreshKeys] = useState<Record<string, number>>({});
   const [allKey, setAllKey] = useState(0);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const genderInfo = useGenderInfo();
   const initialised = useRef(false);
   const continueAfterAuto = useRef(false);
 
@@ -139,6 +141,8 @@ export default function CastingScreen() {
       {error ? <ErrorPanel error={error} onRetry={() => void load()} /> : null}
       {chars === null && !error ? <Spinner label={t("app.loading")} /> : null}
 
+      {tab === "characters" && chars ? <GenderMissingNote items={chars.map((c) => ({ name: c.name_tgt || c.name_src || c.speaker_id, gender: c.gender }))} /> : null}
+
       {tab === "characters" && chars ? (
         chars.length === 0 ? (
           <Callout tone="info" testid="casting-no-characters">
@@ -156,6 +160,7 @@ export default function CastingScreen() {
                 allNames={names}
                 refreshKey={(refreshKeys[c.speaker_id] ?? 0) + allKey}
                 suspendAutoGen={autoBusy}
+                genderGuessed={isGuessed(genderInfo, c.speaker_id, c.gender)}
               />
             ))}
           </div>

@@ -8,7 +8,8 @@ import { ErrorPanel } from "../components/ErrorPanel";
 import { GlossaryEditor } from "../components/GlossaryEditor";
 import { JobProgress } from "../components/JobProgress";
 import { StepFooter } from "../components/StepFooter";
-import { Button, Callout, Card, Checkbox, Chip, Collapsible, LicenseBadge, PageTitle, RadioGroup, SelectField, Spinner, TextField } from "../components/ui";
+import { Button, Callout, Card, Checkbox, Chip, Collapsible, LicenseBadge, PageTitle, RadioGroup, SelectField, Spinner, TextField, useToast } from "../components/ui";
+import { GenderMissingNote, useGenderInfo } from "../components/GenderNote";
 import { useI18n } from "../i18n";
 import { useJobTracker } from "../state/progress";
 import { useProject } from "../state/project";
@@ -31,6 +32,7 @@ function SaveIndicator({ status }: { status: SaveStatus }) {
 
 export default function TranslateScreen() {
   const { t, langName } = useI18n();
+  const toast = useToast();
   const nav = useNavigate();
   const { project, reload } = useProject();
   const { reload: reloadSettings } = useSettings();
@@ -45,22 +47,30 @@ export default function TranslateScreen() {
   const [translatedHere, setTranslatedHere] = useState(false);
 
   // the license policy is one global setting that this form also writes: the Settings screen must read it again
-  const trSave = useAutosave<TranslationSettings>(async (v) => {
-    const res = await api.putTranslation(v);
-    void reloadSettings();
-    return res;
-  });
-  const glSave = useAutosave<Glossary>((v) => api.putGlossary(v));
+  const trSave = useAutosave<TranslationSettings>(
+    async (v) => {
+      const res = await api.putTranslation(v);
+      void reloadSettings();
+      return res;
+    },
+    700,
+    () => toast.show(t("common.save_failed")),
+  );
+  const glSave = useAutosave<Glossary>((v) => api.putGlossary(v), 700, () => toast.show(t("common.save_failed")));
   // kinds + project: the job (running, or done with its warnings) is shown again after a visit to another screen
   const job = useJobTracker({
     onDone: () => {
       setTranslatedHere(true);
       setDirty(false);
       void reload();
+      // the translation may have guessed genders and found names: the glossary on the server has them now
+      void load();
     },
     kinds: TRANSLATE_JOBS,
     project: project?.slug ?? null,
   });
+
+  const genderInfo = useGenderInfo(translatedHere);
 
   const load = useCallback(async () => {
     try {
@@ -129,7 +139,12 @@ export default function TranslateScreen() {
   };
 
   const startTranslate = async () => {
-    await Promise.all([trSave.flush(), glSave.flush()]);
+    const saved = await Promise.all([trSave.flush(), glSave.flush()]);
+    // settings that are not on the server would be translated with the old values: stop and let the error panel say why
+    if (saved.some((ok) => !ok)) {
+      toast.show(t("translate.save_failed_no_start"));
+      return;
+    }
     void job.start(() => api.translate());
   };
 
@@ -312,7 +327,8 @@ export default function TranslateScreen() {
 
       <Card testid="translate-glossary">
         <h2>{t("glossary.title")}</h2>
-        <GlossaryEditor value={glossary} onChange={updateGlossary} />
+        <GenderMissingNote items={glossary.characters.map((c) => ({ name: c.tgt || c.src || c.speaker_id, gender: c.gender }))} />
+        <GlossaryEditor value={glossary} onChange={updateGlossary} genderInfo={genderInfo} />
       </Card>
 
       <Collapsible title={t("translate.advanced.title")} testid="translate-advanced-toggle" keepMounted>

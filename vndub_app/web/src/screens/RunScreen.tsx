@@ -8,7 +8,7 @@ import { CoverageCallout } from "../components/PatchCoverage";
 import { StepFooter } from "../components/StepFooter";
 import { Button, Callout, Card, Checkbox, Gauge, PageTitle } from "../components/ui";
 import { useI18n } from "../i18n";
-import { useActiveJob, useGpu, useJobTracker } from "../state/progress";
+import { useActiveJob, useConnected, useGpu, useJobTracker } from "../state/progress";
 import { useProject } from "../state/project";
 import { useSettings } from "../state/settings";
 import { useWizard } from "../state/wizard";
@@ -29,6 +29,7 @@ export default function RunScreen() {
   const { project } = useProject();
   const { settings, update } = useSettings();
   const gpu = useGpu();
+  const connected = useConnected();
   const shutdown = !!settings.shutdown_when_done;
   // kinds + project: the run (running, or done with its warnings) is shown again after a visit to another screen
   const tracker = useJobTracker({ kinds: RUN_KINDS, project: project?.slug ?? null });
@@ -94,7 +95,7 @@ export default function RunScreen() {
         ) : null}
         <div className="row-actions">
           <Button variant="primary" busy={tracker.starting} disabled={running} onClick={start} data-testid="run-start">
-            {finished ? t("run.start_again") : t("run.start")}
+            {job?.state === "cancelled" ? t("run.continue") : finished ? t("run.start_again") : t("run.start")}
           </Button>
         </div>
         <p className="hint" data-testid="run-closable">
@@ -104,8 +105,14 @@ export default function RunScreen() {
 
       {tracker.error && !job ? <ErrorPanel error={tracker.error} onRetry={start} /> : null}
 
+      {job?.state === "cancelled" ? (
+        <Callout tone="info" testid="run-cancelled">
+          {t("run.cancelled_keep")}
+        </Callout>
+      ) : null}
+
       {job ? (
-        <Card testid="run-progress">
+        <Card testid="run-progress" className={connected ? undefined : "is-stale"}>
           <JobProgress job={job} onRetry={start} showStages showLog testid="run-job" />
           {gpu ? <Gauge used={gpu.used_gb} total={gpu.total_gb} label={t("run.gpu")} testid="run-gpu" /> : null}
         </Card>

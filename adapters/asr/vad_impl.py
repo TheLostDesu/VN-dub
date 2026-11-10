@@ -12,6 +12,8 @@ SR = 16000
 class SileroVAD(ModelImpl):
     selftest_op = "vad"
 
+    probe_imports = ("faster_whisper.vad",)  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         from faster_whisper.vad import VadOptions, get_speech_timestamps
 

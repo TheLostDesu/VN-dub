@@ -441,7 +441,8 @@ def test_14_auto_casting(flow: Flow) -> None:
     flow.needs("designs")
     res = flow.job("/api/casting/auto")["result"]  # a casting_auto job: designs for whoever lacks them, then choose
     chosen = res["chosen"]
-    assert {"sakura", "haruto", "yui", "hero"} <= set(chosen)
+    # round 18 (contract C8): a voice the user chose earlier in the flow is kept, not re-chosen
+    assert {"sakura", "haruto", "yui", "hero"} <= set(chosen) | set(res.get("kept") or [])
     by = {c["speaker_id"]: c for c in flow.get("/api/characters")}
     for sid, did in chosen.items():
         assert by[sid]["chosen"]["design_id"] == did
@@ -670,7 +671,7 @@ def test_24_review_list_filters(flow: Flow) -> None:
     assert set(r) >= {"items", "facets", "counts", "total"} and r["total"] == len(r["items"]) >= 20
     assert r["counts"]["ok"] + r["counts"]["check"] + r["counts"]["failed"] == r["total"]
     it = r["items"][0]
-    assert set(it) == {"line_id", "speaker_id", "name", "scene", "status", "composite", "text_src", "text_tgt", "winner_label", "flags", "delivery", "touched", "patch"}
+    assert set(it) == {"line_id", "speaker_id", "name", "scene", "status", "composite", "text_src", "text_tgt", "winner_label", "flags", "translation_flags", "delivery", "touched", "patch"}
     assert it["status"] in ("ok", "check", "failed") and it["touched"] is False and it["winner_label"] in ("A", "B", "C", "D")
     assert {i["patch"] for i in r["items"]} <= {"ok", "provisional"}, "after the full run every listed line has a file in the patch"
     assert {s["speaker_id"] for s in r["facets"]["speakers"]} >= {"sakura", "hero"} and {s["scene"] for s in r["facets"]["scenes"]} >= {"start", "after_menu"}

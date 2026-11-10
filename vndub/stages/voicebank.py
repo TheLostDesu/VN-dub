@@ -42,6 +42,7 @@ from vndub.stages import designs as dz
 from vndub.stages import genutil as gu
 from vndub.stages.common import StageError, counter
 from vndub.stages.designs import TEST_SENTENCES  # noqa: F401  (re-exported: tests and docs refer to it here)
+from vndub.util import hash_obj
 from vndub.text.style_prompt import StyleSpec, design_words, normalize_tuning, render
 
 NAME = "voicebank"
@@ -50,12 +51,37 @@ CONFIG_SECTIONS = ("voicebank", "score", "project")
 
 _SENTENCE_END = re.compile(r"[。！？!?…」』\.]\s*$")
 N_CLIPS_FOR_CENTROID = 10
+HARD_MIN_SEC = 1.5  # select_refs: the limits that hold even when the usual criteria are relaxed
+HARD_MAX_SEC = 15.0
 MAX_PROPOSE = 8
 
 
 # ----------------------------------------------------------------------------
 # refs
 # ----------------------------------------------------------------------------
+
+
+def voicebank_hash(cfg: Any) -> str:
+    """What the voicebank reads from the config: its own section, ``project`` without the folders, the speaker embedder (and its
+    options) and the F0 backend. The rest of ``score`` (gates, weights, regen limits, the CER ASR) is not an input of a reference, a
+    design or an RVC model: it used to be in the key, so a gate tweak after casting re-rendered the designs of every uncast
+    character and re-trained every RVC model."""
+    dump = cfg.model_dump(mode="json", by_alias=True)
+    project = {k: v for k, v in (dump.get("project") or {}).items() if k not in gu.PROJECT_PATH_KEYS}
+    score = dump.get("score") or {}
+    return hash_obj({
+        "voicebank": dump.get("voicebank"), "project": project,
+        "score": {"speaker": score.get("speaker"), "speaker_extra": score.get("speaker_extra")},
+        "analyze": {"f0": (dump.get("analyze") or {}).get("f0")},
+    })
+
+
+def _cache(ctx: Any) -> Any:
+    """The stage cache keyed by :func:`voicebank_hash`; entries stored under the older keys (the whole ``score`` section, with and
+    without the folders) are still honoured and migrated, so a 1.1.0 project keeps its designs and trained RVC models."""
+    cache = gu.stage_cache(ctx, NAME, VERSION, "voicebank", "score", "project")
+    cache.rekey(voicebank_hash(ctx.cfg))
+    return cache
 
 
 def _emotion_of(passport: dict[str, Any]) -> str:
@@ -87,18 +113,22 @@ def select_refs(
                 continue
             dur = float(p.get("duration_s") or 0.0)
             snr = p.get("snr_db")
-            if p.get("bgm"):
-                if strict:
-                    continue
-            if strict and not (min_sec <= dur <= max_sec):
+            bgm = bool(p.get("bgm"))
+            in_window = min_sec <= dur <= max_sec
+            reasons: list[str] = []
+            if not in_window:
+                reasons.append(f"duration {dur:.1f} s outside {min_sec:g}-{max_sec:g} s")
+            if snr is not None and float(snr) < min_snr_db:
+                reasons.append(f"snr {float(snr):.0f} dB < {min_snr_db:g}")
+            # snr None = no noise floor to measure (a tightly trimmed clip): unknown, not bad (and not the old 40 dB "perfect")
+            if strict and (bgm or reasons):
                 continue
-            if strict and (snr is None or float(snr) < min_snr_db):
-                continue
+            if not strict and (bgm or not HARD_MIN_SEC <= dur <= HARD_MAX_SEC):
+                continue  # music under the voice, a half-second "eh?" or a monologue is never a reference, however few clips there are
             full = bool(_SENTENCE_END.search(l.text_src or ""))
             adv = (p.get("emotion") or {}).get("adv") or {}
             # prefer clean, full sentences, durations inside the window
-            in_window = min_sec <= dur <= max_sec
-            score = float(snr if snr is not None else 0.0) + (3.0 if full else 0.0) + (5.0 if in_window else 0.0) - (10.0 if p.get("bgm") else 0.0)
+            score = float(snr if snr is not None else min_snr_db) + (3.0 if full else 0.0) + (5.0 if in_window else 0.0) - (10.0 if bgm else 0.0)
             out.append(
                 {
                     "line": l,
@@ -108,28 +138,35 @@ def select_refs(
                     "arousal": adv.get("arousal"),
                     "valence": adv.get("valence"),
                     "score": score,
+                    "bgm": bgm,
+                    "relaxed_reasons": reasons,
                 }
             )
         return out
 
-    relaxed = False
+    def round_robin(pool: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        hist = counter([c["emotion"] for c in pool])
+        by_emo: dict[str, list[dict[str, Any]]] = {}
+        for c in sorted(pool, key=lambda c: -c["score"]):
+            by_emo.setdefault(c["emotion"], []).append(c)
+        picked: list[dict[str, Any]] = []
+        for rnd in range(per_emotion):  # round-robin over emotions ordered by frequency
+            for emo in hist:
+                lst = by_emo.get(emo, [])
+                if rnd < len(lst) and len(picked) < limit:
+                    picked.append(lst[rnd])
+        return picked
+
     pool = cands(strict=True)
-    if len(pool) < min_refs:
-        relaxed = True
-        pool = cands(strict=False)
+    relaxed = len(pool) < min_refs
+    chosen = round_robin(pool, max_total)
+    if relaxed:
+        # strict clips first, then the best relaxed ones up to min_refs (not every clip of the character, as the old fallback did)
+        extra = [c for c in cands(strict=False) if c["line"].line_id not in {x["line"].line_id for x in chosen}]
+        chosen += round_robin(extra, max(0, min(min_refs, max_total) - len(chosen)))
+        pool = [*pool, *extra]
     if not pool:
         return [], relaxed
-    hist = counter([c["emotion"] for c in pool])
-    by_emo: dict[str, list[dict[str, Any]]] = {}
-    for c in sorted(pool, key=lambda c: -c["score"]):
-        by_emo.setdefault(c["emotion"], []).append(c)
-    chosen: list[dict[str, Any]] = []
-    # round-robin over emotions ordered by frequency
-    for rnd in range(per_emotion):
-        for emo in hist:
-            lst = by_emo.get(emo, [])
-            if rnd < len(lst) and len(chosen) < max_total:
-                chosen.append(lst[rnd])
     if len(chosen) < min(min_refs, len(pool)):
         rest = [c for c in sorted(pool, key=lambda c: -c["score"]) if c not in chosen]
         chosen += rest[: min(min_refs, len(pool)) - len(chosen)]
@@ -184,6 +221,9 @@ def _write_refs(ctx: Any, sid: str, chosen: list[dict[str, Any]]) -> list[RefCli
                 duration=round(c["duration"], 3),
                 usage=c["usage"],
                 text=l.text_src,
+                bgm=bool(c.get("bgm")),
+                relaxed=bool(c.get("relaxed_reasons")),
+                relaxed_reasons=list(c.get("relaxed_reasons") or []),
             )
         )
     write_json(ctx.paths.vb_refs_json(sid), [r.model_dump(mode="json") for r in refs])
@@ -203,7 +243,7 @@ def _ensure_refs(ctx: Any, cache: Any, sid: str, ls: list[LineRecord], passports
     vb = ctx.cfg.voicebank
     # the effective source text is part of the key: refs.json carries it (timbre_ref_text), and a set_src_text
     # override / ASR-recovered text changes it without touching any audio
-    key = cache.key("refs", [(l.line_id, l.src_wav) for l in ls], [_passport_inputs(passports.get(l.line_id)) for l in ls], vb.refs.model_dump(), [l.text_src for l in ls])
+    key = cache.key("refs", "r18", [(l.line_id, l.src_wav) for l in ls], [_passport_inputs(passports.get(l.line_id)) for l in ls], vb.refs.model_dump(), [l.text_src for l in ls])
     if cache.fresh(f"refs:{sid}", key, [ctx.paths.vb_refs_json(sid)]):
         refs = gu.load_refs(ctx, sid)
     else:
@@ -216,7 +256,9 @@ def _ensure_refs(ctx: Any, cache: Any, sid: str, ls: list[LineRecord], passports
             per_emotion=vb.refs.per_emotion, max_total=vb.refs.max_total, min_refs=vb.refs.min_refs,
         )
         if relaxed:
-            ctx.log.warning("%s: fewer than %d clips meet the ref criteria; relaxed SNR/duration filters", sid, vb.refs.min_refs)
+            ctx.log.warning("%s: fewer than %d clips meet the ref criteria; relaxed SNR/duration filters (never music, under %g s or over %g s)", sid, vb.refs.min_refs, HARD_MIN_SEC, HARD_MAX_SEC)
+        if not chosen:
+            ctx.log.warning("%s: no usable reference clip (every clip has music under it or is outside %g-%g s)", sid, HARD_MIN_SEC, HARD_MAX_SEC)
         refs = _write_refs(ctx, sid, chosen)
         cache.put(f"refs:{sid}", key)
     chars[sid].refs = [r.path for r in refs]
@@ -472,6 +514,7 @@ def _render_cloned(
 
 def _clone_design(ctx: Any, sid: str, char: Character, refs: list[RefClip], char_f0: float | None, audition: list[dict[str, str]], origin: str, tick: Any = None) -> dict[str, Any] | None:
     """The route-A design: the audition lines in a zero-shot clone of the character's best timbre reference."""
+    refs = [r for r in refs if not (r.model_extra or {}).get("bgm")]  # a clone repeats the music under its reference
     pool = [r for r in refs if r.usage in ("timbre", "both")] or refs
     if not pool:
         return None
@@ -541,7 +584,7 @@ def _measure_new_designs(ctx: Any, sid: str, char: Character, new: list[dict[str
             passports = {l.line_id: p for l in ls if (p := gu.load_passport(ctx, l.line_id))}
             refs = gu.load_refs(ctx, sid)
             if not refs and ls:
-                cache = gu.stage_cache(ctx, NAME, VERSION, "voicebank", "score", "project")
+                cache = _cache(ctx)
                 chars = {sid: char}
                 refs = _ensure_refs(ctx, cache, sid, ls, passports, chars)
                 cache.save()
@@ -695,7 +738,7 @@ def run(ctx: Any) -> dict[str, Any]:
     if not passports and by_spk:
         ctx.log.warning("no passports found: refs use durations only (run analyze for emotion/SNR-aware selection)")
 
-    cache = gu.stage_cache(ctx, NAME, VERSION, "voicebank", "score", "project")
+    cache = _cache(ctx)
     summary: dict[str, Any] = {"characters": 0, "refs": 0, "performers": 0, "rvc": 0, "lora": 0, "skipped": {}}
     eligible: dict[str, list[LineRecord]] = {}
     minutes: dict[str, float] = {}
@@ -726,6 +769,8 @@ def run(ctx: Any) -> dict[str, Any]:
     for sid, ls in eligible.items():
         refs[sid] = _ensure_refs(ctx, cache, sid, ls, passports, chars)
         summary["refs"] += len(refs[sid])
+        if any((r.model_extra or {}).get("relaxed") for r in refs[sid]):
+            summary.setdefault("refs_relaxed", {})[sid] = sorted({why for r in refs[sid] for why in (r.model_extra or {}).get("relaxed_reasons") or []})[:3]
         tick(sid)
 
     char_f0: dict[str, float | None] = {sid: _char_f0(ctx, chars, sid, refs[sid]) for sid in eligible}
@@ -757,7 +802,10 @@ def run(ctx: Any) -> dict[str, Any]:
         else:
             design_caps = dict(backend.spec.caps)
             for sid in regen:
-                jobs = _plan_designs(ctx, sid, chars[sid], kept[sid], max(1, vb.performer.n_designs), char_f0.get(sid))
+                # without original audio nothing ranks the designs (every rank_score is -1) and the stage keeps the first one: the
+                # other designs and their clips (3 of 4, 15 of 20 by default) were rendered for nothing; "generate more" in the app adds them
+                n_new = max(1, vb.performer.n_designs) if sid in eligible else 1
+                jobs = _plan_designs(ctx, sid, chars[sid], kept[sid], n_new, char_f0.get(sid))
                 new[sid] = _render_designs(ctx, backend, jobs)
                 if not new[sid]:
                     performer_reason[sid] = "all performer designs failed"
@@ -998,7 +1046,7 @@ def _rvc_clips(ctx: Any, ls: list[LineRecord], passports: dict[str, dict[str, An
     for l in ls:
         p = passports.get(l.line_id) or {}
         snr = p.get("snr_db")
-        if p.get("bgm") or snr is None or float(snr) < vbref.min_snr_db or float(p.get("duration_s") or 0) < 1.0:
+        if p.get("bgm") or (snr is not None and float(snr) < vbref.min_snr_db) or float(p.get("duration_s") or 0) < 1.0:  # snr None: unmeasured, not bad
             continue
         clean.append((l, p))
     mins = sum(float(p.get("duration_s") or 0) for _, p in clean) / 60.0
@@ -1284,7 +1332,7 @@ def propose_designs(
     ls = [l for l in ctx.voiced_lines(apply_only=False) if l.speaker_id == speaker_id] if has_audio else []
     if has_audio and not refs and ls:
         passports = {l.line_id: p for l in ls if (p := gu.load_passport(ctx, l.line_id))}
-        cache = gu.stage_cache(ctx, NAME, VERSION, "voicebank", "score", "project")
+        cache = _cache(ctx)
         refs = _ensure_refs(ctx, cache, speaker_id, ls, passports, chars)
         cache.save()
         save_characters(ctx.paths.characters, chars)
@@ -1450,8 +1498,11 @@ def choose_design(ctx: Any, speaker_id: str, design_id: str, route: str) -> dict
     return {"speaker_id": speaker_id, "design_id": design_id, "route": route, "kind": d["kind"], "performer": dict(char.performer)}
 
 
-def auto_cast(ctx: Any) -> dict[str, str]:
-    """Choose the top-ranked design for every character that has designs; returns ``{speaker_id: design_id}``.
+def auto_cast(ctx: Any, overwrite: bool = False) -> dict[str, Any]:
+    """Choose the top-ranked design for every character that has designs; returns ``{"chosen": {speaker_id: design_id}, "kept": [speaker_id]}``.
+
+    A character whose voice the user chose (``chosen_by: user`` and the design still exists) is kept as it is unless ``overwrite``:
+    the "choose automatically" button is for the characters that have no voice yet, not for undoing a casting made by ear.
 
     The ``clone`` design is only taken when it is the character's only design (its similarity is high by
     construction, but it is route A with the accent risk). Route: ``B`` for characters with original audio
@@ -1467,12 +1518,17 @@ def auto_cast(ctx: Any) -> dict[str, str]:
     for l in voiced_lines:
         seconds[l.speaker_id] = seconds.get(l.speaker_id, 0.0) + gu.src_duration(ctx, l, gu.load_passport(ctx, l.line_id), audio.get(l.audio_id or ""))
     out: dict[str, str] = {}
-    for sid in ctx.characters():
+    kept: list[str] = []
+    for sid, char in ctx.characters().items():
         if sid == "narrator":
             continue
         ds = list_designs(ctx, sid)
         pool = [d for d in ds if d["kind"] != "clone"] or ds
         if not pool:
+            continue
+        mine = char.performer or {}
+        if not overwrite and mine.get("chosen_by") == "user" and any(d["design_id"] == mine.get("design_id") for d in ds):
+            kept.append(sid)
             continue
         d = pool[0]
         route = "A" if d["kind"] == "clone" else ("B" if sid in voiced else "P")
@@ -1482,7 +1538,7 @@ def auto_cast(ctx: Any) -> dict[str, str]:
             route = "P"
         choose_design(ctx, sid, d["design_id"], route)
         out[sid] = d["design_id"]
-    return out
+    return {"chosen": out, "kept": kept}
 
 
 def set_tuning(ctx: Any, speaker_id: str, tuning: dict[str, Any] | None) -> dict[str, Any]:
@@ -1525,7 +1581,7 @@ def train_rvc(ctx: Any, speaker_id: str) -> dict[str, Any]:
         ctx.progress(3, 3, speaker_id)
         return result("skipped", "not_enough_audio", why)
     char_f0 = _char_f0(ctx, chars, speaker_id, gu.load_refs(ctx, speaker_id))
-    cache = gu.stage_cache(ctx, NAME, VERSION, "voicebank", "score", "project")
+    cache = _cache(ctx)
     reasons: dict[str, str] = {}
     holder: dict[str, Any] = {}
     outcome = _rvc_train_character(ctx, cache, speaker_id, clips, chars, char_f0, holder, reasons, progress=ctx.progress)

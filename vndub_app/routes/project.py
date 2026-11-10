@@ -128,7 +128,7 @@ def put_state(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         if isinstance(patch.get(section), dict):
             patch[section] = {k: v for k, v in patch[section].items() if k not in keys}
     with session.STATE_LOCK:
-        st = appdirs.write_app_state(h, _deep_merge(appdirs.read_app_state(h), patch))
+        st = appdirs.update_app_state(h, lambda cur: _deep_merge(cur, patch))
     appdirs.write_project_config(h)
     return st
 

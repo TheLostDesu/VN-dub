@@ -98,7 +98,7 @@ function WarningLine({ w }: { w: JobWarning }) {
   if (w.kind === "substitution") {
     return (
       <li data-kind={w.kind}>
-        {t("job.warn.substitution", { requested: w.requested ?? "?", used: w.used ?? "?" })}
+        {t("job.warn.substitution", { requested: w.requested ? tOr(`models.${w.requested}.name`, w.requested) : "?", used: w.used ? tOr(`models.${w.used}.name`, w.used) : "?" })}
         {w.reason ? <span className="hint">{w.reason}</span> : null}
       </li>
     );
@@ -109,7 +109,7 @@ function WarningLine({ w }: { w: JobWarning }) {
     return <li data-kind={w.kind}>{t("job.warn.unavailable", { stage, group, reason: w.reason ?? "?" })}</li>;
   }
   if (w.kind === "mixed_models") {
-    return <li data-kind={w.kind}>{t("job.warn.mixed_models", { models: w.models ?? "?" })}</li>;
+    return <li data-kind={w.kind}>{t("job.warn.mixed_models", { models: (w.models ?? "?").replace(/[\w.-]+/g, (m) => tOr(`models.${m}.name`, m)) })}</li>;
   }
   if (w.kind === "settings_changed") {
     const keys = (w.keys ?? "")
@@ -119,6 +119,12 @@ function WarningLine({ w }: { w: JobWarning }) {
       .map((k) => tOr(`job.warn.key.${k}`, k))
       .join(", ");
     return <li data-kind={w.kind}>{t("job.warn.settings_changed", { keys })}</li>;
+  }
+  if ((w.kind === "glossary_misses" || w.kind === "check_failed") && has(`job.warn.${w.kind}`)) {
+    return <li data-kind={w.kind}>{t(`job.warn.${w.kind}`, { count: w.count ?? "?" })}</li>;
+  }
+  if (w.kind === "stress_missing" && has("job.warn.stress_missing")) {
+    return <li data-kind={w.kind}>{t("job.warn.stress_missing", { detail: w.detail ?? w.reason ?? "?" })}</li>;
   }
   return w.reason ? <li data-kind={w.kind}>{w.reason}</li> : null;
 }
@@ -369,7 +375,7 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
               <span>{t("job.working")}</span>
             ) : null}
             {active && eta !== null && eta !== undefined && eta > 0 ? (
-              <span data-testid="job-eta">{t("job.eta", { time: fmtDuration(t, eta) })}</span>
+              <span data-testid="job-eta">{t(job.eta_s !== null && job.eta_s !== undefined && multi ? "job.eta_total" : "job.eta", { time: fmtDuration(t, eta) })}</span>
             ) : null}
             {active && job.rate_per_min && showsLineRate(job.kind) ? (
               <span data-testid="job-rate">{t("job.rate", { n: job.rate_per_min >= 10 ? Math.round(job.rate_per_min) : fmtNumber(job.rate_per_min, 1) })}</span>
@@ -382,7 +388,7 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
           ) : null}
           {twoBars ? (
             <div className="job-overall">
-              <span className="sr-only">{t("job.overall")}</span>
+              <span className="hint">{t("job.overall")}</span>
               <ProgressBar value={overall} label={t("job.overall")} size="sm" testid="job-overall" />
             </div>
           ) : null}
@@ -406,6 +412,13 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
       ) : null}
 
       {job.state === "failed" && job.error ? <ErrorPanel error={job.error} onRetry={onRetry} /> : null}
+      {job.state === "failed" ? (
+        <p className="job-cause">
+          <Button small onClick={() => void api.openFolder("logs").catch((e) => setControlError(toErrorInfo(e)))} data-testid="job-open-logs">
+            {t("actions.open_logs")}
+          </Button>
+        </p>
+      ) : null}
       {job.state === "interrupted" && onRetry ? (
         <p>
           <Button variant="primary" onClick={onRetry} data-testid="job-continue">
@@ -434,7 +447,7 @@ export function JobProgress({ job, compact, showStages, showLog, onRetry, stageL
 
       <JobWarnings job={job} />
       {footer}
-      {showLog && !compact ? (
+      {(showLog || job.state === "failed") && !compact ? (
         <Collapsible title={t("job.show_log")} testid="job-log-toggle">
           <LogViewer jobId={job.id} />
         </Collapsible>

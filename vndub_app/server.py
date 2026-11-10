@@ -273,6 +273,10 @@ def _sync_custom_models() -> None:
 def create_app() -> FastAPI:
     app = FastAPI(title="VNDub", version=__version__, docs_url=None, redoc_url=None, openapi_url="/api/openapi.json", lifespan=_lifespan)
     errors.install_handlers(app)
+    try:  # before huggingface_hub is first imported: it reads HF_ENDPOINT once, at import
+        appdirs.apply_hf_endpoint()
+    except Exception as e:
+        log.warning("HF_ENDPOINT not applied: %s", e)
     _sync_custom_models()
 
     @app.middleware("http")
@@ -498,9 +502,7 @@ def serve_review(ctx: Any, host: str = "127.0.0.1", port: int = 0, open_browser:
     meta = h.meta()
     meta.update(work_dir=str(ctx.paths.work), out_dir=str(ctx.paths.out))
     appdirs.write_json_atomic(h.meta_file, meta)
-    st = appdirs.read_app_state(h)
-    st["step"] = "review"
-    appdirs.write_app_state(h, st)
+    appdirs.update_app_state(h, lambda st: st.__setitem__("step", "review"))
     appdirs.write_project_config(h)
     session.set_current(h.slug)
     srv = BackgroundServer(host, port).start()

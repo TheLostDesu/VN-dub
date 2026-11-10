@@ -463,6 +463,7 @@ export function SelectField<V extends string>({
   disabled,
   hideLabel,
   className,
+  hint,
 }: {
   label: string;
   value: V;
@@ -472,6 +473,8 @@ export function SelectField<V extends string>({
   disabled?: boolean;
   hideLabel?: boolean;
   className?: string;
+  /** a small mark under the select (e.g. "guessed") */
+  hint?: ReactNode;
 }) {
   const id = useId();
   return (
@@ -486,6 +489,7 @@ export function SelectField<V extends string>({
           </option>
         ))}
       </select>
+      {hint ? <span className="hint">{hint}</span> : null}
     </div>
   );
 }

@@ -11,6 +11,7 @@ import { Button, Callout, Card, Checkbox, Chip, Collapsible, Dialog, PageTitle, 
 import { useI18n } from "../i18n";
 import { useJobTracker } from "../state/progress";
 import { useProject } from "../state/project";
+import { useWizard } from "../state/wizard";
 import { dirname, fmtDate } from "../util/format";
 
 const APPLY_JOBS = ["install_apply"];
@@ -26,7 +27,8 @@ function unrecoverableOf(result: Record<string, unknown> | undefined): number {
 export default function InstallScreen() {
   const { t, tOr, has, lang } = useI18n();
   const toast = useToast();
-  const { project } = useProject();
+  const wiz = useWizard();
+  const { project, reload: reloadProject } = useProject();
   const slug = project?.slug ?? null;
   const [plan, setPlan] = useState<InstallPlan | null>(null);
   const [error, setError] = useState<ErrorInfo | null>(null);
@@ -52,6 +54,12 @@ export default function InstallScreen() {
   useEffect(() => {
     void load();
   }, [load]);
+  // edits made in Review that Apply has not rebuilt yet are not in this patch: read the list fresh (the state may be older)
+  useEffect(() => {
+    void reloadProject();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const unapplied = project?.state?.review?.touched?.length ?? 0;
 
   // kinds + project: the jobs keep running when the screen is left; each tracker picks up its job of this project again
   const apply = useJobTracker({ onDone: () => void load(), kinds: APPLY_JOBS, project: slug });
@@ -144,6 +152,15 @@ export default function InstallScreen() {
               <p>{tOr(plan.manual_reason_key, t("install.manual.default_reason"))}</p>
               <p>{t("install.manual.text")}</p>
               <p className="hint">{t("install.manual.no_claim")}</p>
+            </Callout>
+          ) : null}
+
+          {unapplied > 0 ? (
+            <Callout tone="warn" title={t("review.unapplied.title", { n: unapplied })} testid="install-unapplied">
+              <p>{t("install.unapplied.text")}</p>
+              <Button onClick={() => wiz.goto("review")} data-testid="install-unapplied-go">
+                {t("install.unapplied.go")}
+              </Button>
             </Callout>
           ) : null}
 

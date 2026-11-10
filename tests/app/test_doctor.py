@@ -38,6 +38,9 @@ def probes(**kw: Any) -> doctor.Probes:
         data_dir=lambda: Path("C:/VNDub"),
         profile=lambda: "default",
         processes=lambda: [],
+        huggingface=lambda: {"ok": True, "host": "huggingface.co"},
+        memory=lambda: {"ram_gb": 32.0, "commit_gb": 48.0},
+        folders=lambda: {"models": Path("C:/VNDub/models"), "envs": Path("C:/VNDub/envs")},
         platform="win32",
     )
     base.update(kw)

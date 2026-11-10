@@ -8,7 +8,11 @@ r"""Diagnostics ("Doctor", wizard step 0): green / yellow / red rows with a fix 
 
 The router carries full ``/api/...`` paths; include it without a prefix.
 
-Rows (ids): ``gpu driver vram disk ffmpeg vcredist git internet defender envs models processes``. Each row is
+Rows (ids): ``gpu driver vram memory disk ffmpeg vcredist git internet huggingface defender envs models processes``.
+Round 18: ``memory`` (RAM and commit limit), ``huggingface`` (the model host on its own, a ``HF_ENDPOINT`` mirror honoured),
+``disk`` per drive of the data / models / environments folders, ``envs`` with the health of each built env
+(``installer.env_states``: broken import check, unfinished build, stale pins, failed extras, CPU torch on an NVIDIA box,
+not checked by this version) and the fixes ``rebuild_envs`` / ``check_envs`` (jobs). Each row is
 ``{id, status: green|yellow|red, value, params, fix: {action, label_key}|null}``; the UI shows
 ``doctor.<id>.title`` and ``doctor.<id>.<status>`` interpolated with ``params``. The backend sends
 no display text. ``fix.action`` is either one of the fix actions above (button label
@@ -83,8 +87,12 @@ VC_REG_KEY = r"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
 VC_MIN = (14, 40)  # binaries built with VS 2022 17.10+ (llama.cpp b11469, torch 2.8) need runtime 14.40+
 VC_DLLS = ("msvcp140.dll", "vcruntime140_1.dll")
 
-FIX_ACTIONS = ("download_ffmpeg", "install_vcredist", "open_data_dir", "open_driver_page", "open_vcredist_page", "add_defender_exclusion_help", "kill_processes")
-ROW_IDS = ("gpu", "driver", "vram", "disk", "ffmpeg", "vcredist", "git", "internet", "defender", "envs", "models", "processes")
+RAM_GREEN_GB = 16.0  # below: several model processes (each a torch with its CUDA DLLs) page or fail to start
+COMMIT_GREEN_GB = 24.0  # RAM + page file; torch on Windows reserves commit for every CUDA DLL ("paging file is too small", WinError 1455)
+HF_HOST = "huggingface.co"
+
+FIX_ACTIONS = ("download_ffmpeg", "install_vcredist", "open_data_dir", "open_driver_page", "open_vcredist_page", "add_defender_exclusion_help", "kill_processes", "rebuild_envs", "check_envs")
+ROW_IDS = ("gpu", "driver", "vram", "memory", "disk", "ffmpeg", "vcredist", "git", "internet", "huggingface", "defender", "envs", "models", "processes")
 
 
 # ----------------------------------------------------------------------------
@@ -186,12 +194,57 @@ def probe_tools() -> dict[str, dict[str, Any]]:
 
 
 def probe_envs() -> dict[str, Any]:
-    """Envs the default profile needs and which of them exist."""
+    """Envs the default profile needs, which of them exist, and their health (``installer.env_states``)."""
     from vndub.backends import registry
     from vndub.backends.runner import env_exists
+    from vndub_app import installer
 
     needed = sorted({s.env for s in registry.for_profile("default") if s.env})
-    return {"needed": needed, "present": [e for e in needed if env_exists(e)]}
+    states = installer.env_states()
+    return {"needed": needed, "present": [e for e in needed if env_exists(e)], "states": {e: states[e] for e in needed if e in states}}
+
+
+def hf_endpoint_host() -> str:
+    """The host the model downloads go to: a mirror from ``HF_ENDPOINT`` (Settings exports it), else huggingface.co."""
+    from urllib.parse import urlsplit
+
+    ep = (os.environ.get("HF_ENDPOINT") or "").strip()
+    return (urlsplit(ep if "://" in ep else f"https://{ep}").hostname or HF_HOST) if ep else HF_HOST
+
+
+def probe_huggingface() -> dict[str, Any]:
+    """TCP connect to the Hugging Face host alone (GitHub answering used to hide a blocked Hugging Face)."""
+    host = hf_endpoint_host()
+    try:
+        with socket.create_connection((host, 443), timeout=INTERNET_TIMEOUT_S):
+            return {"ok": True, "host": host}
+    except OSError:
+        return {"ok": False, "host": host}
+
+
+def probe_memory() -> dict[str, float] | None:
+    """``{ram_gb, commit_gb}`` (GlobalMemoryStatusEx: physical RAM and the commit limit = RAM + page file); None off Windows."""
+    if not sys.platform.startswith("win"):
+        return None
+    import ctypes
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    st = MEMORYSTATUSEX()
+    st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):  # type: ignore[attr-defined]
+        return None
+    return {"ram_gb": round(st.ullTotalPhys / 1024**3, 1), "commit_gb": round(st.ullTotalPageFile / 1024**3, 1)}
+
+
+def probe_folders() -> dict[str, Path]:
+    """The folders that take space: data (projects, work room), models, environments (each may be on another drive)."""
+    from vndub_app import installer
+
+    return {"data": appdirs.data_dir(), "models": appdirs.effective_models_dir(), "envs": installer.resolve_envs_dir()}
 
 
 def probe_models() -> dict[str, Any]:
@@ -336,6 +389,9 @@ class Probes:
     data_dir: Callable[[], Path] = appdirs.data_dir
     profile: Callable[[], str] = probe_profile
     processes: Callable[[], list[Any]] = probe_processes
+    huggingface: Callable[[], dict[str, Any]] = probe_huggingface
+    memory: Callable[[], dict[str, float] | None] = probe_memory
+    folders: Callable[[], dict[str, Path]] = probe_folders
     platform: str = sys.platform
     cache_internet: bool = False  # only the default probes cache the network check
 
@@ -481,15 +537,92 @@ def row_defender(platform: str, data_dir: Path) -> dict[str, Any]:
     return _row("defender", "yellow", str(data_dir), {"path": str(data_dir)}, _fix("add_defender_exclusion_help"))
 
 
-def row_envs(envs: dict[str, Any], mock: bool) -> dict[str, Any]:
+def env_findings(envs: dict[str, Any], gpu: GpuInfo | None) -> dict[str, list[str]]:
+    """Needed + present envs by what is wrong with them: ``broken`` / ``incomplete`` (errors), ``cpu_torch`` (a CPU torch while
+    the NVIDIA card would take CUDA), ``stale``, ``extras``, ``unchecked`` (warnings). Also what ``rebuild_envs`` rebuilds."""
+    states = envs.get("states") or {}
+    want_cuda = gpu is not None and choose_torch(gpu) == "cuda"
+    out: dict[str, list[str]] = {k: [] for k in ("broken", "incomplete", "cpu_torch", "stale", "extras", "unchecked")}
+    codes = {"env_broken": "broken", "env_incomplete": "incomplete", "env_stale": "stale", "env_extras_failed": "extras", "env_unchecked": "unchecked"}
+    for e in envs.get("present", []):
+        st = states.get(e) or {}
+        for p in st.get("problems") or []:
+            k = codes.get(p.get("code", ""))
+            if k and e not in out[k]:
+                out[k].append(e)
+        if want_cuda and st.get("torch_kind") == "cpu":
+            out["cpu_torch"].append(e)
+    return out
+
+
+def row_envs(envs: dict[str, Any], mock: bool, gpu: GpuInfo | None = None) -> dict[str, Any]:
     needed, present = envs.get("needed", []), envs.get("present", [])
     p = {"present": len(present), "total": len(needed), "missing": ", ".join(e for e in needed if e not in present)}
     if mock:
         return _row("envs", "green", {"present": len(present), "total": len(needed)}, {**p, "mock": True})
     val = {"present": len(present), "total": len(needed), "missing": [e for e in needed if e not in present]}
-    if len(present) >= len(needed):
-        return _row("envs", "green", val, p)
-    return _row("envs", "yellow" if present else "red", val, p, _fix("open_tools"))
+    if len(present) < len(needed):
+        return _row("envs", "yellow" if present else "red", val, p, _fix("open_tools"))
+    f = env_findings(envs, gpu)
+    states = envs.get("states") or {}
+
+    def detail(names: list[str], code: str) -> str:
+        for n in names:
+            for pr in (states.get(n) or {}).get("problems") or []:
+                if pr.get("code") == code:
+                    return str(pr.get("detail") or "")[:300]
+        return ""
+
+    # one row, the worst finding decides; the button rebuilds exactly the envs that need it (apply_fix)
+    for reason, status, code, fix in (
+        ("broken", "red", "env_broken", "rebuild_envs"), ("incomplete", "red", "env_incomplete", "rebuild_envs"),
+        ("cpu_torch", "yellow", "", "rebuild_envs"), ("stale", "yellow", "env_stale", "rebuild_envs"),
+        ("extras", "yellow", "env_extras_failed", "rebuild_envs"), ("unchecked", "yellow", "env_unchecked", "check_envs"),
+    ):
+        if f[reason]:
+            return _row("envs", status, {**val, reason: f[reason]}, {**p, "reason": reason, "envs": ", ".join(f[reason]), "detail": detail(f[reason], code) if code else ""}, _fix(fix))
+    return _row("envs", "green", val, p)
+
+
+def row_memory(platform: str, mem: dict[str, float] | None) -> dict[str, Any]:
+    """Yellow under 16 GB RAM or a 24 GB commit limit (RAM + page file): torch on Windows fails with "the paging file is too
+    small" (WinError 1455) when several model processes reserve memory for their CUDA libraries."""
+    if not platform.startswith("win") or mem is None:
+        return _row("memory", "green", None, {"applicable": False, "reason": "not_applicable"})
+    p = {"ram_gb": mem["ram_gb"], "commit_gb": mem["commit_gb"], "min_ram_gb": RAM_GREEN_GB, "min_commit_gb": COMMIT_GREEN_GB}
+    if mem["ram_gb"] < RAM_GREEN_GB:
+        return _row("memory", "yellow", mem["ram_gb"], {**p, "reason": "low_ram"})
+    if mem["commit_gb"] < COMMIT_GREEN_GB:
+        return _row("memory", "yellow", mem["commit_gb"], {**p, "reason": "small_page_file"})
+    return _row("memory", "green", mem["ram_gb"], p)
+
+
+def row_huggingface(hf: dict[str, Any]) -> dict[str, Any]:
+    host = str(hf.get("host") or HF_HOST)
+    p = {"host": host, "mirror": host != HF_HOST}
+    return _row("huggingface", "green" if hf.get("ok") else "yellow", bool(hf.get("ok")), {**p, **({"reason": "mirror"} if host != HF_HOST else {})} if hf.get("ok") else p)
+
+
+def disk_by_drive(folders: dict[str, Path], models: dict[str, Any], envs: dict[str, Any], free_gb: Callable[[Path], float]) -> list[dict[str, Any]]:
+    """``[{drive, free_gb, need_gb, path}]``: what each drive of the data / models / environments folders still has to take."""
+    present = set(envs.get("present", []))
+    need = {
+        "data": WORK_ROOM_GB,
+        "models": float(models.get("default_missing_gb", 0.0)),
+        "envs": sum(ENV_ESTIMATE_BY_NAME_GB.get(e, ENV_ESTIMATE_GB) for e in envs.get("needed", []) if e not in present),
+    }
+    drives: dict[str, dict[str, Any]] = {}
+    for role in ("data", "models", "envs"):
+        path = folders.get(role)
+        if path is None:
+            continue
+        key = (os.path.splitdrive(str(path))[0] or Path(path).anchor or str(path)).upper()
+        d = drives.setdefault(key, {"drive": key, "need_gb": 0.0, "path": Path(path)})
+        d["need_gb"] += need[role]
+    for d in drives.values():
+        d["free_gb"] = float(free_gb(d["path"]))
+        d["need_gb"] = round(d["need_gb"], 1)
+    return list(drives.values())
 
 
 def row_models(models: dict[str, Any], mock: bool) -> dict[str, Any]:
@@ -557,20 +690,33 @@ def run_doctor(probes: Probes | None = None, *, refresh: bool = False) -> dict[s
         f_vcb = pool.submit(_safe, probes.vcredist_bundled, False, "vcredist_bundled")
         f_git = pool.submit(_safe, probes.git, {"path": None, "source": None, "frozen": False, "envs": []}, "git")
         f_procs = pool.submit(_safe, probes.processes, [], "processes")
+        f_hf = pool.submit(_safe, probes.huggingface, {"ok": False, "host": hf_endpoint_host()}, "huggingface")
+        f_mem = pool.submit(_safe, probes.memory, None, "memory")
+        f_dirs = pool.submit(_safe, probes.folders, {}, "folders")
         gpu, net, tools, envs, models, free = (f.result() for f in (f_gpu, f_net, f_tools, f_envs, f_models, f_disk))
-        vc, vc_bundled, git, procs = (f.result() for f in (f_vc, f_vcb, f_git, f_procs))
+        vc, vc_bundled, git, procs, hf, mem, dirs = (f.result() for f in (f_vc, f_vcb, f_git, f_procs, f_hf, f_mem, f_dirs))
     drive = os.path.splitdrive(str(data_dir))[0] or str(data_dir)
+    disk = row_disk(float(free), disk_need_gb(models, envs), drive)
+    folders = {**(dirs or {}), "data": Path(data_dir)}
+    drives = _safe(lambda: disk_by_drive(folders, models, envs, probes.disk_free_gb), [], "disk_by_drive")
+    if len(drives) > 1:  # models or environments on another drive: each drive against its own share, the worst one shown
+        rank = {"red": 2, "yellow": 1, "green": 0}
+        per = [row_disk(d["free_gb"], d["need_gb"], d["drive"]) for d in drives]
+        disk = max(per, key=lambda r: (rank[r["status"]], -r["params"]["free_gb"]))
+        disk["params"]["drives"] = "; ".join(f"{d['drive']} {round(d['free_gb'], 1)} / {d['need_gb']}" for d in drives)
     rows = [
         row_gpu(gpu),
         row_driver(gpu),
         row_vram(gpu),
-        row_disk(float(free), disk_need_gb(models, envs), drive),
+        row_memory(probes.platform, mem),
+        disk,
         row_ffmpeg(tools),
         row_vcredist(probes.platform, vc, bool(vc_bundled)),
         row_git(git),
         row_internet(bool(net)),
+        row_huggingface(hf or {}),
         row_defender(probes.platform, Path(data_dir)),
-        row_envs(envs, mock),
+        row_envs(envs, mock, gpu),
         row_models(models, mock),
         row_processes(procs),
     ]
@@ -624,6 +770,8 @@ def apply_fix(action: str) -> dict[str, Any]:
         }
     from vndub_app import installer, jobs
 
+    if action in ("rebuild_envs", "check_envs"):
+        return _env_fix(action)
     if action == "install_vcredist":
         exe = installer.bundled_vcredist()
         if exe is None:  # the row offers this fix only while the file is there; it can have been deleted since
@@ -631,6 +779,26 @@ def apply_fix(action: str) -> dict[str, Any]:
         job = jobs.runner().submit("vcredist_install", lambda ctx: installer.install_vcredist(ctx), params={"file": str(exe)}, gpu=False)
         return job.info()
     job = jobs.runner().submit("ffmpeg_download", lambda ctx: installer.install_tools(["ffmpeg"], ctx), params={"names": ["ffmpeg"]}, gpu=False)
+    return job.info()
+
+
+def _env_fix(action: str) -> dict[str, Any]:
+    """``rebuild_envs``: an ``envs_install`` job (torch ``auto``) of exactly the needed envs the envs row complains about
+    (incremental: make_envs keeps the venv, uv moves the pins, a CPU torch becomes CUDA); ``check_envs``: an ``envs_check``
+    job, the import probe of every needed env that is built. Both refuse while another install or check runs."""
+    from vndub_app import installer, jobs
+
+    probes = current_probes()
+    envs = probes.envs()
+    if action == "check_envs":
+        names = list(envs.get("present", []))
+        job = jobs.runner().submit("envs_check", lambda ctx: installer.check_envs(names, ctx), params={"envs": names}, gpu=False, guard=installer._refuse_when_busy(("envs_install", "envs_check")))  # noqa: SLF001
+        return job.info()
+    f = env_findings(envs, _safe(probes.gpu, None, "gpu"))
+    names = list(dict.fromkeys(f["broken"] + f["incomplete"] + f["cpu_torch"] + f["stale"] + f["extras"]))
+    if not names:
+        return {"ok": True, "envs": []}
+    job = jobs.runner().submit("envs_install", lambda ctx: installer.install_envs(names, "auto", ctx), params={"envs": names, "torch": "auto"}, gpu=False, guard=installer._refuse_when_busy(None))  # noqa: SLF001
     return job.info()
 
 

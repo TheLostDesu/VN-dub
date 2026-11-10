@@ -37,7 +37,7 @@ Where a mistake silently silences a line (the file is named by an identifier Ren
   that is only ``{clear}`` is an ``nvl clear`` statement instead;
 * the translate block is the run of translatable statements (``voice``, ``voice sustain``, ``nvl clear``: all of them,
   in script order) right before the say, in the same block: any other statement, or the end of the block, ends the group
-  (``voice "a"`` / ``show eileen`` / ``e "Hi"`` hashes the say alone); from Ren'Py 8.6 (``config.tlid_only_considers_say``)
+  (``voice "a"`` / ``show eileen`` / ``e "Hi"`` hashes the say alone); from Ren'Py 8.5.1 (the release that brought ``config.tlid_only_considers_say``)
   only the say is hashed, the version is read from the game's ``renpy/`` folder (:func:`detect_renpy_version`);
 * a ``Character`` without a name argument takes its name and ``voice_tag`` from its ``kind``; only an explicit ``None``
   (or a chain that ends in ``adv`` / ``nvl``) is narration;
@@ -66,6 +66,7 @@ from vndub.engines.base import (
     bind_line,
     build_characters,
     copy_loose,
+    find_audio,
     pick_voice_files,
     speaker_id_for,
     write_install,
@@ -102,6 +103,11 @@ SAY_RE = re.compile(
 )
 CALL_FROM_RE = re.compile(rf"^call\b.*?\sfrom\s+(?P<name>\.?{_DOTTED})\s*$")
 CHAR_DEF = re.compile(rf"^define\s+(?P<var>{_DOTTED})\s*=\s*(?P<expr>(?:Dynamic)?Character\s*\(.*\))\s*$")
+CHAR_ASSIGN = re.compile(rf"^(?:\$\s*)?(?P<var>{_DOTTED})\s*=\s*(?P<expr>(?:Dynamic)?Character\s*\(.*\))\s*$")
+# statements that never interact: a voice queued before them still plays with the next say (``_voice.play`` waits for it)
+VOICE_KEEPERS = {"show", "scene", "hide", "play", "queue", "stop", "camera"}
+# the characters the engine itself defines for narration (``renpy/common/00library.rpy``, ``00nvl_mode.rpy``)
+NARRATION_CHARS = {"narrator", "centered", "vcentered", "nvl_narrator", "adv", "nvl"}
 NVL_CLEAR_RE = re.compile(r"^nvl\s+clear$")
 AUTO_VOICE = re.compile(r"(?:define\s+)?config\.auto_voice\s*=\s*(?P<val>.+?)\s*$")
 VOICE_RE = re.compile(rf"^voice\s+(?P<arg>sustain\b|{_STR}|.+)$")
@@ -228,8 +234,12 @@ def dialogue_identifier(label: str | None, codes: list[str], alloc: IdAllocator 
 
 def strip_text_tags(s: str) -> str:
     s = re.sub(r"\{\{", "\x00", s)
+    s = re.sub(r"\{rt\}.*?\{/rt\}", "", s)  # ruby: the reading over the kanji is not said twice
+    # a page break ({p}) or a line break ends a sentence on screen: without a space the translator and the TTS read "anyway.New"
+    s = re.sub(r"\{p(?:=[^{}]*)?\}|\n", " ", s)
     s = re.sub(r"\{[^{}]*\}", "", s)
     s = s.replace("\x00", "{").replace("[[", "[")
+    s = re.sub(r"  +", " ", s)
     return s.replace("%%", "%").strip()
 
 
@@ -490,6 +500,21 @@ def parse_say_tail(rest: str) -> tuple[bool, str | None, str, str | None]:
     return interact, ident, args, with_
 
 
+def _voice_of(block: _Pending, carry: _Pending) -> _Pending:
+    """``block`` (the say's own group) with the voice of ``carry``."""
+    return _Pending(codes=block.codes, indent=block.indent, voice=carry.voice, voice_code=carry.voice_code, sustain=carry.sustain)
+
+
+def _char_def(s: str, state: RpyParse) -> bool:
+    """A character definition: ``define e = Character(...)``, or the same assignment as Python (``$ e = Character(...)``, a line
+    of an ``init python:`` block). Ren'Py runs both before the script starts, so both name the speaker."""
+    m = CHAR_DEF.match(s) or CHAR_ASSIGN.match(s)
+    if not m:
+        return False
+    state.chars[m.group("var")] = parse_character_expr(m.group("var"), m.group("expr"))
+    return True
+
+
 def enter_label(name: str, hide: bool, ctx_label: list[str | None], declare: bool = True) -> str:
     """A ``Label`` node is met: returns the full label name and moves the translation label that prefixes the dialogue
     identifiers from here (``Restructurer.callback``: a hidden label, or one whose name starts with ``_``, does not).
@@ -513,12 +538,16 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
     skip_indent: int | None = None
     menu_stack: list[list[Any]] = []  # [indent of the menu, its record, indent of its direct children (None until one is seen)]
     pending = _Pending()
+    carry: _Pending | None = None  # a voice whose group a non-interacting statement ended: still queued for the next say
+    skip_chars = False  # the skipped block runs Python at init (``init:``, ``init python:``, ``python early:``): it may define characters
     for no, indent, s in lines:
         if skip_indent is not None:
             if indent > skip_indent:
                 m = AUTO_VOICE.search(s)
                 if m:
                     state.auto_voice = _literal(m.group("val"))
+                elif skip_chars:
+                    _char_def(s, state)
                 continue
             skip_indent = None
         while menu_stack and indent <= menu_stack[-1][0]:
@@ -530,9 +559,18 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
         group, pending = pending, _Pending()
         if group.codes and indent != group.indent:  # the block of the group ended: a say after it is in another block
             group = _Pending()
-        m = CHAR_DEF.match(s)
-        if m:
-            state.chars[m.group("var")] = parse_character_expr(m.group("var"), m.group("expr"))
+        # The voice itself is not the group: ``voice`` only sets ``_voice.play`` and the next say interaction plays it, so
+        # ``voice "a"`` / ``show eileen`` / ``e "Hello"`` is voiced although the say is hashed alone. The binding survives
+        # the statements that never interact (show / scene / hide / play / queue / stop / camera / ``$``) in the same block.
+        if carry is not None and indent != carry.indent:
+            carry = None
+        if s.startswith("$") or s.split(None, 1)[0] in VOICE_KEEPERS:
+            if group.voice_code or group.sustain:
+                carry = group
+            carry_now = carry
+        else:
+            carry_now, carry = carry, None
+        if _char_def(s, state):
             continue
         m = AUTO_VOICE.match(s)
         if m and (s.startswith("define") or s.startswith("config.") or s.startswith("$")):
@@ -545,6 +583,7 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
             continue
         if SKIP_BLOCKS.match(s) and s.endswith(":"):
             skip_indent = indent
+            skip_chars = bool(re.match(r"^(init\b|python\b)", s))  # not ``translate x python:``: that renames for another language
             continue
         m = LABEL_RE.match(s)
         if m:
@@ -593,6 +632,7 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
             pending = group
             pending.codes.append(s)
             pending.indent = indent
+            carry = carry_now  # ``nvl clear`` does not interact either
             continue
         first = s.split(None, 1)[0].rstrip(":")
         if first in KEYWORDS and first != "extend":
@@ -634,6 +674,9 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
             codes.append(say_code(who, what, attrs, tmp, interact, explicit_id if first_say else None, args, with_))
             computed = alloc.allocate(ctx_label[0], block_digest(codes))  # an explicit id replaces it, the computed one stays taken
             ident = (explicit_id if first_say else None) or computed
+            outside = False
+            if first_say and carry_now is not None and not (block.voice_code or block.sustain):
+                block, outside = _voice_of(block, carry_now), True  # the voice an earlier group left queued (the ids stay the say's own)
             state.says.append(
                 {
                     "kind": "say",
@@ -642,6 +685,8 @@ def parse_rpy_text(text: str, filename: str, state: RpyParse, alloc: IdAllocator
                     "voice": block.voice,
                     "voice_expr": bool(block.voice_code) and block.voice is None,
                     "sustain": block.sustain,
+                    "voice_stmt": block.voice_code,
+                    "voice_outside": outside,
                     "id": ident,
                     "label": ctx_label[0],
                     "file": filename,
@@ -726,6 +771,63 @@ def detect_renpy_version(game_dir: Path) -> tuple[int, int, int] | None:
         if m:
             return int(m.group(1)), int(m.group(2)), int(m.group(3))
     return None
+
+
+PLAY_RE = re.compile(r"^(?:play|queue)\s+\w+\s+(?P<arg>.+)$")
+AUDIO_DEF = re.compile(rf"^define\s+audio\.(?P<name>{_WORD})\s*=\s*(?P<val>{_STR})")
+
+
+def _voiced_by_script(scripts: list[Path], auto_voice: str | None = None) -> Any:
+    """``relpath -> bool``: is this sound file a voice, judged by the scripts? Named by a ``voice`` statement (also without its
+    extension or folder: ``config.voice_filename_format`` builds the path from ``voice "e_0001"``) or matched by
+    ``config.auto_voice``, and never played as music / sound (``play`` / ``queue``, ``define audio.x``)."""
+    from vndub.engines.base import read_text_any
+
+    voiced: set[str] = set()
+    other: set[str] = set()
+    audio_names: dict[str, str] = {}
+    played: list[str] = []
+    patterns = [auto_voice] if auto_voice else []
+    for f in scripts:
+        try:
+            text = read_text_any(f)
+        except OSError:
+            continue
+        for _no, _ind, s in _logical_lines(text):
+            m = VOICE_RE.match(s)
+            if m and m.group("arg")[0] in "\"'":
+                voiced.add(dequote(m.group("arg").strip()).replace("\\", "/").lower())
+                continue
+            m = PLAY_RE.match(s)
+            if m:
+                played.append(m.group("arg"))
+                continue
+            m = AUDIO_DEF.match(s)
+            if m:
+                audio_names[m.group("name")] = dequote(m.group("val"))
+                other.add(dequote(m.group("val")).replace("\\", "/").lower())
+                continue
+            m = AUTO_VOICE.search(s)
+            if m and _literal(m.group("val")):
+                patterns.append(str(_literal(m.group("val"))))
+    for arg in played:
+        for lit in re.findall(_STR, arg):
+            other.add(dequote(lit).replace("\\", "/").lower())
+        for w in re.findall(_WORD, arg):
+            if w in audio_names:
+                other.add(audio_names[w].replace("\\", "/").lower())
+    stems = {PurePosixPath(v).stem for v in voiced} | {PurePosixPath(v).name for v in voiced}
+    auto = [re.compile(re.escape(p.replace("\\", "/")).replace(re.escape("{id}"), "[^/]+") + "$", re.I) for p in patterns if "{id}" in p]
+
+    def kept(rel: str) -> bool:
+        r = rel.lower()
+        if r in other or r.removeprefix("audio/") in other:  # ``play music "theme.ogg"`` finds game/audio/theme.ogg too
+            return False
+        if r in voiced or PurePosixPath(r).stem in stems or str(PurePosixPath(r).with_suffix("")) in voiced:
+            return True
+        return any(p.match(r) for p in auto)
+
+    return kept
 
 
 def _is_engine_script(path: Path, root: Path, engine_dir: Path) -> bool:
@@ -813,6 +915,7 @@ class RenpyEngine(BaseEngine):
                         scripts.append(rpy)
         voice_dirs = list(ctx.cfg.extract.voice_dirs) + ["voices", "audio/voice", "audio/voices"]
         voices: list[Path] = []
+        notes: list[str] = []
         seen: set[str] = set()
         for root in roots:
             for v in pick_voice_files(root, voice_dirs):
@@ -820,25 +923,38 @@ class RenpyEngine(BaseEngine):
                 if key not in seen:
                     seen.add(key)
                     voices.append(v)
-        return ExtractResult(script_files=sorted(scripts), voice_root=game, voice_files=voices, voice_roots=roots[1:], warnings=warnings, notes=[f"{len(scripts)} scripts"])
+        if voices and not any(find_audio(root / vd) for root in roots for vd in voice_dirs if (root / vd).is_dir()):
+            # no voice folder: pick_voice_files took every sound of the game (game/audio/ holds music and effects too). Only
+            # what the script plays as a voice counts, never what it plays as music or sound
+            kept = _voiced_by_script(scripts, ctx.cfg.parse.engine_opts.renpy.auto_voice)
+            n_all = len(voices)
+            voices = [v for root in roots for v in voices if v.is_relative_to(root) and kept(v.relative_to(root).as_posix())]
+            voices = list(dict.fromkeys(voices))
+            if n_all != len(voices):
+                notes.append(f"no voice folder: {len(voices)} of {n_all} sound files are named by voice statements or config.auto_voice, the rest (music, sounds) is not voice")
+        return ExtractResult(script_files=sorted(scripts), voice_root=game, voice_files=voices, voice_roots=roots[1:], warnings=warnings, notes=[f"{len(scripts)} scripts", *notes])
 
     def parse(self, ctx: "StageContext", extracted: ExtractResult, audio: list[AudioIndexRecord]) -> ParseResult:
         opts = ctx.cfg.parse.engine_opts.renpy
         notes: list[str] = []
         only_say = opts.tlid_only_considers_say
-        if only_say is None:  # auto: Ren'Py 8.6 made config.tlid_only_considers_say True by default (8.5.1 added it, False)
+        if only_say is None:
+            # auto. The 8.5.1 changelog says config.tlid_only_considers_say is False until 8.6, but the code that came with it
+            # (renpy/translation/__init__.py: create_translate, read in the 8.5.3 SDK) feeds only Say nodes into the digest
+            # whatever the flag says, and `renpy translate` of 8.5.3 writes the id of the say alone for a voice + say pair
+            # (round 18, checked in the SDK). So the cut is where the flag appeared, not where its default flips.
             ver = detect_renpy_version(ctx.game_dir)
-            only_say = ver is not None and ver >= (8, 6, 0)
+            only_say = ver is not None and ver >= (8, 5, 1)
             if ver is None:
                 notes.append(
                     "Ren'Py version not found (no renpy/vc_version.py or renpy/__init__.py in the game folder): dialogue identifiers include "
-                    "the voice statements (Ren'Py 8.5 and older); for a Ren'Py 8.6+ game set parse.engine_opts.renpy.tlid_only_considers_say: true "
+                    "the voice statements (Ren'Py 8.5.0 and older); for a Ren'Py 8.5.1+ game set parse.engine_opts.renpy.tlid_only_considers_say: true "
                     "or import a dialogue.tab"
                 )
             else:
                 notes.append(
                     f"Ren'Py {'.'.join(map(str, ver))} found in the game folder: dialogue identifiers {'ignore' if only_say else 'include'} "
-                    "the voice statements (config.tlid_only_considers_say is " + ("True" if only_say else "False") + " by default there)"
+                    "the voice statements (" + ("from 8.5.1 only the say statement is hashed" if only_say else "before 8.5.1 the whole group is hashed") + ")"
                 )
         roots = [*extracted.all_roots(), ctx.paths.raw / "renpy" / "decompiled"]  # the folders the scripts were found under
         state = parse_rpy_files(extracted.script_files, only_say=only_say, roots=roots)
@@ -885,7 +1001,9 @@ class RenpyEngine(BaseEngine):
             elif who == "extend":
                 speaker_raw, sid = last_speaker
             elif who:
-                if who not in state.chars:
+                if who in NARRATION_CHARS and who not in state.chars:
+                    pass  # ``centered "Chapter One"``: the engine's own narration characters, unless the game defines one of that name
+                elif who not in state.chars:
                     speaker_raw, sid = who, speaker_id_for(who, ctx.cfg.parse.narrator_names)
                 else:
                     if who not in resolved:
@@ -906,6 +1024,10 @@ class RenpyEngine(BaseEngine):
             rec = lb.add(scene, text, speaker_raw=speaker_raw, speaker_id=sid, raw=st["raw"], source_file=st["file"], source_line=st["line"], flags=flags)
             if st["id"]:  # a menu caption is not a say statement and has no identifier
                 rec.dialogue_id = st["id"]  # type: ignore[attr-defined]
+            if st.get("voice_stmt"):
+                rec.voice_stmt = st["voice_stmt"]  # type: ignore[attr-defined]  # the literal: pack needs it under config.voice_filename_format
+            if st.get("voice_outside"):
+                rec.flags.append("voice_outside_group")  # bound to a voice statement that is not in the say's translate block
             ref = st["voice"]
             if st["sustain"] and last_voiced is not None and not ref:
                 rec.flags.append("voice_sustain")

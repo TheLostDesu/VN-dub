@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -157,7 +158,7 @@ def _target_base(engine: str, game_dir: Path) -> tuple[Path, str | None]:
 def classify(engine: str, project: Any, game_dir: Path, patch_dir: Path, files: list[Path]) -> dict[str, Any]:
     """``auto_possible`` / ``manual_reason_key`` / ``base`` / ``helpers`` for one engine."""
     res: dict[str, Any] = {"auto_possible": False, "manual_reason_key": None, "base": game_dir, "helpers": []}
-    if not game_dir.is_dir():
+    if not _game_dir_ok(game_dir):
         res["manual_reason_key"] = "install.manual.game_missing"
         return res
     if not files:
@@ -191,6 +192,15 @@ def classify(engine: str, project: Any, game_dir: Path, patch_dir: Path, files: 
         else:
             res["auto_possible"] = True
     return res
+
+
+def _game_dir_ok(p: Path | str) -> bool:
+    """An existing absolute folder. ``Path("")`` (a transient read failure of project_meta.json) is ``.``: the current folder, never a game."""
+    s = str(p)
+    if not s or s == ".":
+        return False
+    q = Path(s)
+    return q.is_absolute() and q.is_dir()
 
 
 def _safe_target(base: Path, rel: Path) -> Path:
@@ -295,6 +305,7 @@ def build_plan(slug: str | None = None) -> dict[str, Any]:
     pdir = patch_dir_of(h, engine)
     files = patch_files(pdir)
     cls = classify(engine, proj, game_dir, pdir, files)
+    gok = _game_dir_ok(game_dir)
     base: Path = cls["base"]
     items = []
     total = 0
@@ -302,11 +313,11 @@ def build_plan(slug: str | None = None) -> dict[str, Any]:
     for f in files:
         rel = f.relative_to(pdir)
         dst = base / rel
-        exists = dst.exists()
+        exists = gok and dst.exists()
         size = f.stat().st_size
         total += size
         replaces += 1 if exists else 0
-        items.append({"target": _rel_target(game_dir, base, rel) if game_dir.is_dir() else rel.as_posix(), "source": rel.as_posix(), "exists": exists, "size": size})
+        items.append({"target": _rel_target(game_dir, base, rel) if gok else rel.as_posix(), "source": rel.as_posix(), "exists": exists, "size": size})
     items.sort(key=lambda i: (not i["exists"], i["target"]))
     notes: list[dict[str, Any]] = []
     unv = _unvoiced_dir(pdir)
@@ -326,7 +337,7 @@ def build_plan(slug: str | None = None) -> dict[str, Any]:
         "slug": h.slug,
         "engine": engine,
         "game_dir": str(game_dir),
-        "game_dir_ok": game_dir.is_dir(),
+        "game_dir_ok": gok,
         "patch_dir": str(pdir),
         "auto_possible": bool(cls["auto_possible"]),
         "manual_reason_key": cls["manual_reason_key"],
@@ -370,8 +381,25 @@ def _new_backup_dir(slug: str) -> tuple[str, Path]:
     return bid, d
 
 
+def _is_readonly(p: Path) -> bool:
+    try:
+        return p.is_file() and not p.stat().st_mode & stat.S_IWRITE
+    except OSError:
+        return False
+
+
+def _set_readonly(p: Path, readonly: bool) -> None:
+    try:
+        mode = p.stat().st_mode
+        os.chmod(p, (mode & ~stat.S_IWRITE) if readonly else (mode | stat.S_IWRITE))
+    except OSError as e:
+        log.warning("cannot change the read-only attribute of %s: %s", p, e)
+
+
 def _copy_atomic(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
+    if _is_readonly(dst):
+        _set_readonly(dst, False)  # os.replace onto a read-only file fails with WinError 5; the backup entry records the attribute for rollback
     tmp = dst.with_name(dst.name + ".vndub-tmp")
     try:
         shutil.copy2(src, tmp)
@@ -410,6 +438,59 @@ def _missing_dirs(game_dir: Path, dst: Path) -> list[Path]:
     return out
 
 
+def _running_game(game_dir: Path) -> list[str]:
+    """Names of running processes whose executable lies under the game folder (a running game holds its files open). Never raises."""
+    try:
+        from vndub_app import winproc
+
+        # roots[0] is the envs folder in winproc's scheme and is filtered by pyvenv.cfg: pass a dummy there, the game folder is a tool root
+        return sorted({p.name for p in winproc.list_processes(["vndub-no-envs-root", game_dir])})
+    except Exception as e:
+        log.warning("cannot list the processes under %s: %s", game_dir, e)
+        return []
+
+
+def _refuse_running_game(game_dir: Path) -> None:
+    names = _running_game(game_dir)
+    if names:
+        raise AppError("game_running", params={"game": ", ".join(names[:3]), "path": str(game_dir)}, action="none", details=f"running under {game_dir}: {', '.join(names)}", status=409)
+
+
+def _backup_order(bid: str) -> tuple[str, int]:
+    """Sort key of a backup id (``YYYYmmdd-HHMMSS`` or ``...-N`` for the Nth in the same second)."""
+    parts = bid.split("-")
+    num = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+    return "-".join(parts[:2]), num
+
+
+def _active_backups(slug: str, game_dir: Path | None = None) -> list[tuple[str, Path, dict[str, Any]]]:
+    """Backups of the project that are not rolled back yet (``installed`` or a stale ``installing``), newest first; only those of ``game_dir`` when given."""
+    root = backups_root(slug)
+    out: list[tuple[str, Path, dict[str, Any]]] = []
+    if root.is_dir():
+        for d in root.iterdir():
+            m = appdirs.read_json(d / MANIFEST, None)
+            if not m or m.get("state") == "rolled_back":
+                continue
+            if game_dir is not None and os.path.normcase(os.path.normpath(str(m.get("game_dir", "")))) != os.path.normcase(os.path.normpath(str(game_dir))):
+                continue
+            out.append((d.name, d, m))
+    out.sort(key=lambda t: _backup_order(t[0]), reverse=True)
+    return out
+
+
+def _undo_one(bid: str, bdir: Path, manifest: dict[str, Any], ctx: JobContext) -> dict[str, int]:
+    game_dir = Path(manifest["game_dir"])
+    ctx.message("install.msg.rollback", count=len(manifest.get("files", [])))
+    res = _restore(manifest, bdir, game_dir)
+    manifest["state"] = "rolled_back"
+    manifest["rolled_back"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    appdirs.write_json_atomic(bdir / MANIFEST, manifest)
+    if res["unrecoverable"]:
+        log.warning("backup %s: %d replaced files had no backup copy and stay as installed", bid, res["unrecoverable"])
+    return res
+
+
 def apply_patch(slug: str | None, backup: bool, ctx: JobContext) -> dict[str, Any]:
     """Job body for ``POST /api/install/apply``."""
     plan = build_plan(slug)
@@ -423,6 +504,16 @@ def apply_patch(slug: str | None, backup: bool, ctx: JobContext) -> dict[str, An
     if not files:
         raise AppError("nothing_to_install", params={"engine": plan["engine"]}, status=409)
     base, _ = _target_base(proj.engine, game_dir)
+    _refuse_running_game(game_dir)
+    # One active install per game: undo the earlier one first, so the new backup holds the true originals, files the earlier patch
+    # added and this one does not are gone, and no older backup is left that would restore a dub over the game
+    for old_id, old_dir, old_m in _active_backups(h.slug, game_dir):
+        ctx.checkpoint()
+        try:
+            _undo_one(old_id, old_dir, old_m, ctx)
+        except Exception as e:
+            raise AppError("install_undo_failed", params={"backup_id": old_id}, action="none", details=f"{type(e).__name__}: {e}", status=409) from e
+    ctx.checkpoint()
     todo = [(f, _safe_target(base, f.relative_to(pdir))) for f in files]
 
     # room for the backup (data drive) and for the growth of the game folder
@@ -445,10 +536,13 @@ def apply_patch(slug: str | None, backup: bool, ctx: JobContext) -> dict[str, An
         ctx.progress(i, n * 2 if backup else n, dst.name)
         existed = dst.exists()
         entry: dict[str, Any] = {"target": dst.relative_to(game_dir).as_posix(), "existed": existed, "backup_file": None}
+        if existed and _is_readonly(dst):
+            entry["readonly"] = True
         if existed and backup:
             bf = bdir / "files" / dst.relative_to(game_dir)
             bf.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(dst, bf)
+            _set_readonly(bf, False)  # the backup folder must stay deletable; the attribute lives in the entry
             entry["backup_file"] = bf.relative_to(bdir / "files").as_posix()
             entry["sha256_before"] = _sha256(dst)
         created_dirs.update(_missing_dirs(game_dir, dst))
@@ -460,6 +554,7 @@ def apply_patch(slug: str | None, backup: bool, ctx: JobContext) -> dict[str, An
     written = 0
     try:
         for i, (src, dst) in enumerate(todo):
+            ctx.checkpoint()  # a cancel lands in the handler below: the game goes back to the originals
             ctx.progress(n + i if backup else i, n * 2 if backup else n, dst.name)
             if not manifest["files"][i]["existed"]:
                 _drop_rpyc_twin(dst)  # a .rpyc left by an earlier install of a script that is new again
@@ -475,6 +570,9 @@ def apply_patch(slug: str | None, backup: bool, ctx: JobContext) -> dict[str, An
         except Exception as e2:  # pragma: no cover - best effort
             ctx.log(f"ERROR rollback after failed install also failed: {e2}")
         if isinstance(e, PermissionError):
+            running = _running_game(game_dir)  # a game that holds the file open looks like a permission error
+            if running:
+                raise AppError("game_running", params={"game": ", ".join(running[:3]), "path": str(game_dir)}, action="none", details=f"{type(e).__name__}: {e}", status=409) from e
             raise AppError("permission_denied", params={"path": str(getattr(e, "filename", "") or game_dir)}, action="show_manual", details=f"{type(e).__name__}: {e}") from e
         raise
     manifest["state"] = "installed"
@@ -509,6 +607,8 @@ def _restore(manifest: dict[str, Any], bdir: Path, game_dir: Path) -> dict[str, 
             bf = f.get("backup_file")
             if bf and (bdir / "files" / bf).is_file():
                 _copy_atomic(bdir / "files" / bf, dst)
+                if f.get("readonly"):
+                    _set_readonly(dst, True)
                 restored += 1
             else:
                 unrecoverable += 1  # replaced without a backup: the original cannot come back
@@ -541,18 +641,24 @@ def rollback_patch(slug: str | None, backup_id: str, ctx: JobContext) -> dict[st
     if not manifest:
         raise AppError("file_not_found", params={"path": str(bdir / MANIFEST)}, action="none", details="backup not found", status=404)
     game_dir = Path(manifest["game_dir"])
-    if not game_dir.is_dir():
+    if not _game_dir_ok(game_dir):
         raise AppError("game_dir_invalid", params={"path": str(game_dir)}, action="choose_game_dir", status=409)
     if manifest.get("state") == "rolled_back":
         raise AppError("nothing_to_install", params={"reason": "already_rolled_back", "backup_id": backup_id}, status=409)
-    ctx.message("install.msg.rollback", count=len(manifest.get("files", [])))
-    ctx.progress(0, 1, None)
-    res = _restore(manifest, bdir, game_dir)
-    manifest["state"] = "rolled_back"
-    manifest["rolled_back"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    appdirs.write_json_atomic(bdir / MANIFEST, manifest)
-    ctx.progress(1, 1, None)
-    return {"backup_id": backup_id, **res}
+    _refuse_running_game(game_dir)
+    # Newer installs of this game go back first (newest first): a backup holds what the game had when it was made, so restoring an older one
+    # over a newer install would leave a dub with no backup. Rolling back "install 1" therefore also undoes "install 2".
+    newer = [t for t in _active_backups(h.slug, game_dir) if _backup_order(t[0]) > _backup_order(backup_id)]
+    ctx.progress(0, len(newer) + 1, None)
+    undone: list[str] = []
+    for k, (nid, ndir, nm) in enumerate(newer):
+        ctx.checkpoint()
+        _undo_one(nid, ndir, nm, ctx)
+        undone.append(nid)
+        ctx.progress(k + 1, len(newer) + 1, None)
+    res = _undo_one(backup_id, bdir, manifest, ctx)
+    ctx.progress(len(newer) + 1, len(newer) + 1, None)
+    return {"backup_id": backup_id, **res, **({"also_rolled_back": undone} if undone else {})}
 
 
 # ----------------------------------------------------------------------------

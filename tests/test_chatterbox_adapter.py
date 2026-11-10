@@ -126,5 +126,17 @@ def test_the_vendor_stresser_leaves_the_marks_alone(monkeypatch: pytest.MonkeyPa
     assert sys.modules["chatterbox.models.tokenizers.tokenizer"].add_russian_stress("замо́к") == "замо́к"
 
 
+def test_the_probe_raises_the_swallowed_import_error_without_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 18: the import-level probe meets round 14's failure in seconds; no weight entry is needed."""
+    monkeypatch.setattr(chatterbox_impl, "ensure_pkg_resources", lambda: False)
+    install_packages(monkeypatch, lambda cls, *a: None, watermarker=None)
+    for name in ("perth.perth_net", "perth.perth_net.perth_net_implicit", "perth.perth_net.perth_net_implicit.perth_watermarker"):
+        monkeypatch.setitem(sys.modules, name, None)
+    with pytest.raises(ImportError, match="perth"):
+        ChatterboxML.probe({"name": "chatterbox_ml", "options": {}, "weights": []})
+    install_packages(monkeypatch, lambda cls, *a: None)
+    assert ChatterboxML.probe({"name": "chatterbox_ml", "options": {}, "weights": []})["ok"] is True
+
+
 def test_the_env_pins_a_setuptools_with_pkg_resources() -> None:
     assert "setuptools==80.10.2" in (REPO / "envs" / "chatterbox.txt").read_text(encoding="utf-8")

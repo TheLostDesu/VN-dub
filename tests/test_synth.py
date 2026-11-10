@@ -503,10 +503,16 @@ def test_laughter_can_be_switched_off_and_a_user_text_is_left_alone(proj):
     for side in _sides(ctx, line.line_id):
         assert side["text_used"] == "Ха-ха-ха, ну ты даёшь! *laughs*" and "laughter" not in side
     ctx.cfg.synth.laughter.enabled = True
-    write_override(ctx.paths, line.line_id, "set_text", {"text": "Ха-ха-ха, вот так."})  # what the user typed is what is spoken
+    # round 18: a review text gets translate's preparation, so its laugh is written for the backend like a translated one ...
+    write_override(ctx.paths, line.line_id, "set_text", {"text": "Ха-ха-ха, вот так."})
     synth.run(ctx)
     over = [s for s in _sides(ctx, line.line_id) if s["text_variant"] == "override"]
-    assert over and all(s["text_used"] == "Ха-ха-ха, вот так." and "laughter" not in s for s in over)
+    assert over and all("laughter" in s and "вот так" in s["text_used"] for s in over)
+    # ... unless the user marked the stress himself: then the text is spoken as typed (numbers spelled out)
+    write_override(ctx.paths, line.line_id, "set_text", {"text": "Ха-ха-ха, вот т+ак."})
+    synth.run(ctx)
+    over = [s for s in _sides(ctx, line.line_id) if s["text_variant"] == "override" and s["round"] == 2]  # (round 1 says the same words: kept)
+    assert over and all("laughter" not in s and "Ха-ха-ха" in s["text_used"] and "вот т" in s["text_used"] for s in over)
 
 
 def test_missing_and_broken_laughter_table(proj, tmp_path):

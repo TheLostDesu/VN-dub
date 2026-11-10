@@ -69,6 +69,7 @@ def update_character(h: appdirs.ProjectHandle, sid: str, *, gender: str | None =
         c = _char_or_404(chars, sid)
         if gender is not None:
             c.gender = gender
+            setattr(c, "gender_source", "user")  # contract C3: the translate stage's guess no longer applies to it
         if age_hint is not None:
             c.age_hint = str(age_hint)
         if description is not None:
@@ -104,8 +105,13 @@ def validate_tuning(raw: dict[str, Any]) -> dict[str, Any]:
             if v not in TIMBRE_PRESETS:
                 raise AppError("bad_request", params={"field": k, "value": v}, status=422)
             out[k] = v
-        else:
-            out[k] = str(v or "")[:500]
+        else:  # character_note: the style prompt keeps only NOTE_MAX_CHARS of it, so a longer one is refused, not cut silently
+            from vndub.text.style_prompt import NOTE_MAX_CHARS
+
+            note = str(v or "").strip()
+            if len(note) > NOTE_MAX_CHARS:
+                raise AppError("bad_request", params={"field": k, "value": len(note), "max": NOTE_MAX_CHARS}, status=422)
+            out[k] = note
     return out
 
 
@@ -127,10 +133,13 @@ def set_tuning(h: appdirs.ProjectHandle, sid: str, tuning: dict[str, Any]) -> di
 
 
 def apply_tuning_to_similar(h: appdirs.ProjectHandle, sid: str) -> list[str]:
-    """Copy the tuning of ``sid`` to characters with the same gender and age_hint."""
+    """Copy the tuning of ``sid`` to characters with the same known gender and the same age_hint. A character of unknown
+    gender matches nobody: with everything ``unknown`` one character's tuning would land on the whole cast."""
     updated: list[str] = []
     with edit_characters(h) as chars:
         src = _char_or_404(chars, sid)
+        if src.gender not in ("m", "f"):
+            return updated
         t = get_tuning(src)
         for other, c in chars.items():
             if other in (sid, viewdata.NARRATOR) or c.gender != src.gender or (c.age_hint or "") != (src.age_hint or ""):

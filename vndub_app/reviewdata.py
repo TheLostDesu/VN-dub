@@ -126,15 +126,19 @@ def touched_ids(h: appdirs.ProjectHandle) -> list[str]:
 
 
 def add_touched(h: appdirs.ProjectHandle, ids: list[str]) -> list[str]:
-    with _LOCK, session.STATE_LOCK:
-        st = appdirs.read_app_state(h)
+    out: list[str] = []
+
+    def _add(st: dict) -> None:
         cur = list(st.get("review", {}).get("touched", []))
         for i in ids:
             if i not in cur:
                 cur.append(i)
         st.setdefault("review", {})["touched"] = cur
-        appdirs.write_app_state(h, st)
-    return cur
+        out[:] = cur
+
+    with _LOCK, session.STATE_LOCK:
+        appdirs.update_app_state(h, _add)
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -148,6 +152,9 @@ def patch_state(patch: dict[str, str] | None, line_id: str) -> str | None:
     return None if patch is None else patch.get(line_id, "none")
 
 
+TRANSLATION_ROW_FLAGS = ("check_failed", "glossary_miss")
+
+
 def make_row(
     l: Any, s: Any, tr: Any, chars: dict[str, Any], winner_label: str | None, delivery: dict[str, Any] | None, touched: bool, patch: str | None = None,
 ) -> dict[str, Any]:
@@ -155,6 +162,8 @@ def make_row(
         "line_id": l.line_id, "speaker_id": l.speaker_id, "name": viewdata.display_name(l.speaker_id, chars), "scene": l.scene,
         "status": viewdata.status_of(s), "composite": (s.scores or {}).get("composite"), "text_src": l.text_src,
         "text_tgt": tr.text_tgt if tr else "", "winner_label": winner_label, "flags": list(l.flags or []),
+        # the translation record's flags the review can filter on (the self-check failed, a glossary term is missing)
+        "translation_flags": [f for f in (tr.flags or []) if f in TRANSLATION_ROW_FLAGS] if tr else [],
         "delivery": delivery, "touched": touched, "patch": patch, "_order": l.order,
     }
 
@@ -321,7 +330,7 @@ def line_detail(h: appdirs.ProjectHandle, line_id: str) -> dict[str, Any]:
         "original_url": session.work_url(h, line.src_wav) if snap.is_voiced(line_id) and line.src_wav else None,
         "candidates": out_cands, "why": why, "style_prompt": style_prompt,
         "text_tts": (tr.text_tts or tr.text_tgt) if tr else "", "refs": refs, "tuning_override": tuning_override, "character_tuning": character_tuning,
-        "selection": {"status": sel.status, "route": sel.route, "backend": sel.backend},
+        "selection": {"status": sel.status, "route": sel.route, "backend": sel.backend, "reason": sel.reason or ""},
     }
 
 

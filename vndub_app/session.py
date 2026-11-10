@@ -45,10 +45,8 @@ def set_current(slug: str | None) -> None:
     with _LOCK:
         _CURRENT = slug
     if slug:
-        s = appdirs.load_settings()
-        if s.last_project != slug:
-            s.last_project = slug
-            appdirs.save_settings(s)
+        if appdirs.load_settings().last_project != slug:
+            appdirs.update_settings(lambda s: setattr(s, "last_project", slug))
 
 
 def current_slug() -> str | None:

@@ -196,10 +196,8 @@ def _put_settings(h: appdirs.ProjectHandle, body: dict[str, Any]) -> dict[str, A
     if "license_policy" in body:
         if body["license_policy"] not in LICENSE_POLICIES:
             raise _bad("license_policy", body["license_policy"])
-        s = appdirs.load_settings()
-        if s.license_policy != body["license_policy"]:
-            s.license_policy = body["license_policy"]
-            appdirs.save_settings(s)
+        if appdirs.load_settings().license_policy != body["license_policy"]:
+            appdirs.update_settings(lambda s: setattr(s, "license_policy", body["license_policy"]))
         ov.pop("license_policy", None)  # one source of truth: the global setting
 
     adv = body.get("advanced") or {}
@@ -233,8 +231,8 @@ def _put_settings(h: appdirs.ProjectHandle, body: dict[str, Any]) -> dict[str, A
                 raise _bad("backends", name)
             ov[f"synth.backends.{name}.enabled"] = bool(enabled)
 
-    st["translation"], st["advanced"], st["config_overrides"] = tr, adv_state, ov
-    appdirs.write_app_state(h, st)
+    # only these three keys go into the state as it is now: a job thread may have recorded something since the read above
+    appdirs.update_app_state(h, lambda cur: cur.update({"translation": tr, "advanced": adv_state, "config_overrides": ov}))
     appdirs.write_project_config(h)
     _sync_project_lang(h, tr["tgt_lang"], str(tr.get("src_lang") or "auto"))
     write_glossary(h)
@@ -282,11 +280,9 @@ def retag_flags(flags: list[str], text: str) -> list[str]:
     it without ``laughter``): only a laughter-derived ``interjection`` is recomputed. Order and duplicates of the kept flags are
     unchanged; the new ones are appended.
     """
-    from vndub.stages.translate import laughter_flags
+    from vndub.stages.translate import retag_laughter_flags  # one rule: the translate stage re-applies it on every run
 
-    was_laugh = "laughter" in flags
-    kept = [f for f in flags if f != "laughter" and not (f == "interjection" and was_laugh)]
-    return kept + [f for f in laughter_flags(text) if f not in kept]
+    return retag_laughter_flags(flags, text)
 
 
 def sync_text_flags(h: appdirs.ProjectHandle, line_id: str, text: str) -> bool:
@@ -363,9 +359,14 @@ def write_glossary(h: appdirs.ProjectHandle, terms: list[dict[str, Any]] | None 
             continue
         matrix.setdefault(sid, {})["default"] = default_addr
         prev = dict(gchars.get(sid) or {})
+        # notes reach the translator's character list: the voice-design description ("строгая учительница, низкий голос") is not a
+        # translation note, and copying it made every casting edit change the glossary (round 18; an old copy of it is dropped)
+        prev_notes = str(prev.get("notes") or "")
+        if prev_notes and prev_notes == (c.description or ""):
+            prev_notes = ""
         gchars[sid] = {
             **prev, "src": c.names.get("src", "") or prev.get("src", sid), "tgt": c.names.get("tgt", ""),
-            "gender": c.gender, "age_hint": c.age_hint, "notes": c.notes or c.description or prev.get("notes", ""),
+            "gender": c.gender, "age_hint": c.age_hint, "notes": c.notes or prev_notes,
         }
     g["address_matrix"] = matrix
     g["characters"] = gchars
@@ -398,9 +399,26 @@ def get_glossary(h: appdirs.ProjectHandle) -> dict[str, Any]:
         out_chars.append({
             "speaker_id": sid, "src": c.names.get("src", "") or (gchars.get(sid) or {}).get("src", sid),
             "tgt": c.names.get("tgt", "") or (gchars.get(sid) or {}).get("tgt", ""), "gender": c.gender,
+            **({"gender_source": str((c.model_extra or {})["gender_source"])} if (c.model_extra or {}).get("gender_source") else {}),
         })
     terms = [{"src": str(t.get("src", "")), "tgt": str(t.get("tgt", "")), "note": str(t.get("note") or t.get("notes") or "")} for t in (g.get("terms") or []) if isinstance(t, dict)]
+    # C9: the names pass's spellings (work/glossary_auto.yaml) follow, marked auto; a user term of the same source wins
+    have = {t["src"].casefold() for t in terms}
+    auto, deleted = _auto_terms(h)
+    gone = {d.casefold() for d in deleted}
+    for t in auto:
+        src = str(t.get("src") or "")
+        if src.casefold() in have or src.casefold() in gone:
+            continue
+        terms.append({"src": src, "tgt": str(t.get("tgt") or ""), "note": "", "auto": True})
+        have.add(src.casefold())
     return {"characters": out_chars, "terms": terms}
+
+
+def _auto_terms(h: appdirs.ProjectHandle) -> tuple[list[dict[str, Any]], list[str]]:
+    from vndub.stages.translate import read_auto_glossary
+
+    return read_auto_glossary(h.work)
 
 
 def put_glossary(h: appdirs.ProjectHandle, body: dict[str, Any]) -> dict[str, Any]:
@@ -410,11 +428,24 @@ def put_glossary(h: appdirs.ProjectHandle, body: dict[str, Any]) -> dict[str, An
         if c.get("gender", "unknown") not in casting.GENDERS:
             raise _bad("gender", c.get("gender"))
     terms = []
+    sent: set[str] = set()
     for t in body.get("terms") or []:
         src = str(t.get("src", "")).strip()
         if not src:
             continue
+        sent.add(src.casefold())
+        if t.get("auto") is True:  # an automatic spelling sent back unchanged stays automatic (not written into glossary.yaml)
+            continue
         terms.append({"src": src, "tgt": str(t.get("tgt", "")).strip(), **({"notes": str(t["note"])} if t.get("note") else {})})
+    if "terms" in body:
+        # C9: an automatic term missing from the saved list was deleted by the user: remembered, so the names pass does not add it back
+        auto, deleted = _auto_terms(h)
+        gone = [str(a.get("src") or "") for a in auto if str(a.get("src") or "").casefold() not in sent]
+        if gone:
+            from vndub.stages.translate import write_auto_glossary
+
+            keep = [a for a in auto if str(a.get("src") or "").casefold() in sent]
+            write_auto_glossary(h.work, keep, [*deleted, *gone])
     if body.get("characters"):
         with casting.edit_characters(h) as chars:
             for c in body["characters"]:
@@ -425,7 +456,10 @@ def put_glossary(h: appdirs.ProjectHandle, body: dict[str, Any]) -> dict[str, An
                 ch.names = {**ch.names, "tgt": str(c.get("tgt", ch.names.get("tgt", "")))}
                 if "src" in c and str(c["src"]).strip():
                     ch.names["src"] = str(c["src"])
-                ch.gender = c.get("gender", ch.gender)
+                new_gender = c.get("gender", ch.gender)
+                if new_gender != ch.gender:  # the user's choice: the translate stage's gender pass never overwrites it (C3)
+                    setattr(ch, "gender_source", "user")
+                ch.gender = new_gender
     write_glossary(h, terms if "terms" in body else None)
     return get_glossary(h)
 
@@ -478,8 +512,6 @@ def put_cues(h: appdirs.ProjectHandle, data: dict[str, Any]) -> dict[str, Any]:
     except ValueError as e:
         raise AppError("bad_request", params={"field": "cues", "reason": str(e)}, details=str(e), status=422) from e
     with session.STATE_LOCK:
-        st = appdirs.read_app_state(h)
-        st["config_overrides"] = {**(st.get("config_overrides") or {}), "text_emotion.cues": str(own)}
-        appdirs.write_app_state(h, st)
+        appdirs.update_app_state(h, lambda cur: cur.update({"config_overrides": {**(cur.get("config_overrides") or {}), "text_emotion.cues": str(own)}}))
         appdirs.write_project_config(h)
     return get_cues(h)

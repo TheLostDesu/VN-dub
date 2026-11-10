@@ -14,6 +14,8 @@ HOP = 160  # 10 ms
 class TorchCrepeF0(ModelImpl):
     selftest_op = "f0"
 
+    probe_imports = ("torch", "torchcrepe")  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         import torch
         import torchcrepe

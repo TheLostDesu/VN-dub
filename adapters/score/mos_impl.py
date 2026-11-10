@@ -30,6 +30,8 @@ def _torch_home(params: dict[str, Any]) -> Path:
 class UTMOSv2(ModelImpl):
     selftest_op = "mos"
 
+    probe_imports = ("utmosv2",)  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         import utmosv2
 
@@ -123,6 +125,8 @@ class UTMOS22(ModelImpl):
     the final time average run over the padded frames, so batching would change the score."""
 
     selftest_op = "mos"
+
+    probe_imports = ("torch",)  # what load() imports (ModelImpl.probe)
 
     def load(self) -> dict[str, Any]:
         import torch

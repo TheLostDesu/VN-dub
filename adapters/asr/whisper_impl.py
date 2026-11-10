@@ -41,6 +41,8 @@ class FasterWhisperASR(ModelImpl):
     selftest_op = "transcribe"
     selftest_kwargs = {"lang": "ja"}
 
+    probe_imports = ("faster_whisper",)  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         from faster_whisper import WhisperModel
 

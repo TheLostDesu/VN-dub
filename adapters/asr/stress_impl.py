@@ -151,6 +151,8 @@ class RuAccentStress(ModelImpl):
     def _size(self) -> str:
         return MODEL_SIZES.get(str(self.options.get("model", "turbo")), str(self.options.get("model", "turbo3.1")))
 
+    probe_imports = ("ruaccent",)  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         workdir = weight_dir(self.params, 0)
         size = self._size()

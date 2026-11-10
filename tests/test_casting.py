@@ -262,8 +262,9 @@ def test_auto_cast_takes_the_top_ranked_for_everyone(proj):
     voicebank.propose_designs(ctx, "sakura", n=3)
     voicebank.propose_designs(ctx, "haruto", n=2)
     voicebank.propose_designs(ctx, "hero", n=2)
-    out = voicebank.auto_cast(ctx)
-    assert set(out) == {"sakura", "haruto", "hero"}
+    res = voicebank.auto_cast(ctx)
+    out = res["chosen"]
+    assert res["kept"] == [] and set(out) == {"sakura", "haruto", "hero"}
     chars = load_characters(ctx.paths.characters)
     for sid, did in out.items():
         top = [d for d in voicebank.list_designs(ctx, sid) if d["kind"] != "clone"][0]  # never the clone while there are designs
@@ -275,7 +276,7 @@ def test_auto_cast_takes_the_top_ranked_for_everyone(proj):
         if d["kind"] != "clone":
             dz.remove_design_files(ctx, "haruto", d["design_id"])
     dz.save_designs(ctx, "haruto", [d for d in dz.load_designs(ctx, "haruto") if d["kind"] == "clone"])
-    assert voicebank.auto_cast(ctx)["haruto"] == "clone"
+    assert voicebank.auto_cast(ctx, overwrite=True)["chosen"]["haruto"] == "clone"
     assert load_characters(ctx.paths.characters)["haruto"].route == "A"
 
 
@@ -304,7 +305,7 @@ def test_stage_keeps_the_chosen_design_and_does_not_regenerate(proj):
     ctx = proj
     add_unvoiced(ctx)
     s = run_stage("voicebank", ctx)
-    assert s["mode_b"] == ["hero"] and s["performers"] == 3 and s["designs"] == 6
+    assert s["mode_b"] == ["hero"] and s["performers"] == 3 and s["designs"] == 5  # hero (no audio, uncast): one design, the others were never ranked or used
     chars = load_characters(ctx.paths.characters)
     assert chars["hero"].route == "P" and chars["hero"].performer["chosen_by"] == "stage"
     assert chars["sakura"].route is None  # the CLI default (both routes compete) is not changed
@@ -462,5 +463,19 @@ def test_auto_cast_gives_route_p_to_a_character_with_too_little_audio_for_rvc(pr
     chars = load_characters(ctx.paths.characters)
     assert chars["sakura"].route == "P" and chars["haruto"].route == "P"  # B would convert with a model that is never made
     ctx.cfg.voicebank.min_minutes_for_voicebank = 0.0
-    voicebank.auto_cast(ctx)
+    voicebank.auto_cast(ctx, overwrite=True)  # the first pass made them "chosen"; a recast must say so
     assert load_characters(ctx.paths.characters)["sakura"].route == "B"
+
+
+def test_auto_cast_keeps_a_voice_the_user_chose(proj):
+    ctx = proj
+    add_unvoiced(ctx)
+    voicebank.propose_designs(ctx, "hero", n=3)
+    voicebank.propose_designs(ctx, "sakura", n=2)
+    second = voicebank.list_designs(ctx, "hero")[1]["design_id"]
+    voicebank.choose_design(ctx, "hero", second, "P")
+    res = voicebank.auto_cast(ctx)
+    assert res["kept"] == ["hero"] and "hero" not in res["chosen"] and "sakura" in res["chosen"]
+    assert load_characters(ctx.paths.characters)["hero"].performer["design_id"] == second
+    res = voicebank.auto_cast(ctx, overwrite=True)
+    assert "hero" in res["chosen"] and res["kept"] == []

@@ -7,10 +7,11 @@ import { JobProgress } from "../components/JobProgress";
 import { ReviewDetailView, type ReviewDetailHandle } from "../components/ReviewDetailView";
 import { StepFooter } from "../components/StepFooter";
 import { VirtualList } from "../components/VirtualList";
-import { Button, Callout, Card, Chip, PageTitle, SelectField, Spinner, useToast } from "../components/ui";
+import { Button, Callout, Card, Chip, Dialog, PageTitle, SelectField, Spinner, useToast } from "../components/ui";
 import { useI18n } from "../i18n";
 import { useJobTracker } from "../state/progress";
 import { useProject } from "../state/project";
+import { useWizard } from "../state/wizard";
 import { fmtNumber, normalizeFacets } from "../util/format";
 
 const ROW_H = 64;
@@ -29,10 +30,18 @@ function isActivatable(el: EventTarget | null): boolean {
 export default function ReviewScreen() {
   const { t } = useI18n();
   const toast = useToast();
+  const wiz = useWizard();
   const { project } = useProject();
+  // "apply and continue" from the unapplied-edits dialog: go on to the install once the apply job is done
+  const [confirmNext, setConfirmNext] = useState(false);
+  const continueAfterApply = useRef(false);
   const [speaker, setSpeaker] = useState("");
   const [scene, setScene] = useState("");
-  const [status, setStatus] = useState<"" | ReviewStatus>("");
+  // the status select also carries two client-side views: lines changed by the user, lines in the patch as provisional
+  const [statusSel, setStatusSel] = useState<"" | ReviewStatus | "touched" | "provisional">("");
+  const status: "" | ReviewStatus = statusSel === "touched" || statusSel === "provisional" ? "" : statusSel;
+  // the size of the unfiltered list, remembered from the last load without filters (for "of N" under a filter)
+  const [allCount, setAllCount] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [debouncedQ, setDebouncedQ] = useState("");
   const [minC, setMinC] = useState("");
@@ -70,7 +79,11 @@ export default function ReviewScreen() {
         max: maxC !== "" && Number.isFinite(Number(maxC)) ? Number(maxC) : undefined,
       });
       if (id !== reqId.current) return;
-      setItems(res.items ?? []);
+      const all = res.items ?? [];
+      if (!speaker && !scene && !statusSel && !debouncedQ && minC === "" && maxC === "") setAllCount(all.length);
+      const kept = statusSel === "touched" ? all.filter((i) => i.touched) : statusSel === "provisional" ? all.filter((i) => i.patch === "provisional") : all;
+      res.items = kept;
+      setItems(kept);
       setFacets(res.facets ?? { speakers: [], scenes: [] });
       setTouchedTotal(typeof res.touched_count === "number" ? res.touched_count : null);
       setError(null);
@@ -79,7 +92,8 @@ export default function ReviewScreen() {
     } catch (e) {
       if (id === reqId.current) setError(toErrorInfo(e));
     }
-  }, [speaker, scene, status, debouncedQ, minC, maxC]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [speaker, scene, status, statusSel, debouncedQ, minC, maxC]);
 
   useEffect(() => {
     void load();
@@ -90,6 +104,13 @@ export default function ReviewScreen() {
     onDone: () => {
       void load();
       setDetailEpoch((n) => n + 1);
+      if (continueAfterApply.current) {
+        continueAfterApply.current = false;
+        void wiz.next("review");
+      }
+    },
+    onFinal: (j) => {
+      if (j.state !== "done") continueAfterApply.current = false;
     },
     kinds: APPLY_JOBS,
     project: project?.slug ?? null,
@@ -136,6 +157,11 @@ export default function ReviewScreen() {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (isTextTarget(e.target)) return;
       if (document.querySelector('[role="dialog"]')) return;
+      // a held key must not accept or re-queue line after line (the next line is accepted unheard): only the arrows repeat
+      if (e.repeat && (e.key === "Enter" || e.code === "KeyR" || e.code === "Space" || /^(Digit|Numpad)[1-4]$/.test(e.code))) {
+        e.preventDefault();
+        return;
+      }
       const h = detail.current;
       switch (e.code) {
         case "Space":
@@ -190,10 +216,10 @@ export default function ReviewScreen() {
     return () => document.removeEventListener("keydown", onKey);
   }, [move]);
 
-  const preferA = async () => {
+  const preferA = async (speakerId?: string) => {
     setBulkBusy(true);
     try {
-      const res = await api.preferRoute("A");
+      const res = await api.preferRoute("A", speakerId);
       toast.show(t("review.prefer_a_done", { n: res.updated }));
       await load();
     } catch (e) {
@@ -219,14 +245,16 @@ export default function ReviewScreen() {
           <SelectField label={t("review.filter.scene")} value={scene} options={[{ value: "", label: t("review.filter.all") }, ...scenes.map((s) => ({ value: s.id, label: s.name }))]} onChange={setScene} testid="review-filter-scene" />
           <SelectField
             label={t("review.filter.status")}
-            value={status}
+            value={statusSel}
             options={[
               { value: "", label: t("review.filter.all") },
               { value: "check", label: t("review.status.check") },
               { value: "ok", label: t("review.status.ok") },
               { value: "failed", label: t("review.status.failed") },
+              { value: "touched", label: t("review.filter.touched") },
+              { value: "provisional", label: t("review.filter.provisional") },
             ]}
-            onChange={(v) => setStatus(v as "" | ReviewStatus)}
+            onChange={(v) => setStatusSel(v)}
             testid="review-filter-status"
           />
           <div className="field">
@@ -246,12 +274,25 @@ export default function ReviewScreen() {
           <Button onClick={() => void preferA()} busy={bulkBusy} data-testid="review-prefer-a" title={t("review.prefer_a_hint")}>
             {t("review.prefer_a")}
           </Button>
+          {speaker ? (
+            <Button onClick={() => void preferA(speaker)} busy={bulkBusy} data-testid="review-prefer-a-speaker" title={t("review.prefer_a_hint")}>
+              {t("review.prefer_a_speaker", { name: speakers.find((s) => s.id === speaker)?.name ?? speaker })}
+            </Button>
+          ) : null}
           <Button variant="primary" onClick={() => void apply.start(() => api.reviewApply())} busy={apply.busy} data-testid="review-apply">
             {t("review.apply")}
             {touchedCount > 0 ? <span className="count-badge" aria-label={t("review.touched_count", { n: touchedCount })}>{touchedCount}</span> : null}
           </Button>
           <span className="hint">{t("review.prefer_a_hint")}</span>
         </div>
+        {touchedCount > 0 && !apply.busy ? (
+          <Callout tone="warn" title={t("review.unapplied.title", { n: touchedCount })} testid="review-unapplied">
+            <p>{t("review.unapplied.text")}</p>
+            <Button variant="primary" onClick={() => void apply.start(() => api.reviewApply())} data-testid="review-unapplied-apply">
+              {t("review.unapplied.apply_now")}
+            </Button>
+          </Callout>
+        ) : null}
         {apply.job ? <JobProgress job={apply.job} onRetry={() => void apply.start(() => api.reviewApply())} testid="review-apply-job" /> : null}
         {apply.error && !apply.job ? <ErrorPanel error={apply.error} /> : null}
         {applyResult && !apply.busy ? (
@@ -269,6 +310,7 @@ export default function ReviewScreen() {
           <section className="review-list-pane" aria-label={t("review.list")}>
             <p className="hint" data-testid="review-counts" role="status">
               {t("review.counts", { total: items.length, check: counts.check, failed: counts.failed })}
+              {allCount !== null && allCount !== items.length ? ` ${t("review.counts_of_all", { all: allCount })}` : ""}
             </p>
             {items.length === 0 ? (
               <Callout tone="info" testid="review-empty">
@@ -290,7 +332,7 @@ export default function ReviewScreen() {
                         {it.name || it.speaker_id}
                         <span className="sr-only">: {t(`review.status.${it.status}`)}</span>
                       </span>
-                      <span className="review-row-text">{it.text_tgt || it.text_src}</span>
+                      <span className="review-row-text" title={it.text_tgt || it.text_src}>{it.text_tgt || it.text_src}</span>
                     </span>
                     <span className="review-row-meta">
                       {it.touched ? <Chip tone="info">{t("review.touched")}</Chip> : null}
@@ -337,7 +379,44 @@ export default function ReviewScreen() {
         </div>
       ) : null}
 
-      <StepFooter step="review" canNext={items !== null && !apply.busy} nextLabel={t("review.to_install")} />
+      <Dialog
+        open={confirmNext}
+        onClose={() => setConfirmNext(false)}
+        title={t("review.unapplied.title", { n: touchedCount })}
+        testid="review-unapplied-dialog"
+        actions={
+          <>
+            <Button onClick={() => setConfirmNext(false)} data-testid="review-unapplied-stay">
+              {t("review.unapplied.stay")}
+            </Button>
+            <Button
+              onClick={() => {
+                setConfirmNext(false);
+                void wiz.next("review");
+              }}
+              data-testid="review-unapplied-skip"
+            >
+              {t("review.unapplied.continue")}
+            </Button>
+            <Button
+              variant="primary"
+              data-autofocus
+              onClick={() => {
+                setConfirmNext(false);
+                continueAfterApply.current = true;
+                void apply.start(() => api.reviewApply());
+              }}
+              data-testid="review-unapplied-apply-continue"
+            >
+              {t("review.unapplied.apply_continue")}
+            </Button>
+          </>
+        }
+      >
+        <p>{t("review.unapplied.text")}</p>
+      </Dialog>
+
+      <StepFooter step="review" canNext={items !== null && !apply.busy} nextLabel={t("review.to_install")} onNext={() => (touchedCount > 0 ? setConfirmNext(true) : void wiz.next("review"))} />
     </>
   );
 }

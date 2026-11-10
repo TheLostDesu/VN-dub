@@ -375,7 +375,7 @@ def write_install(out: Path, engine: str, steps: list[str], extra: str = "") -> 
 # shared parsing helpers (additive)
 # ----------------------------------------------------------------------------
 
-NON_VOICE_DIRS = {"bgm", "music", "se", "sfx", "sound", "sounds", "ambient", "system", "sysse", "jingle", "movie", "image", "images", "fgimage", "bgimage"}
+NON_VOICE_DIRS = {"bgm", "music", "se", "sfx", "sound", "sounds", "ambient", "system", "sysse", "jingle", "movie", "image", "images", "fgimage", "bgimage", "gui"}
 
 
 def pick_voice_files(root: Path, voice_dirs: Iterable[str] = (), exts: Iterable[str] = AUDIO_EXTS) -> list[Path]:

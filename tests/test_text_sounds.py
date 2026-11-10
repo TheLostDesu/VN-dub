@@ -17,7 +17,7 @@ from vndub.text.delivery import Delivery, Layer, llm_layer, merge_layers, rule_p
         ("Ahem.", "cough"),
         ("Hmph!", "hmph"),
         ("Mmm...", "hum"),
-        ("Hm?", "hum"),
+        ("М-м-м...", "hum"),
         ("Му-ах!", "kiss"),
         ("З-З-З...", "snore"),
         ("Хр-р-р...", "snore"),

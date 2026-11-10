@@ -615,10 +615,10 @@ def test_delivery_request_shape(make_ctx, tmp_path, monkeypatch):
     spy = Spy()
     monkeypatch.setattr(translate, "_acquire_llm", lambda c: (spy, "fake_llm"))
     run_stage("translate", ctx)
-    voiced_batch = next(r for r in spy.requests if not any(b.get("want_delivery") for b in r))
-    target_batch = next(r for r in spy.requests if all(b.get("want_delivery") for b in r))
-    assert {b["id"] for b in voiced_batch} == {"s01_02", "s01_06", "s01_07"} and all("want_delivery" not in b for b in voiced_batch)
-    assert [b["id"] for b in target_batch] == UNVOICED and all(b["emotion"] == "" for b in target_batch)
+    # round 18: one stream in script order; the lines nobody voices carry want_delivery (and no audio emotion)
+    (batch,) = spy.requests
+    assert [b["id"] for b in batch] == ["s01_02", "s01_03", "s01_05", "s01_06", "s01_07", "s01_08"]
+    assert [b["id"] for b in batch if b.get("want_delivery")] == UNVOICED and all(not b.get("emotion") for b in batch if b.get("want_delivery"))
     target_msgs = next(m for m in msgs if '"want_delivery"' in m[-1]["content"])
     system = target_msgs[0]["content"]
     assert "Do not invent drama" in system and "delivery" in system and "neutral" in system and '"intensity": 0.3' in system
@@ -627,13 +627,12 @@ def test_delivery_request_shape(make_ctx, tmp_path, monkeypatch):
     assert any(r["speaker"] == "narrator" and r["text"] == "勇太は叫んだ。" for r in scene_lines)  # narration is part of the context
     assert [r["id"] for r in scene_lines if r.get("deliver")] == UNVOICED
     assert all(r["id"] in {l.line_id for l in ctx.lines()} for r in scene_lines)
-    # the voiced batch's system prompt knows nothing about delivery
-    voiced_msgs = next(m for m in msgs if '"want_delivery"' not in m[-1]["content"])
-    assert "delivery" not in voiced_msgs[0]["content"] and not any("scene_lines" in m["content"] for m in voiced_msgs)
     ctx.models.close()
 
 
-def test_translate_cache_of_voiced_lines_survives_enabling_unvoiced(make_ctx, tmp_path, monkeypatch):
+def test_enabling_unvoiced_translates_the_scene_again_with_every_turn(make_ctx, tmp_path, monkeypatch):
+    # round 18 (accepted cost): the voiced batches no longer survive enabling the unvoiced lines; the scene is asked again in
+    # script order so a voiced reply is translated with the question before it
     ctx = _project(make_ctx, tmp_path, **{"translate.include_unvoiced": "off"})  # voiced lines only: the old behaviour
     run_stage("translate", ctx)
     ctx.models.close()
@@ -644,10 +643,8 @@ def test_translate_cache_of_voiced_lines_survives_enabling_unvoiced(make_ctx, tm
     # the cache key contains the backend name: keep it the same as in the first run
     monkeypatch.setattr(translate, "_llm_key_backend", lambda c: "mock_translator")
     run_stage("translate", ctx)
-    asked = {b["id"] for r in fake.requests for b in r}
-    assert asked == set(UNVOICED)  # voiced batches came from the cache: the model only saw the new lines
-    recs = _records(ctx)
-    assert recs["s01_02"].text_tgt == "Эй, Юта!"  # still the original (mock dictionary) translation
+    asked = [b["id"] for r in fake.requests for b in r]
+    assert asked == ["s01_02", "s01_03", "s01_05", "s01_06", "s01_07", "s01_08"]
     ctx.models.close()
 
 

@@ -54,6 +54,20 @@ export default function SettingsScreen() {
   }
   if (chosenLlm && !llmOptions.some((o) => o.value === chosenLlm)) llmOptions.push({ value: chosenLlm, label: tOr(`models.${chosenLlm}.name`, chosenLlm) });
 
+  // the Hugging Face mirror: "" = huggingface.co; an older backend does not know the key and drops it
+  const savedHf = typeof settings.hf_endpoint === "string" ? settings.hf_endpoint : "";
+  const [hfDraft, setHfDraft] = useState(savedHf);
+  useEffect(() => {
+    setHfDraft(savedHf);
+  }, [savedHf]);
+  const saveHf = async () => {
+    const v = hfDraft.trim().replace(/\/+$/, "");
+    setHfDraft(v);
+    if (v === savedHf) return;
+    const res = await update({ hf_endpoint: v });
+    if (!res) await reload();
+  };
+
   const setGpuBudget = (v: number) => {
     setGpu(v);
     gpuPending.current = v;
@@ -251,6 +265,19 @@ export default function SettingsScreen() {
       <Card testid="settings-translation-llm">
         <SelectField label={t("settings.translation_llm.title")} value={chosenLlm} options={llmOptions} onChange={(v) => void update({ translation_llm: v })} testid="settings-translation-llm-select" />
         <p className="hint">{t("settings.translation_llm.hint")}</p>
+      </Card>
+
+      <Card testid="settings-hf">
+        <TextField
+          label={t("settings.hf_endpoint.title")}
+          value={hfDraft}
+          onChange={setHfDraft}
+          onBlur={() => void saveHf()}
+          onEnter={() => void saveHf()}
+          placeholder="https://hf-mirror.com"
+          hint={t("settings.hf_endpoint.hint")}
+          testid="settings-hf-endpoint"
+        />
       </Card>
 
       <Card testid="settings-license">

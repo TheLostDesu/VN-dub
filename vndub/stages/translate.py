@@ -27,8 +27,9 @@ Delivery (mode B, speaker lines without original audio -- translated like the vo
 ``{emotion, intensity, tempo, loudness, events, confidence}``, produced with the neighbouring script lines
 (+-``text_emotion.llm_context_lines``, narration included) and the character sheet. Invalid delivery objects are
 dropped (the stage ``text_emotion`` then falls back to its rule/cue layers); they never fail or re-run a batch.
-The result is stored as the extra field ``TranslationRecord.delivery``. These lines are sent in their own
-batches after the scene's regular batches, so the cached batches of voiced lines are never invalidated.
+The result is stored as the extra field ``TranslationRecord.delivery``. Since round 18 these lines are in the regular
+batches in script order (before, they went in batches of their own after the scene, and the voiced lines were translated
+without the turns between them); the ``scene_lines`` block is only sent when narration is not translated with them.
 ``text_emotion.llm: off`` disables the request; with an imported translation (``translate.import``) no LLM is
 loaded for delivery unless ``text_emotion.llm: on`` (then a delivery-only request runs through the same client).
 
@@ -36,6 +37,11 @@ Round 17: the glossary's ``player`` (gender of the person addressed as "you") is
 spelling of the script's proper nouns (glossary terms, cached); a post-check re-asks mixed-script / untranslated lines once and counts glossary
 misses; a model that misses the VRAM budget is retried at ctx 8192 / 4096 with proportionally smaller batches (:func:`_llm_candidates`); narration
 and menu choices are translated as text-only lines (:func:`text_only`; never dubbed) and menu choices land in ``TranslationRecord.choices_tgt``.
+
+Round 18: a batch's key holds the glossary slice its prompt shows (:func:`batch_glossary_slice`), not the whole glossary, and a partial
+answer is cached (a re-run asks only the missing ids); narration and the protagonist take the player's gender; a gender pass guesses
+unknown genders once (``gender_source: guess``); the checks also catch omissions, lost numbers / ``[var]`` tokens, Latin names and glossary
+misses (re-asked once); a sound-only line's table spelling goes to the TTS fields only; the prompt carries fewer rules per batch.
 
 ``preview_import(ctx, path, n)`` shows how an import file would match the lines (no writes).
 """
@@ -46,6 +52,7 @@ import csv
 import json
 import re
 import threading
+import unicodedata
 import urllib.error
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -59,12 +66,13 @@ from vndub.backends import registry
 from vndub.backends.base import BackendUnavailable
 from vndub.engines.base import VOICE_OVER
 from vndub.manifest.io import Character, LineRecord, TranslationRecord, read_json, read_jsonl, write_jsonl, write_yaml
+from vndub.stages import genutil as gu
 from vndub.stages import text_emotion as te_stage
 from vndub.stages._opcache import OpCache
 from vndub.stages.common import StageContext, StageError
 from vndub.text import ja, laughter, ru, sounds
 from vndub.text.delivery import EMOTIONS, LOUDNESSES, SPEECH_EVENTS, TEMPOS, valid_sound, validate_delivery
-from vndub.text.lang import LANG_NAMES, language_name
+from vndub.text.lang import CJK_LANGS, LANG_NAMES, language_name
 from vndub.util import hash_obj, now_iso
 
 NAME = "translate"
@@ -79,12 +87,12 @@ DEFAULT_RULES = [
     "Keep the meaning, register and emotional tone of each line.",
     "Interjections, laughter and hesitations must sound natural in the target language, not literal.",
     "Do not add explanations, notes or quotation marks into the translated text.",
-    "Keep character names exactly as listed in the glossary.",
 ]
 
 #: part of the cache key of translation batches: bump when the request changes in a way the glossary hash does not show
 #: (3: the prompt asks for ``sound`` -- non-speech sounds; cached answers of protocol 2 carry none)
-TRANSLATE_PROTOCOL = "3"
+#: (4, round 18: batches keyed by their glossary slice, delivery targets in the regular batches in script order, new prompt rules)
+TRANSLATE_PROTOCOL = "4"
 
 #: Cyrillic-script target languages: a Latin run inside a word of these is a spelling defect (see :func:`check_translation`)
 CYRILLIC_LANGS = {"ru", "uk", "be", "bg", "sr", "kk", "mk"}
@@ -144,8 +152,26 @@ def seed_glossary(ctx: StageContext) -> dict[str, Any]:
 
 def _gender_of(sid: str, chars: dict[str, Character], gloss: dict[str, Any]) -> str:
     gc = (gloss.get("characters") or {}).get(sid) or {}
-    g = gc.get("gender") or (chars[sid].gender if sid in chars else "unknown")
+    g = gc.get("gender")
+    if g not in ("m", "f"):  # a glossary "unknown" must not hide the sheet's gender (set at casting, or guessed by the gender pass)
+        g = chars[sid].gender if sid in chars else "unknown"
     return g if g in ("m", "f") else "unknown"
+
+
+def is_player(sid: str, speaker_raw: str | None, gloss: dict[str, Any]) -> bool:
+    """Is ``sid`` the protagonist: the glossary's ``player.speaker_id``, or a speaker whose raw name is an interpolation
+    (``Character("[player_name]")``: the name the player typed)."""
+    pid = str(((gloss.get("player") or {}) if isinstance(gloss.get("player"), dict) else {}).get("speaker_id") or "").strip()
+    return bool(sid and sid not in ("narrator", VOICE_OVER) and ((pid and sid == pid) or "[" in (speaker_raw or "")))
+
+
+def row_gender(sid: str, speaker_raw: str | None, chars: dict[str, Character], gloss: dict[str, Any]) -> str:
+    """The gender a row shows: narration and the protagonist's own lines take the player's gender when it is known (first-person
+    narration is the player's voice; third-person narration does not care), every other speaker their own."""
+    pg = player_of(gloss)["gender"]
+    if pg in ("m", "f") and (sid == "narrator" or is_player(sid, speaker_raw, gloss)):
+        return pg
+    return _gender_of(sid, chars, gloss)
 
 
 def _display_name(sid: str, l: LineRecord, chars: dict[str, Character], gloss: dict[str, Any]) -> str:
@@ -187,12 +213,15 @@ def _delivery_object_doc() -> str:
     )
 
 
-def delivery_rules() -> list[str]:
-    """Prompt lines that ask for the ``delivery`` object (only added to batches that contain target lines)."""
+def delivery_rules(scene_lines: bool = True) -> list[str]:
+    """Prompt lines that ask for the ``delivery`` object (only added to batches that contain target lines). ``scene_lines``: the
+    request carries the ``scene_lines`` block (narration is not among the translated lines); else the batch and the previous lines
+    already hold the narration around the line."""
+    where = "in 'scene_lines'" if scene_lines else "(the other input lines and the previous lines, narration included)"
     return [
         '- Lines with "want_delivery": true are spoken by a character nobody voices yet. For those lines also give '
         f"'delivery': an object describing HOW the line is spoken: {_delivery_object_doc()}. 'other' means expressive without a specific emotion.",
-        "- Decide the delivery from the line itself, from the neighbouring lines in 'scene_lines' (narration often says how a "
+        f"- Decide the delivery from the line itself, from the neighbouring lines {where} (narration often says how a "
         "line is spoken: shouted, whispered, through tears ...) and from the character sheet.",
         f"- When nothing in the text or the surrounding narration indicates a delivery, answer {_NEUTRAL_ANSWER} -- low confidence. "
         "Do not invent drama.",
@@ -294,6 +323,15 @@ def sound_rules(tgt: str) -> list[str]:
     ]
 
 
+_SOUND_HINT = re.compile(r"[*(（]")  # a stage direction (*yawns*, (laughs)); not "[": that is a Ren'Py interpolation
+
+
+def sound_candidate(text: str) -> bool:
+    """Might ``text`` be or hold a non-speech sound: the rules find one, it is a few characters long, or it has a stage direction."""
+    t = (text or "").strip()
+    return bool(t) and (len(t) <= _SOUND_ONLY_MAX_CHARS or bool(_SOUND_HINT.search(t)) or sounds.summarize(t, "auto") is not None)
+
+
 def craft_rules(tgt: str, gloss: dict[str, Any], batch: list[dict[str, Any]]) -> list[str]:
     """Fixed craft rules of the translation prompt (the glossary's ``style_rules`` come before them)."""
     ru = tgt == "ru"
@@ -303,13 +341,25 @@ def craft_rules(tgt: str, gloss: dict[str, Any], batch: list[dict[str, Any]]) ->
     out = [
         "- The speaker's gender decides grammatical agreement (past tense, adjectives) when the speaker talks about themself.",
         player_rule(tgt, gloss),
+    ]
+    if any(b.get("speaker_id") == "narrator" or b.get("player") for b in batch):
+        out.append('- Narration written in the first person and lines marked "player": true are the player\'s own words: their first person '
+                   "agrees with the player's gender (the gender given in their row).")
+    if any(b.get("gender") == "unknown" and b.get("speaker_id") not in ("narrator", None) for b in batch):
+        out.append("- A speaker of gender unknown: decide the gender from the scene (he/she in the narration, how the others address them) "
+                   "and keep that choice for every line of the scene.")
+    out += [
         f"- Translate idioms by meaning, never word for word{idiom_eg}; keep every clause of the source, omit nothing.",
         f"- Laughter and sounds use the standard {lang} spelling{sound_eg}, never a letter-by-letter transliteration.",
         "- Spell names of characters and places exactly as the Characters and Terms lists say; never mix scripts inside a word.",
     ]
-    out += sound_rules(tgt)
+    if any(sound_candidate(b.get("text") or "") for b in batch):  # a third of the prompt: only where a sound may be (round 18)
+        out += sound_rules(tgt)
     if ru:
         out.append("- Write the letter ё wherever the word has it (ещё, всё, моё, тёмном, насчёт, найдёшь); never е for ё.")
+        # num2words cannot decline ("С 3 друзьями" -> "С три друзьями"); the model can, and the voice reads what it wrote
+        out.append("- Write numbers in words, declined to fit the sentence (с тремя друзьями, в тысяча девятьсот девяносто девятом году), "
+                   "except clock times and scores (7:30, 2:1).")
     if any(b.get("kind") == "player_choice" for b in batch):
         out.append('- Items with "kind": "player_choice" are options the player picks in a menu: translate them as short phrases in the player\'s voice.')
     if any(b.get("previous_answer") for b in batch):
@@ -317,16 +367,67 @@ def craft_rules(tgt: str, gloss: dict[str, Any], batch: list[dict[str, Any]]) ->
     return out
 
 
-def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gloss: dict[str, Any], chars: dict[str, Character], short_words: int, delivery: bool = False, src: str = "ja") -> str:
-    lang = LANG_NAMES.get(tgt, tgt)
+def glossary_parts(batch: list[dict[str, Any]], speakers: list[str], gloss: dict[str, Any], chars: dict[str, Character], delivery: bool = False, src: str = "ja") -> dict[str, Any]:
+    """The lines of a batch's prompt that come from the glossary and the character sheet, and nothing else.
+
+    :func:`system_prompt` prints them; the same dict is the glossary part of the batch's cache key (:func:`batch_glossary_slice`),
+    so an edit of the glossary re-translates only the batches whose prompt it changes, not the whole game (round 18)."""
     text_all = " ".join(b["text"] for b in batch)
-    rules = list(gloss.get("style_rules") or DEFAULT_RULES)
+    # the old default "Keep character names exactly as listed in the glossary" repeats the craft rule on names (seeded glossaries hold it)
+    rules = [r for r in (gloss.get("style_rules") or DEFAULT_RULES) if r != _DUP_NAMES_RULE]
+    hon_lines: list[str] = []
+    hon = gloss.get("honorifics")
+    if hon and (src in ("ja", "auto") or _HONORIFIC_SUFFIX.search(text_all)):  # an English script without -san needs no such line
+        policy = {"drop": "drop Japanese honorifics (-san, -chan, -kun)", "transliterate": "transliterate honorifics (-сан, -тян, -кун)", "map": "render honorifics with the mapping below"}.get(str(hon), str(hon))
+        hon_lines.append(f"- Honorifics: {policy}.")
+        hmap = gloss.get("honorific_map") or {}
+        used = {k: v for k, v in hmap.items() if k in text_all and v}
+        if used:
+            hon_lines.append("  Honorific mapping: " + "; ".join(f"{k} -> {v}" for k, v in used.items()))
+    matrix = gloss.get("address_matrix") or {}
+    addr = []
+    for sid in speakers:
+        forms = [(k, v) for k, v in (matrix.get(sid) or {}).items() if v]
+        if forms:  # display names, not ids, and no "default" (round 18)
+            who = _sid_name(sid, chars, gloss)
+            addr.append(who + " says " + ", ".join(f"'{v}' to everyone" if k == "default" else f"'{v}' to {_sid_name(k, chars, gloss)}" for k, v in forms))
+    terms = [t for t in (gloss.get("terms") or []) if t and str(t.get("src", "")) and term_in(str(t["src"]), text_all)]
+    return {
+        "rules": rules,
+        "player": player_of(gloss),
+        "honorifics": hon_lines,
+        "address": addr,
+        "characters": _character_lines(speakers, text_all, gloss, chars, delivery),
+        "terms": [f"  - {t['src']} -> {t.get('tgt', '')}" + (f" ({t['notes']})" if t.get("notes") else "") for t in terms],
+    }
+
+
+_DUP_NAMES_RULE = "Keep character names exactly as listed in the glossary."
+_HONORIFIC_SUFFIX = re.compile(r"-(?:san|chan|kun|sama|senpai|sempai|sensei|tan|dono|chin)(?![A-Za-z])", re.I)
+
+
+def _sid_name(sid: str, chars: dict[str, Character], gloss: dict[str, Any]) -> str:
+    gc = (gloss.get("characters") or {}).get(sid) or {}
+    c = chars.get(sid)
+    return str(gc.get("tgt") or (c.names.get("tgt") if c else "") or gc.get("src") or (c.names.get("src") if c else "") or sid)
+
+
+def batch_glossary_slice(batch: list[dict[str, Any]], gloss: dict[str, Any], chars: dict[str, Character], src: str = "ja") -> str:
+    """Hash of :func:`glossary_parts` for ``batch``: the glossary part of its cache key (the whole glossary used to be hashed)."""
+    speakers = sorted({b.get("speaker_id", "") for b in batch})
+    delivery = any(b.get("want_delivery") for b in batch)
+    return hash_obj(glossary_parts(batch, speakers, gloss, chars, delivery, src))
+
+
+def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gloss: dict[str, Any], chars: dict[str, Character], short_words: int, delivery: bool = False, src: str = "ja", scene_lines: bool = True) -> str:
+    lang = LANG_NAMES.get(tgt, tgt)
+    parts = glossary_parts(batch, speakers, gloss, chars, delivery, src)
     out = [
         f"You are a professional game localizer translating a visual novel from {language_name(src)} into {lang}.",
         "Rules:",
-        *[f"- {r}" for r in rules],
+        *[f"- {r}" for r in parts["rules"]],
         *craft_rules(tgt, gloss, batch),
-        f"- For each line give '{tgt}': the full translation; '{tgt}_short': a version at least 20% shorter when the translation has more than {short_words} words (otherwise repeat the full translation); 'notes': a delivery hint of at most 6 words in English (for example: teasing, rising at the end).",
+        f"- For each line give '{tgt}': the full translation; '{tgt}_short' only when the translation has more than {short_words} words: a version at least 20% shorter (leave '{tgt}_short' out otherwise); 'notes': a delivery hint of at most 6 words in English (for example: teasing, rising at the end).",
         f"- Answer with JSON only: {{\"lines\": [{{\"id\": \"...\", \"{tgt}\": \"...\", \"{tgt}_short\": \"...\", \"notes\": \"...\"}}]}} containing exactly one entry for every input id.",
     ]
     if delivery:
@@ -334,28 +435,17 @@ def system_prompt(tgt: str, batch: list[dict[str, Any]], speakers: list[str], gl
             f'- Answer with JSON only: {{"lines": [{{"id": "...", "{tgt}": "...", "{tgt}_short": "...", "notes": "...", '
             '"delivery": {...} (only for lines with want_delivery)}]} containing exactly one entry for every input id.'
         )
-        out += delivery_rules()
-    hon = gloss.get("honorifics")
-    if hon:
-        policy = {"drop": "drop Japanese honorifics (-san, -chan, -kun)", "transliterate": "transliterate honorifics (-сан, -тян, -кун)", "map": "render honorifics with the mapping below"}.get(str(hon), str(hon))
-        out.append(f"- Honorifics: {policy}.")
-        hmap = gloss.get("honorific_map") or {}
-        used = {k: v for k, v in hmap.items() if k in text_all and v}
-        if used:
-            out.append("  Honorific mapping: " + "; ".join(f"{k} -> {v}" for k, v in used.items()))
-    matrix = gloss.get("address_matrix") or {}
-    addr = [f"{sid}: " + ", ".join(f"to {k} '{v}'" for k, v in (matrix.get(sid) or {}).items()) for sid in speakers if matrix.get(sid)]
-    if addr:
-        out.append("- Address forms (speaker: listener -> form):")
-        out += [f"  {a}" for a in addr]
-    names = _character_lines(speakers, text_all, gloss, chars, delivery)
-    if names:
+        out += delivery_rules(scene_lines)
+    out += parts["honorifics"]
+    if parts["address"]:
+        out.append("- Address forms:")
+        out += [f"  {a}" for a in parts["address"]]
+    if parts["characters"]:
         out.append("Characters:")
-        out += names
-    terms = [t for t in (gloss.get("terms") or []) if t and str(t.get("src", "")) and str(t["src"]) in text_all]
-    if terms:
+        out += parts["characters"]
+    if parts["terms"]:
         out.append("Terms:")
-        out += [f"  - {t['src']} -> {t.get('tgt', '')}" + (f" ({t['notes']})" if t.get("notes") else "") for t in terms]
+        out += parts["terms"]
     return "\n".join(out)
 
 
@@ -550,7 +640,7 @@ class LlmTranslator:
         speakers = sorted({b["speaker_id"] for b in batch})
         visible = [{k: v for k, v in b.items() if k != "speaker_id"} for b in batch]
         delivery = any(b.get("want_delivery") for b in batch)
-        msgs = [{"role": "system", "content": system_prompt(self.tgt, batch, speakers, self.gloss, self.chars, self.t.short_variant_min_words, delivery, self.src)}]
+        msgs = [{"role": "system", "content": system_prompt(self.tgt, batch, speakers, self.gloss, self.chars, self.t.short_variant_min_words, delivery, self.src, bool(scene_context))}]
         msgs += self._context_messages(summary, context, scene_context)
         msgs.append({"role": "user", "content": "Translate these lines and answer with JSON only:\n" + json.dumps(visible, ensure_ascii=False)})
         return msgs
@@ -713,7 +803,8 @@ class LlmTranslator:
                 "content": (
                     f"You are a localization editor for a {src} visual novel{title}. For every proper noun in the list give its canonical {lang} "
                     f"spelling as used by the official or best-known {lang} localization of that setting (the game title and the characters tell "
-                    f"you the setting). Write it in the {lang} alphabet. Skip words that are not names. "
+                    f"you the setting); if you do not know an established spelling, transliterate. Write it in the {lang} alphabet. "
+                    "Leave out every word that is not a proper name (darling, professor, oops, a language or a common noun). "
                     'Answer with JSON only: {"names": [{"src": "...", "tgt": "..."}]}.'
                 ),
             },
@@ -739,6 +830,51 @@ class LlmTranslator:
             return {}, False
         return got, True
 
+    def guess_genders(self, items: list[dict[str, Any]]) -> tuple[dict[str, str], bool]:
+        """``({speaker_id: m | f}, from_model)``: the gender of characters nobody set, asked in one request (temperature 0) from the
+        name, the character's own lines and how the others refer to them. "unknown" answers are dropped."""
+        if self.name.startswith("mock") or not items:
+            return {}, False
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    f"You read the script of a {language_name(self.src)} visual novel. For every character decide the gender from the name, "
+                    "the character's own lines and how the others refer to them (he/she, his/her, titles, gendered word forms). "
+                    'Answer "unknown" when the text does not tell. Answer with JSON only: {"genders": [{"id": "...", "gender": "m|f|unknown"}]}.'
+                ),
+            },
+            {"role": "user", "content": json.dumps(items, ensure_ascii=False)},
+        ]
+        self._count("calls")
+        content: Any = None
+        try:
+            content = self.backend.chat(msgs, temperature=0.0, max_tokens=max(256, 24 * len(items) + 64), json_mode=True, seed=1234, **self._extra())
+        except BackendUnavailable:
+            self.ctx.check_cancel()
+            raise
+        except Exception as e:
+            self.ctx.check_cancel()
+            dead = self._dead_reason(e)
+            if dead:
+                raise StageError(f"the translation model {self.name} stopped answering: {dead}. See work/logs/llama_server.log; the lines already translated are kept") from e
+            self.ctx.log.warning("gender request failed (%s): %s", self.name, e)
+            return {}, True  # remembered as "no guess": a living server's error must not load the model on every later cached run
+        data = _json_object(content) if isinstance(content, str) else None
+        rows = data.get("genders") if isinstance(data, dict) else data
+        ids = {str(i["id"]) for i in items}
+        out: dict[str, str] = {}
+        for r in rows if isinstance(rows, list) else []:
+            if isinstance(r, dict) and str(r.get("id", "")) in ids:
+                g = str(r.get("gender") or "").strip().lower()[:1]
+                if g in ("m", "f"):
+                    out[str(r["id"])] = g
+        if not isinstance(rows, list):
+            # an answer that says nothing is remembered as "no guess" (True): asking it again every run would load the model for
+            # an otherwise cached run (a living server that raised is treated the same, above)
+            self._log_answer("genders", sorted(ids), 0, 0.0, content)
+        return out, True
+
 
 def derived_summary(scene: str, rows: list[dict[str, Any]]) -> str:
     speakers = list(dict.fromkeys(r["speaker"] for r in rows if r["speaker"] != "narrator"))
@@ -760,6 +896,14 @@ _NAME_STOP = {
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "january", "february", "march", "april", "may", "june", "july",
     "august", "september", "october", "november", "december", "christmas", "god", "lord", "what", "why", "how", "who", "where", "when", "now", "then",
     "maybe", "just", "wait", "stop", "ugh", "huh", "wow", "ahh", "ohh", "hehe", "haha", "muah", "zzz",
+    # round 18: address words, titles, languages and interjections a 9B model turned into "canonical names" (Darling -> Дорогой
+    # then fought the player's gender rule)
+    "darling", "honey", "dear", "sweetie", "sweetheart", "babe", "baby", "sis", "bro", "brother", "sister", "mother", "father", "grandma",
+    "grandpa", "senpai", "sempai", "sensei", "sama", "professor", "teacher", "doctor", "captain", "boss", "master", "lady", "princess",
+    "prince", "king", "queen", "english", "japanese", "russian", "chinese", "french", "german", "nope", "yep", "yup", "oops", "whoa",
+    "woah", "yay", "shit", "damn", "dammit", "geez", "jeez", "gosh", "crap", "hell", "um", "uh", "eh", "hmph", "ow", "ouch", "aww", "ooh",
+    "alright", "sure", "fine", "good", "great", "right", "really", "seriously", "anyway", "look", "listen", "come", "let", "here", "there",
+    "everyone", "nothing", "something", "today", "tomorrow", "yesterday", "tonight", "morning", "evening", "night",
 }
 
 
@@ -777,9 +921,10 @@ def _name_tokens(text: str) -> Iterator[tuple[str, bool]]:
 
 
 def collect_name_candidates(texts: Iterable[str], known: Iterable[str] = (), limit: int = NAMES_MAX) -> list[str]:
-    """Proper-noun candidates of a script: capitalised words that are not at a sentence start, plus capitalised words that occur twice
-    or more anywhere; minus a small stop list, minus words the script also writes in lower case ("Maybe"/"maybe"), minus ``known``
-    (character names). Scripts without letter case (Japanese ...) give nothing. Most frequent first, at most ``limit``."""
+    """Proper-noun candidates of a script: capitalised words seen at least once NOT at a sentence start (round 18: a word seen twice at
+    sentence starts only, "Nope." / "Oops.", no longer counts); minus a stop list, minus words the script also writes in lower case
+    ("Maybe"/"maybe"), minus ``known`` and every word of it (character names, the glossary terms: "Scarlet" of "Scarlet Devil
+    Mansion" is not asked on its own). Scripts without letter case (Japanese ...) give nothing. Most frequent first, at most ``limit``."""
     seen: Counter[str] = Counter()
     mid: Counter[str] = Counter()
     lower: set[str] = set()
@@ -797,7 +942,7 @@ def collect_name_candidates(texts: Iterable[str], known: Iterable[str] = (), lim
     skip = {k.casefold() for k in known if k} | _NAME_STOP
     for k in list(skip):
         skip.update(k.split())
-    out = [t for t, n in seen.items() if (mid[t] >= 1 or n >= 2) and t.casefold() not in skip and t.casefold() not in lower]
+    out = [t for t in seen if mid[t] >= 1 and t.casefold() not in skip and t.casefold() not in lower]
     out.sort(key=lambda t: (-seen[t], t))
     return out[:limit]
 
@@ -818,20 +963,41 @@ def parse_names(content: Any) -> dict[str, str]:
     return out
 
 
-def merge_names(gloss: dict[str, Any], answers: dict[str, str]) -> list[dict[str, Any]]:
+def merge_names(gloss: dict[str, Any], answers: dict[str, str], deleted: Iterable[str] = ()) -> list[dict[str, Any]]:
     """Add the model's spellings to ``gloss["terms"]`` as ``{src, tgt, notes: "auto"}``. A term that exists already (the user's, or an
-    earlier auto one) is never touched; an answer equal to its source says nothing and is dropped. Returns the terms added."""
+    earlier auto one) is never touched; an answer equal to its source says nothing and is dropped; so is a lower-case answer (a common
+    noun, not a name) and a source the user deleted from the glossary editor (``deleted``). Returns the terms added."""
     terms = [t for t in (gloss.get("terms") or []) if isinstance(t, dict)]
-    have = {str(t.get("src", "")).casefold() for t in terms}
+    have = {str(t.get("src", "")).casefold() for t in terms} | {str(d).casefold() for d in deleted}
     added: list[dict[str, Any]] = []
     for s, g in answers.items():
-        if s.casefold() in have or g.casefold() == s.casefold():
+        if s.casefold() in have or g.casefold() == s.casefold() or g[:1].islower():
             continue
         added.append({"src": s, "tgt": g, "notes": "auto"})
         have.add(s.casefold())
     if added:
         gloss["terms"] = [*(gloss.get("terms") or []), *added]
     return added
+
+
+AUTO_GLOSSARY = "glossary_auto.yaml"  # in the work folder: the names pass's spellings + the auto terms the user deleted
+
+
+def read_auto_glossary(work: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """``(auto terms, deleted sources)`` of ``work/glossary_auto.yaml`` (missing or broken file = nothing)."""
+    try:
+        data = yaml.safe_load((Path(work) / AUTO_GLOSSARY).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return [], []
+    if not isinstance(data, dict):
+        return [], []
+    terms = [t for t in data.get("terms") or [] if isinstance(t, dict) and str(t.get("src") or "").strip()]
+    deleted = [str(d) for d in data.get("deleted") or [] if str(d).strip()]
+    return terms, deleted
+
+
+def write_auto_glossary(work: Path, terms: list[dict[str, Any]], deleted: Iterable[str]) -> None:
+    write_yaml(Path(work) / AUTO_GLOSSARY, {"terms": list(terms), "deleted": sorted(dict.fromkeys(deleted), key=str.casefold)})
 
 
 def game_name(ctx: StageContext) -> str:
@@ -863,43 +1029,112 @@ def check_translation(src_text: str, tgt_text: str, tgt: str, src: str = "ja", t
     s, g = " ".join((src_text or "").split()), " ".join((tgt_text or "").split())
     if not g:
         return ""
-    if tgt in CYRILLIC_LANGS and _CYR.search(g):
-        for w in g.split():
+    terms = list(terms)
+    if tgt in CYRILLIC_LANGS:
+        g_scan = _TOKENS.sub(" ", g)  # [var] / {tag} are kept verbatim on purpose
+        for w in g_scan.split():
             if _CYR.search(w) and _LATIN_CH.search(w):
                 return "mixed_script"
-        allowed = {w.casefold() for w in _LATIN_RUN.findall(s)} | {w.casefold() for t in terms for w in _LATIN_RUN.findall(str(t.get("tgt", "")))}
-        for w in _LATIN_RUN.findall(g):
-            if w.casefold() not in allowed:
+        if src != tgt and g.casefold() == s.casefold() and sum(c.isalpha() for c in g) >= 4 and _LATIN_CH.search(g_scan):
+            return "untranslated"
+        # a Latin word in a Cyrillic target: allowed only when it is a glossary spelling, an abbreviation (OK, NASA) or a lower-case
+        # word of the source (iPhone-like brands); a capitalised one ("Kevin", "Minecraft") is a name left untranslated: the TTS then
+        # reads it as Latin and the CER check fails the take (round 18; also a translation without any Cyrillic is checked now)
+        spelled = {w.casefold() for t in terms for w in _LATIN_RUN.findall(str(t.get("tgt", "")))}
+        src_words = {w.casefold() for w in _LATIN_RUN.findall(_TOKENS.sub(" ", s))}
+        for w in _LATIN_RUN.findall(g_scan):
+            if w.casefold() in spelled or w.isupper():
+                continue
+            if w[0].isupper() or w.casefold() not in src_words:
                 return "latin_run"
-    if src != tgt and len(g.split()) >= 2 and g.casefold() == s.casefold() and sum(c.isalpha() for c in g) >= 6:
+    elif src != tgt and len(g.split()) >= 2 and g.casefold() == s.casefold() and sum(c.isalpha() for c in g) >= 6:
         return "untranslated"
+    need = Counter(_INTERP.findall(s))
+    have = Counter(_INTERP.findall(g))
+    if any(have[k] < n for k, n in need.items()):
+        return "lost_token"
+    if _lost_numbers(s, g, tgt):
+        return "lost_number"
+    if src not in CJK_LANGS and len(s.split()) >= 6 and len(g) / max(1, len(s)) < OMITTED_RATIO:
+        return "omitted"
     return ""
+
+
+OMITTED_RATIO = 0.45  # target/source length under this for a source of 6+ words: a clause was dropped ("How are you doing today, my friend?" -> "Привет.")
+_INTERP = re.compile(r"\[[^\[\]]+\]")  # Ren'Py interpolations ([player_name]): the text patch drops a line that loses one
+_TOKENS = re.compile(r"\[[^\[\]]+\]|\{[^{}]+\}")
+_DIGITS = re.compile(r"\d+")
+#: Russian numeral word stems: a source number may be written in words (the prompt asks for that), "3" -> "тремя"
+_RU_NUMERAL = re.compile(
+    r"(?<![а-яё])(?:ноль|нул|од[иноу]|одн|перв|дв[аеуо]|втор|тр[иеё]|трет|четыр|четв|пят|шест|сем[ьи]|седьм|восем|восьм|девят|десят|"
+    r"сорок|девяност|сот|ст[оа]|тысяч|миллион|миллиард|полтор|пол)", re.I,
+)
+
+
+def _lost_numbers(src_text: str, tgt_text: str, tgt: str) -> bool:
+    """A digit run of the source that is neither in the translation as digits nor covered by a numeral word (Russian)."""
+    src_text, tgt_text = unicodedata.normalize("NFKC", src_text), unicodedata.normalize("NFKC", tgt_text)  # １００ = 100
+    missing = [d for d in dict.fromkeys(_DIGITS.findall(_TOKENS.sub(" ", src_text))) if d not in _DIGITS.findall(tgt_text)]
+    if not missing:
+        return False
+    words = len(_RU_NUMERAL.findall(tgt_text.casefold())) if tgt == "ru" else 0
+    return len(missing) > words
 
 
 _FIX_NOTE = {
     "mixed_script": "a word mixes Latin and Cyrillic letters; fix the spelling, write names in the target alphabet exactly as the Terms say",
-    "latin_run": "the answer contains Latin letters that are not in the source line; spell it in the target alphabet",
+    "latin_run": "the answer contains Latin letters: write names and words in the target alphabet (names exactly as the Terms say)",
     "untranslated": "the answer is the source text again; translate it",
+    "lost_token": "keep every [name] in square brackets exactly as the source writes it (the game fills it in); do not translate it",
+    "lost_number": "keep every number of the source (in words, declined to fit the sentence)",
+    "omitted": "the answer leaves out part of the line: translate every clause",
 }
 
 
+def _fix_note(why: str, src_text: str = "", terms: Iterable[dict[str, Any]] = ()) -> str:
+    """The "fix" note of a re-asked line (a glossary miss names the spellings it must use)."""
+    if why == "glossary_miss":
+        terms = list(terms)
+        miss = glossary_missing(src_text, "", terms)
+        spell = ", ".join(f"{m} -> {next((str(t.get('tgt')) for t in terms if t.get('src') == m), '')}" for m in miss)
+        return f"use the glossary spelling ({spell}); change nothing else"
+    return _FIX_NOTE.get(why, "the answer is wrong; translate the line again")
+
+
 def _stem(term: str) -> str:
-    """The part of a glossary spelling that survives declension: a name ending in -а/-я/-ь/-й loses that letter, every other spelling
-    (Генсокё, Пачули, Рейму: they do not decline) must appear as it is -- also with its ё, which is the point of writing it."""
+    """The part of a glossary spelling that survives declension: a name ending in -а/-я/-ь/-й loses that letter (from 3 letters on:
+    Мия -> Мию, Мией), every other spelling (Генсокё, Пачули, Рейму: they do not decline) must appear as it is -- also with its ё,
+    which is the point of writing it."""
     t = term.casefold()
-    return t[:-1] if len(t) >= 5 and t[-1] in "аяьй" else t
+    return t[:-1] if len(t) >= 3 and t[-1] in "аяьй" else t
+
+
+def _spaced(ch: str) -> bool:
+    """A letter of a script that separates words with spaces (Latin, Cyrillic ...): word boundaries apply. Kana / han / hangul: no."""
+    return ch.isalnum() and not ("぀" <= ch <= "ヿ" or "㐀" <= ch <= "鿿" or "가" <= ch <= "힯" or "＀" <= ch <= "￯")
+
+
+def _term_rx(term: str, end: bool = True) -> re.Pattern[str]:
+    left = r"(?<!\w)" if term and _spaced(term[0]) else ""
+    right = r"(?!\w)" if end and term and _spaced(term[-1]) else ""
+    return re.compile(left + re.escape(term) + right, re.I)
+
+
+def term_in(term: str, text: str) -> bool:
+    """``term`` occurs in ``text`` as a whole word, case-insensitive ("Ann" is not in "Annoying", "Oak" not in "soak"); Japanese and
+    the like match as a substring (no spaces between their words)."""
+    return bool(term) and _term_rx(term).search(text or "") is not None
 
 
 def glossary_missing(src_text: str, tgt_text: str, terms: Iterable[dict[str, Any]]) -> list[str]:
-    """Sources of glossary terms that occur in ``src_text`` while their spelling is absent from ``tgt_text`` (declension tolerated)."""
-    low_src = (src_text or "").casefold()
-    low_tgt = (tgt_text or "").casefold()
+    """Sources of glossary terms that occur in ``src_text`` while their spelling is absent from ``tgt_text`` (declension tolerated:
+    the spelling's stem must start a word of the translation)."""
     out: list[str] = []
     for t in terms:
         s, g = str((t or {}).get("src") or ""), str((t or {}).get("tgt") or "")
-        if not s or not g or s.casefold() not in low_src:
+        if not s or not g or not term_in(s, src_text):
             continue
-        if _stem(g) not in low_tgt:
+        if not _term_rx(_stem(g), end=False).search(tgt_text or ""):
             out.append(s)
     return out
 
@@ -1154,6 +1389,30 @@ def laughter_flags(text: str | None) -> list[str]:
     return ["laughter", "interjection"] if laughter.is_laughter_only(t, "auto") else ["laughter"]
 
 
+def retag_laughter_flags(flags: list[str], text: str) -> list[str]:
+    """``flags`` after the dialogue text became ``text`` (a user's edit): ``laughter`` / ``interjection`` follow the new text, every
+    other flag stays. ``interjection`` is kept when the old flags show it did not come from a laugh (a kana interjection carries it
+    without ``laughter``): only a laughter-derived one is recomputed. The kept flags keep their order; the new ones are appended."""
+    was_laugh = "laughter" in flags
+    kept = [f for f in flags if f != "laughter" and not (f == "interjection" and was_laugh)]
+    return kept + [f for f in laughter_flags(text) if f not in kept]
+
+
+def user_texts(ctx: StageContext) -> dict[str, str]:
+    """``{line_id: text}`` of the latest ``set_text`` override per line (the text the user wrote in the review)."""
+    from vndub.manifest.io import load_overrides
+
+    path = ctx.paths.overrides
+    if not path.exists():
+        return {}
+    out: dict[str, str] = {}
+    for lid, ovs in load_overrides(path).items():
+        last = next((o for o in reversed(ovs) if o.action == "set_text" and isinstance(o.payload.get("text"), str) and o.payload["text"].strip()), None)
+        if last is not None:
+            out[lid] = str(last.payload["text"])
+    return out
+
+
 _SOUND_END = ".!?…。！？"
 _SOUND_TRAIL = re.compile(r"([.!?…。！？]+)[\s\"'«»“”」』)\]*]*$")
 _SOUND_PUNCT = {"。": ".", "！": "!", "？": "?"}
@@ -1209,12 +1468,14 @@ def finalize(rec: TranslationRecord, tgt: str, stresser: Any, fmt: str, plus: bo
         rec.text_tts = rec.text_tts_short = rec.text_plain = ""
         return
     if "sound_spelled" in rec.flags:  # the table's spelling is final: ruaccent must not mark "Хр-р-р", numbers and the like do not apply
-        rec.text_tts = rec.text_tts_short = rec.text_plain = " ".join(rec.text_tgt.split())
+        # the spelling is the extra ``sound_spelling`` (round 18; a record of 1.1.0 had it in text_tgt itself)
+        spelled = str((rec.model_extra or {}).get("sound_spelling") or rec.text_tgt)
+        rec.text_tts = rec.text_tts_short = rec.text_plain = " ".join(spelled.split())
         if tgt == "ru":
             rec.text_plain_short = rec.text_tts
             if plus:
                 rec.text_tts_plus = rec.text_tts_short_plus = rec.text_tts
-        rec.syllables = ru.count_syllables(rec.text_tgt)
+        rec.syllables = ru.count_syllables(spelled)
         return
     if tgt != "ru":
         rec.text_tts = " ".join(rec.text_tgt.split())
@@ -1388,6 +1649,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
     entries: dict[str, dict[str, Any]] = {}
     flags: dict[str, list[str]] = {l.line_id: [] for l in lines}
     backend_name = ""
+    report: dict[str, Any] = {}  # filled by translate_llm (gender_guessed)
 
     # 1. interjections (kana-only short lines are Japanese by definition) and laughter (any language)
     for l in lines:
@@ -1426,7 +1688,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
     else:
         todo = [l for l in lines if l.line_id not in entries]
         if todo:
-            backend_name = translate_llm(ctx, todo, entries, flags, tgt, gloss, chars, delivery_ids & {l.line_id for l in todo}, src)
+            backend_name = translate_llm(ctx, todo, entries, flags, tgt, gloss, chars, delivery_ids & {l.line_id for l in todo}, src, report)
 
     # 3. records + post-processing
     plus = needs_plus(ctx) and tgt == "ru"
@@ -1471,7 +1733,9 @@ def run(ctx: StageContext) -> dict[str, Any]:
                         sounds_cache["table"] = sounds_table(ctx)
                     spelled = spell_sound_line(sounds_cache["table"], tgt, snd["kind"], e["text_tgt"], l.text_src) if sounds_cache["table"] else None
                     if spelled:
-                        e = {**e, "text_tgt": spelled, "text_tgt_short": spelled}
+                        # the spelling goes to the TTS fields only (finalize); text_tgt keeps the model's translation, which is what
+                        # the Ren'Py text patch shows ("Угу." must not turn into "М-м-м." on screen; round 18)
+                        e = {**e, "sound_spelling": spelled}
                         fl.append("sound_spelled")
         recs.append(
             TranslationRecord(
@@ -1485,6 +1749,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
                 **({"sound": snd} if snd else {}),
                 **({"delivery": e["delivery"]} if e.get("delivery") else {}),
                 **({"choices_tgt": choices_of[l.line_id]} if l.line_id in choices_of else {}),
+                **({"sound_spelling": e["sound_spelling"]} if e.get("sound_spelling") else {}),
             )
         )
 
@@ -1492,12 +1757,13 @@ def run(ctx: StageContext) -> dict[str, Any]:
     # player sees); the lines themselves are not touched
     src_text = {l.line_id: l.text_src for l in lines}
     terms = [x for x in (gloss.get("terms") or []) if isinstance(x, dict)]
-    glossary_misses = 0
+    miss_ids: list[str] = []
     for r in recs:
         if terms and r.source.startswith("llm") and "translate_failed" not in r.flags:
             miss = glossary_missing(src_text.get(r.line_id, ""), r.text_tgt, terms)
             if miss:
-                glossary_misses += 1
+                miss_ids.append(r.line_id)
+                r.flags.append("glossary_miss")  # on the record since round 18: the review and the job's warnings can name the line
                 ctx.log.warning("glossary: %s is translated without %s", r.line_id, ", ".join(f"{m} -> {next((x.get('tgt') for x in terms if x.get('src') == m), '')}" for m in miss))
 
     stresser, stress_backend, stress_reason = (None, "", "not russian") if tgt != "ru" else make_stresser(
@@ -1505,8 +1771,17 @@ def run(ctx: StageContext) -> dict[str, Any]:
     )
     if tgt == "ru" and stresser is None:
         ctx.log.warning("no stress marks: %s", stress_reason)
+        if stress_reason != "stress disabled":  # a missing ruaccent is a part of the work left out: the app shows it as a job warning
+            gu.record_unavailable(ctx, NAME, "stress", stress_reason)
     for r in recs:
         finalize(r, tgt, stresser, fmt, plus, t.stress.yo)
+
+    # a line the user rewrote in the review keeps the laughter flags of THAT text (the gates and the take count read the record; the
+    # app retags it when the text is saved, and before round 18 a later translate run undid that)
+    edited = user_texts(ctx)
+    for r in recs:
+        if r.line_id in edited:
+            r.flags = retag_laughter_flags(list(r.flags or []), edited[r.line_id])
 
     out_path = ctx.paths.translation(tgt)
     existing = {r.line_id: r for r in read_jsonl(out_path, TranslationRecord)} if out_path.exists() else {}
@@ -1529,9 +1804,12 @@ def run(ctx: StageContext) -> dict[str, Any]:
         "failed": sum(1 for r in recs if "translate_failed" in r.flags),
         "missing": sum(1 for r in recs if "translate_missing" in r.flags),
         "deliveries": sum(1 for r in recs if (r.model_extra or {}).get("delivery")),
-        "glossary_misses": glossary_misses,
+        "glossary_misses": len(miss_ids),
+        "glossary_miss_ids": miss_ids[:10],
         "check_failed": sum(1 for r in recs if "check_failed" in r.flags),
+        "check_failed_ids": [r.line_id for r in recs if "check_failed" in r.flags][:10],
         "names_auto": sum(1 for x in terms if x.get("notes") == "auto"),
+        "gender_guessed": report.get("gender_guessed", {}),
         "text_only": sum(1 for l in lines if text_only(l)),
         "choices_translated": len(choices_of),
         "stress": stress_backend or f"none ({stress_reason})",
@@ -1623,6 +1901,47 @@ def _llm_preferred(ctx: StageContext, key_backend: str) -> list[str]:
     return names[: names.index(key_backend)] if key_backend in names else []
 
 
+GENDER_SAMPLES = 4  # own lines and mentions shown per character in the gender request
+
+
+def gender_items(lines: list[LineRecord], sids: list[str], chars: dict[str, Character], gloss: dict[str, Any]) -> list[dict[str, Any]]:
+    """The gender request's items: ``{id, name, lines: [own lines], mentions: [lines of others that name them]}``."""
+    out: list[dict[str, Any]] = []
+    for sid in sids:
+        c = chars.get(sid)
+        gc = (gloss.get("characters") or {}).get(sid) or {}
+        name = str(gc.get("src") or (c.names.get("src") if c else "") or sid)
+        own = [l.text_src for l in lines if l.speaker_id == sid and (l.text_src or "").strip()][:GENDER_SAMPLES]
+        rx = re.compile(r"(?<!\w)" + re.escape(name) + r"(?!\w)", re.I) if len(name) >= 2 and name.isalpha() else None
+        mentions = [l.text_src for l in lines if rx and l.speaker_id != sid and rx.search(l.text_src or "")][:GENDER_SAMPLES] if rx else []
+        out.append({"id": sid, "name": name, "lines": own, "mentions": mentions})
+    return out
+
+
+def apply_gender_guesses(ctx: StageContext, chars: dict[str, Character], answers: dict[str, str]) -> dict[str, str]:
+    """Write the model's genders into ``characters.yaml`` (re-read now, so an edit made meanwhile is kept) and into ``chars`` (the
+    prompts of this run): only where the gender is still unknown and the user did not set it. Returns ``{sid: gender}`` written."""
+    from vndub.manifest.io import load_characters, save_characters
+
+    todo = {sid: g for sid, g in (answers or {}).items() if g in ("m", "f")}
+    if not todo:
+        return {}
+    path = ctx.paths.characters
+    disk = load_characters(path) if path.exists() else {}
+    applied: dict[str, str] = {}
+    for sid, g in todo.items():
+        for book in (disk, chars):
+            c = book.get(sid)
+            if c is None or c.gender != "unknown" or (c.model_extra or {}).get("gender_source") == "user":
+                continue
+            c.gender = g  # type: ignore[assignment]
+            setattr(c, "gender_source", "guess")
+            applied[sid] = g
+    if applied and disk:
+        save_characters(path, disk)
+    return applied
+
+
 def translate_llm(
     ctx: StageContext,
     todo: list[LineRecord],
@@ -1633,8 +1952,9 @@ def translate_llm(
     chars: dict[str, Character],
     delivery_ids: set[str] | None = None,
     src: str = "ja",
+    report: dict[str, Any] | None = None,
 ) -> str:
-    """Translate ``todo`` per scene. Lines in ``delivery_ids`` (unvoiced speaker lines) go in their own batches after
+    """Translate ``todo`` per scene (``report`` receives ``gender_guessed``). Lines in ``delivery_ids`` (unvoiced speaker lines) go in their own batches after
     the scene's regular ones and also return a ``delivery`` object (see the module docstring)."""
     t = ctx.cfg.translate
     delivery_ids = delivery_ids or set()
@@ -1649,6 +1969,7 @@ def translate_llm(
     for l in todo:
         scenes.setdefault(l.scene, []).append(l)
     scene_all = _scene_lines(ctx) if delivery_ids else {}
+    narration_in = include_narration(ctx)
 
     def row(l: LineRecord, want: bool = False) -> dict[str, Any]:
         # the emotion hint comes from an audio passport; delivery targets have none (a text passport would feed back)
@@ -1657,10 +1978,13 @@ def translate_llm(
             "id": l.line_id,
             "speaker": _display_name(l.speaker_id, l, chars, gloss),
             "speaker_id": l.speaker_id,
-            "gender": _gender_of(l.speaker_id, chars, gloss),
-            "emotion": style.get("emotion", ""),
+            "gender": row_gender(l.speaker_id, l.speaker_raw, chars, gloss),
             "text": l.text_src,
         }
+        if style.get("emotion"):  # an empty field is tokens for nothing (round 18)
+            r["emotion"] = style["emotion"]
+        if is_player(l.speaker_id, l.speaker_raw, gloss):
+            r["player"] = True
         if want:
             r["want_delivery"] = True
         return r
@@ -1689,16 +2013,6 @@ def translate_llm(
                 translator.summary_lines = max(10, round(80 * scale))
             return translator
 
-    def context_before(scene: str, line_id: str) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for l in scene_all.get(scene, []):
-            if l.line_id == line_id:
-                break
-            e = entries.get(l.line_id)
-            if e is not None and e.get("text_tgt"):
-                out.append({"speaker": _display_name(l.speaker_id, l, chars, gloss), "text": l.text_src, tgt: e["text_tgt"]})
-        return out[-window_lines:] if window_lines else []
-
     llm = t.llm
     key_backend = _llm_key_backend(ctx)
     # cache entries of a model the user prefers over the one that runs now stay readable (labelled with their own model)
@@ -1723,24 +2037,27 @@ def translate_llm(
         return None
 
     player_gender = player_of(gloss)["gender"]
+    summaries: dict[str, str] = {}  # scene -> the summary its batches were translated with (the recheck reuses it)
 
     def scene_rows(scene_lines: list[LineRecord]) -> list[dict[str, Any]]:
+        # every line in script order, the delivery targets (lines nobody voices) included with "want_delivery": before round 18 they
+        # went in batches of their own after the scene, so the voiced lines were translated without the turns between them
         out: list[dict[str, Any]] = []
         for l in scene_lines:
             if l.line_id in delivery_ids:
+                out.append(row(l, True))
                 continue
             if "menu" in l.flags:  # a menu record: each choice is an item of its own (`<line_id>#c<i>`), spoken by the player
                 for i, c in enumerate(l.choices or []):
                     out.append({"id": choice_id(l.line_id, i), "speaker": "player", "speaker_id": "narrator", "gender": player_gender,
-                                "emotion": "", "text": c, "kind": "player_choice"})
+                                "text": c, "kind": "player_choice"})
                 continue
             out.append(row(l))
         return out
 
     def do_scene(scene: str, scene_lines: list[LineRecord]) -> None:
         rows = scene_rows(scene_lines)
-        t_rows = [row(l, True) for l in scene_lines if l.line_id in delivery_ids]
-        summary_rows = rows or t_rows
+        summary_rows = rows
 
         def summary_key(model: str) -> str:
             return store.key("summary", model, scene, [r["text"] for r in summary_rows])
@@ -1750,26 +2067,39 @@ def translate_llm(
 
         def ensure_summary(tr: LlmTranslator) -> str:
             nonlocal summary
+            if summary is None and len(rows) <= batch_lines:
+                summary = ""  # the scene is one batch: the model sees all of it, a summary call would add nothing (round 18)
             if summary is None:
                 text, from_model = tr.summarize_checked(scene, summary_rows)
                 summary = text
                 if from_model:  # the derived fallback serves this scene's batches now and is never stored
                     store.put(f"summary:{scene}", summary_key(tr.name), text)  # under the key of the model that wrote it
+            summaries[scene] = summary
             return summary
+
+        if summary is not None:
+            summaries[scene] = summary
 
         for i in range(0, len(rows), batch_lines):
             batch = rows[i : i + batch_lines]
             context = history[-window_lines:] if window_lines else []
-            def bkey(model: str, batch: list[dict[str, Any]] = batch, context: list[dict[str, Any]] = context) -> str:
-                return store.key(TRANSLATE_PROTOCOL, model, src, tgt, gloss_hash, batch, context, llm.temperature)
+            want = [b["id"] for b in batch if b.get("want_delivery")]
+            # the script around the delivery targets, only when narration is not translated with them (then it is in the batch)
+            sc = _delivery_scene_context(scene_all.get(scene, []), want, ctx.cfg.text_emotion.llm_context_lines, chars, gloss) if want and not narration_in else None
+
+            def bkey(model: str, batch: list[dict[str, Any]] = batch, context: list[dict[str, Any]] = context, sc: Any = sc) -> str:
+                # the glossary enters as the slice this batch's prompt shows (an unrelated glossary edit keeps the batch)
+                return store.key(TRANSLATE_PROTOCOL, DELIVERY_PROTOCOL if sc is not None or any(b.get("want_delivery") for b in batch) else "",
+                                 model, src, tgt, batch_glossary_slice(batch, gloss, chars, src), batch, context, sc, llm.temperature)
 
             item_id = f"batch:{scene}:{batch[0]['id']}:{len(batch)}"
             got = cached(item_id, bkey)
-            if got is None:
+            missing = batch if got is None else [b for b in batch if b["id"] not in got]
+            if missing:
+                # a partial answer is kept: a re-run asks only for the lines still missing, not the whole batch again
                 tr = get_translator()
-                got = tr.translate(batch, context, ensure_summary(tr))
-                if len(got) == len(batch):
-                    store.put(item_id, bkey(tr.name), got)  # under the key of the model that wrote it
+                got = {**(got or {}), **tr.translate(missing, context, ensure_summary(tr), sc)}
+                store.put(item_id, bkey(tr.name), got)  # under the key of the model that wrote it
                 store.save()
             with lock:
                 for b in batch:
@@ -1780,29 +2110,6 @@ def translate_llm(
                     entries[b["id"]] = {**e, "source": e.get("source") or f"llm:{key_backend}"}
                     history.append({"speaker": b["speaker"], "text": b["text"], tgt: e["text_tgt"]})
             tick(len(batch), batch[-1]["id"])
-        # delivery stream: lines nobody voices, translated with the surrounding script as context
-        for i in range(0, len(t_rows), batch_lines):
-            batch = t_rows[i : i + batch_lines]
-            with lock:
-                context = context_before(scene, batch[0]["id"])
-            sc = _delivery_scene_context(scene_all.get(scene, []), [b["id"] for b in batch], ctx.cfg.text_emotion.llm_context_lines, chars, gloss)
-            def dkey(model: str, batch: list[dict[str, Any]] = batch, context: list[dict[str, Any]] = context, sc: list[dict[str, Any]] = sc) -> str:
-                return store.key(DELIVERY_PROTOCOL, TRANSLATE_PROTOCOL, model, src, tgt, gloss_hash, batch, context, sc, llm.temperature)
-
-            item_id = f"batch:{scene}:{batch[0]['id']}:{len(batch)}:delivery"
-            got = cached(item_id, dkey)
-            if got is None:
-                tr = get_translator()
-                got = tr.translate(batch, context, ensure_summary(tr), sc)
-                if len(got) == len(batch):
-                    store.put(item_id, dkey(tr.name), got)
-                store.save()
-            with lock:
-                for b in batch:
-                    e = got.get(b["id"])
-                    if e is not None:
-                        entries[b["id"]] = {**e, "source": e.get("source") or f"llm:{key_backend}"}
-            tick(len(batch), batch[-1]["id"])
 
     def names_pass() -> None:
         """Ask the model ONCE for the canonical target spelling of the script's proper nouns and add them to the glossary terms."""
@@ -1811,7 +2118,7 @@ def translate_llm(
             return
         known = [str(v) for c in chars.values() for v in (c.names or {}).values()] + [
             str((gc or {}).get(k) or "") for gc in (gloss.get("characters") or {}).values() for k in ("src", "tgt")
-        ] + [str(player_of(gloss)["name"])]
+        ] + [str(player_of(gloss)["name"])] + [str(x.get("src") or "") for x in gloss.get("terms") or [] if isinstance(x, dict)]
         texts = [x for l in ctx.lines() for x in [l.text_src, *(l.choices or [])]]
         cands = collect_name_candidates(texts, known)
         if not cands:
@@ -1833,16 +2140,48 @@ def translate_llm(
                 if from_model:
                     store.put("names", nkey(tr.name), answers)
                     store.save()
-        added = merge_names(gloss, answers)
+        _, deleted = read_auto_glossary(ctx.paths.work)
+        added = merge_names(gloss, answers, deleted)
         ctx.log.info("names pass: %d candidates, %d spellings added to the glossary terms", len(cands), len(added))
-        if added:
-            try:
-                write_yaml(ctx.paths.work / "glossary_auto.yaml", {"terms": [x for x in gloss["terms"] if x.get("notes") == "auto"]})
-            except OSError as e:  # an informational copy, never a failure
+        if added or deleted:
+            try:  # the app's glossary editor shows these as "found automatically" (C9) and records deletions next to them
+                write_auto_glossary(ctx.paths.work, [x for x in gloss["terms"] if x.get("notes") == "auto"], deleted)
+            except OSError as e:  # never a failure
                 ctx.log.debug("glossary_auto.yaml not written: %s", e)
         gloss_hash = hash_obj(gloss)
 
+    def gender_pass() -> None:
+        """Ask the model ONCE for the gender of the characters whose gender nobody set; the answers go to characters.yaml with
+        ``gender_source: guess`` (never over a gender the user set) and reach the prompts of this very run."""
+        if not getattr(t, "gender_pass", True) or key_backend.startswith("mock"):
+            return
+        all_lines = ctx.lines()
+        sids = [sid for sid in dict.fromkeys(l.speaker_id for l in todo)
+                if sid not in ("narrator", VOICE_OVER) and sid in chars and _gender_of(sid, chars, gloss) == "unknown"
+                and not is_player(sid, next((l.speaker_raw for l in todo if l.speaker_id == sid), ""), gloss)
+                and (chars[sid].model_extra or {}).get("gender_source") != "user"]
+        if not sids:
+            return
+        items = gender_items(all_lines, sids, chars, gloss)
+
+        def gkey(model: str) -> str:
+            return store.key("genders", TRANSLATE_PROTOCOL, model, src, items)
+
+        answers = cached("genders", gkey)
+        if answers is None:
+            tr = get_translator()
+            answers, from_model = tr.guess_genders(items)
+            if from_model:
+                store.put("genders", gkey(tr.name), answers)
+                store.save()
+        applied = apply_gender_guesses(ctx, chars, answers)
+        if applied:
+            ctx.log.info("gender pass: %s", ", ".join(f"{k}={v}" for k, v in applied.items()))
+
     names_pass()
+    gender_pass()
+    if report is not None:  # every guess that stands, also those of an earlier run (the summary says which genders are the model's)
+        report["gender_guessed"] = {sid: c.gender for sid, c in chars.items() if (c.model_extra or {}).get("gender_source") == "guess" and c.gender in ("m", "f")}
     ctx.progress(0, total, None)
     workers = max(1, int(llm.parallel))
     if workers > 1 and len(scenes) > 1:
@@ -1858,7 +2197,8 @@ def translate_llm(
     else:
         for scene, scene_lines in scenes.items():
             do_scene(scene, scene_lines)
-    recheck_pass(ctx, store, cached, get_translator, todo, entries, flags, gloss, gloss_hash, tgt, src, batch_lines)
+    recheck_pass(ctx, store, cached, get_translator, todo, entries, flags, gloss, gloss_hash, tgt, src, batch_lines,
+                 row_of=row, summaries=summaries, chars=chars)
     store.save()
     if translator is not None:
         ctx.log.info("llm calls: %d, incomplete answers: %d, cut off by the token budget: %d", translator.calls, translator.failures, translator.truncated)
@@ -1868,10 +2208,16 @@ def translate_llm(
 def recheck_pass(
     ctx: StageContext, store: OpCache, cached: Any, get_translator: Any, todo: list[LineRecord], entries: dict[str, dict[str, Any]],
     flags: dict[str, list[str]], gloss: dict[str, Any], gloss_hash: str, tgt: str, src: str, batch_lines: int,
+    row_of: Any = None, summaries: dict[str, str] | None = None, chars: dict[str, Character] | None = None,
 ) -> None:
-    """Re-ask once the lines whose translation fails :func:`check_translation` (mixed scripts, Latin leftovers, untranslated), with a
-    note saying what the previous answer was and what is wrong. A line that still fails is kept as it is and flagged ``check_failed``.
-    The second answers are cached like batches, so a re-run asks nothing."""
+    """Re-ask once the lines whose translation fails :func:`check_translation` (mixed scripts, Latin leftovers, untranslated, ...),
+    with a note saying what the previous answer was and what is wrong. A line that still fails is kept as it is and flagged
+    ``check_failed``. The second answers are cached like batches, so a re-run asks nothing.
+
+    ``row_of`` builds the rows exactly like the batches (display name, the speaker's gender: before round 18 a redone line lost
+    its gender and could flip "сделала" to "сделал"); ``summaries`` (scene -> summary) gives each part its scene's summary."""
+    chars = chars or {}
+    summaries = summaries or {}
     terms = [x for x in (gloss.get("terms") or []) if isinstance(x, dict)]
     bad: list[tuple[LineRecord, str]] = []
     for l in todo:
@@ -1879,40 +2225,46 @@ def recheck_pass(
         if e is None or "menu" in l.flags or not str(e.get("source", "")).startswith("llm") or not e.get("text_tgt"):
             continue
         why = check_translation(l.text_src, e["text_tgt"], tgt, src, terms)
+        if not why and terms and glossary_missing(l.text_src, e["text_tgt"], terms):
+            why = "glossary_miss"  # re-asked with the spelling it must use (round 18; before, only logged)
         if why:
             bad.append((l, why))
     if not bad:
         return
     ctx.log.warning("translation check: %d line(s) to redo (%s)", len(bad), ", ".join(f"{l.line_id}: {w}" for l, w in bad[:10]))
     step = max(1, batch_lines)
-    for i in range(0, len(bad), step):
-        part = bad[i : i + step]
-        rows = [
-            {
-                "id": l.line_id, "speaker": l.speaker_id, "speaker_id": l.speaker_id, "gender": "unknown", "emotion": "", "text": l.text_src,
-                "previous_answer": entries[l.line_id]["text_tgt"], "fix": _FIX_NOTE[why],
-            }
-            for l, why in part
-        ]
-        item_id = f"recheck:{part[0][0].line_id}:{len(part)}"
+    by_scene: dict[str, list[tuple[LineRecord, str]]] = {}
+    for l, why in bad:
+        by_scene.setdefault(l.scene, []).append((l, why))
+    for scene, scene_bad in by_scene.items():
+        summary = summaries.get(scene) or ""
+        for i in range(0, len(scene_bad), step):
+            part = scene_bad[i : i + step]
+            rows = []
+            for l, why in part:
+                base = row_of(l) if row_of is not None else {
+                    "id": l.line_id, "speaker": l.speaker_id, "speaker_id": l.speaker_id, "gender": row_gender(l.speaker_id, l.speaker_raw, chars, gloss), "text": l.text_src,
+                }
+                rows.append({**base, "previous_answer": entries[l.line_id]["text_tgt"], "fix": _fix_note(why, l.text_src, terms)})
+            item_id = f"recheck:{part[0][0].line_id}:{len(part)}"
 
-        def rkey(model: str, rows: list[dict[str, Any]] = rows) -> str:
-            return store.key("recheck", TRANSLATE_PROTOCOL, model, src, tgt, gloss_hash, rows)
+            def rkey(model: str, rows: list[dict[str, Any]] = rows, summary: str = summary) -> str:
+                return store.key("recheck", TRANSLATE_PROTOCOL, model, src, tgt, batch_glossary_slice(rows, gloss, chars, src), rows, summary)
 
-        got = cached(item_id, rkey)
-        if got is None:
-            tr = get_translator()
-            got = tr.translate(rows, [], "")
-            if len(got) == len(rows):
-                store.put(item_id, rkey(tr.name), got)
-            store.save()
-        for l, _ in part:
-            new = got.get(l.line_id)
-            if new is not None and not check_translation(l.text_src, new["text_tgt"], tgt, src, terms):
-                entries[l.line_id] = {**entries[l.line_id], **{k: v for k, v in new.items() if k != "delivery"}}
-            else:
-                flags[l.line_id].append("check_failed")  # kept as the model wrote it: the review shows the flag
-                ctx.log.warning("translation check failed twice for %s", l.line_id)
+            got = cached(item_id, rkey)
+            if got is None:
+                tr = get_translator()
+                got = tr.translate(rows, [], summary)
+                if len(got) == len(rows):
+                    store.put(item_id, rkey(tr.name), got)
+                store.save()
+            for l, why in part:
+                new = got.get(l.line_id)
+                if new is not None and not check_translation(l.text_src, new["text_tgt"], tgt, src, terms) and not glossary_missing(l.text_src, new["text_tgt"], terms):
+                    entries[l.line_id] = {**entries[l.line_id], **{k: v for k, v in new.items() if k != "delivery"}}
+                elif why != "glossary_miss":  # a glossary miss that stays is flagged glossary_miss by the post-check of run()
+                    flags[l.line_id].append("check_failed")  # kept as the model wrote it: the review shows the flag
+                    ctx.log.warning("translation check failed twice for %s (%s)", l.line_id, why)
 
 
 def translate_deliveries(

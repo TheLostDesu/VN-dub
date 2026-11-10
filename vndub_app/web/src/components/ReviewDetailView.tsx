@@ -19,6 +19,11 @@ export interface ReviewDetailHandle {
 
 const EMOTIONS = ["neutral", "happy", "sad", "angry", "fearful", "surprised", "disgusted", "embarrassed"];
 
+/** The selection reasons come as a full key (`why.gate_unchecked`), the gate reasons as a bare one (`cer`). */
+function whyKey(key: string): string {
+  return key.startsWith("why.") ? key : `why.${key}`;
+}
+
 function VerdictChip({ v }: { v: Verdict }) {
   const { t, has } = useI18n();
   const key = `verdict.${v.metric}.${v.key}`;
@@ -68,6 +73,7 @@ export const ReviewDetailView = forwardRef<ReviewDetailHandle, Props>(function R
       setDetail(d);
       setError(null);
       setTextTgt(d.line.text_tgt ?? "");
+      draftRef.current = { text: d.line.text_tgt ?? "", saved: d.line.text_tgt ?? "" };
       setTextSrc(d.line.text_src ?? "");
       setStyle(d.style_prompt ?? "");
       // a line's own tuning replaces the character's as a whole: without one the panel starts from the character's tuning
@@ -88,12 +94,46 @@ export const ReviewDetailView = forwardRef<ReviewDetailHandle, Props>(function R
     void load();
   }, [load]);
 
+  // The edited translation is a draft until it is saved: it is written after a pause, on blur, before an action that moves
+  // on (accept / reject / keep original) and when the view goes away (another line, another screen).
+  const draftRef = useRef({ text: "", saved: "" });
+  const busyRef = useRef<string | null>(null);
+  const saveDraft = useCallback(async (): Promise<void> => {
+    const { text, saved } = draftRef.current;
+    if (!text.trim() || text === saved) return;
+    draftRef.current.saved = text;
+    try {
+      await api.reviewAction(lineId, "set_text", { text });
+      setDetail((d) => (d ? { ...d, line: { ...d.line, text_tgt: text } } : d));
+      onChangedRef.current("set_text", false);
+    } catch (e) {
+      draftRef.current.saved = saved;
+      setActionError(toErrorInfo(e));
+    }
+  }, [lineId]);
+  const onChangedRef = useRef(onChanged);
+  onChangedRef.current = onChanged;
+  useEffect(() => {
+    const id = window.setTimeout(() => void saveDraft(), 1500);
+    return () => window.clearTimeout(id);
+  }, [textTgt, saveDraft]);
+  useEffect(
+    () => () => {
+      const { text, saved } = draftRef.current;
+      if (text.trim() && text !== saved) void api.reviewAction(lineId, "set_text", { text }).catch(() => undefined);
+    },
+    [lineId],
+  );
+
   const act = useCallback(
     async (action: ReviewActionName, payload: JsonObject = {}, advance = false) => {
+      if (busyRef.current !== null) return; // a held key or a double click must not send the same action twice
+      busyRef.current = action;
       setBusy(action);
       setActionError(null);
       setNotice(null);
       try {
+        if (action === "accept" || action === "reject" || action === "keep_original") await saveDraft();
         await api.reviewAction(lineId, action, payload);
         const moved = onChanged(action, advance);
         // nothing to advance to (the last row): this view stays, and its candidates must show the new state
@@ -104,12 +144,14 @@ export const ReviewDetailView = forwardRef<ReviewDetailHandle, Props>(function R
       } catch (e) {
         setActionError(toErrorInfo(e));
       } finally {
+        busyRef.current = null;
         setBusy(null);
       }
     },
-    [lineId, onChanged, load, t],
+    [lineId, onChanged, load, t, saveDraft],
   );
 
+  draftRef.current.text = textTgt;
   const cands = detail?.candidates ?? [];
   const selectedCand = cands.find((c) => c.id === selected) ?? null;
 
@@ -201,7 +243,7 @@ export const ReviewDetailView = forwardRef<ReviewDetailHandle, Props>(function R
         <Callout tone="warn" title={t("review.why.title")} testid="review-why">
           <ul>
             {detail.why.map((w, i) => (
-              <li key={`${w.key}-${i}`}>{has(`why.${w.key}`) ? t(`why.${w.key}`, w.params) : t("why.unknown", { gate: w.gate })}</li>
+              <li key={`${w.key}-${i}`}>{has(whyKey(w.key)) ? t(whyKey(w.key), w.params) : t("why.unknown", { gate: w.gate })}</li>
             ))}
           </ul>
         </Callout>

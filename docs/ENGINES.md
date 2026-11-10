@@ -119,9 +119,10 @@ is read from `init python` / `define config.auto_voice`).
   exactly what Ren'Py's `Restructurer` groups: the `voice` / `voice sustain` statements and `nvl clear` right before
   it, in script order, flushed by any other statement (1.0.0: before, one pending voice survived a `show` in between,
   two voice statements kept only the last, and `nvl clear` was skipped). Ren'Py 8.5.1 added
-  `config.tlid_only_considers_say` (default True from 8.6): with it, voice statements no longer change ids. `parse`
-  reads the game's Ren'Py version (`renpy/vc_version.py` or `renpy/__init__.py` next to the game folder) and uses that
-  default (a parse note says which); `parse.engine_opts.renpy.tlid_only_considers_say: true|false` overrides it, and
+  `config.tlid_only_considers_say` (documented as False until 8.6), and with that release voice statements stopped
+  changing ids whatever the flag says (round 18: read in the 8.5.3 source and checked with `renpy translate`). `parse`
+  reads the game's Ren'Py version (`renpy/vc_version.py` or `renpy/__init__.py` next to the game folder) and hashes the
+  say alone from 8.5.1 (a parse note says which); `parse.engine_opts.renpy.tlid_only_considers_say: true|false` overrides it, and
   `dialogue.tab` beats both. Since 1.0.0 character and image names may be any Ren'Py word (Cyrillic, CJK), and
   `Character(kind=e)` inherits its name and voice tag from `e` (only an explicit `None` name is narration).
 * **Scripts**: `game/**/*.rpy`, every `.rpa` archive (unrpa) and every `.rpyc` without its `.rpy` (unrpyc, `--clobber`,

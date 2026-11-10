@@ -57,7 +57,8 @@ def _project(make_ctx, tmp_path: Path, script: str = SCRIPT, tr: dict[str, Any] 
     g = tmp_path / "g"
     (g / "game" / "voice").mkdir(parents=True)
     (g / "game" / "script.rpy").write_text(script, encoding="utf-8")
-    (g / "game" / "voice" / "s_0001.ogg").write_bytes(b"OggS")
+    for n in ("s_0001", "e_0001", "e_0002"):
+        (g / "game" / "voice" / f"{n}.ogg").write_bytes(b"OggS")
     ctx = make_ctx(g, sets=sets or None)
     _, _, _, res = detect_and_parse(ctx)
     write_jsonl(ctx.paths.lines, res.lines)
@@ -135,8 +136,12 @@ def test_translated_string_unit() -> None:
     assert f("Hi [name]", "Привет [name]") == "Привет [name]"
     assert f("Hi [name]", "Привет") is None
     assert f("Hi", "Привет [x] {b} 50%") == "Привет [[x] {{b} 50%%"
-    assert f("Wait{w} here", "Ждём здесь") is None  # a flow tag was lost
+    assert f("Wait{w} here", "Ждём здесь") == "Ждём здесь"  # the translator never sees {w}: it is not required any more
     assert f("Wait{w} here", "Ждём{w} здесь") == "Ждём{w} здесь"
+    assert f("Wait.{nw}", "Ждём.") == "Ждём.{nw}" and f("Wait.{fast}", "Ждём.") == "Ждём.{fast}"  # a last-token tag goes back at the end
+    assert f("Wait.{nw}", "Ждём.{nw}") == "Ждём.{nw}"
+    assert f(" and more.", "и ещё.") == " и ещё."  # extend: the leading space stays
+    assert f("See {image=x} now", "Смотри") is None and f("See {a=u}link{/a}", "Смотри") is None  # {image} and {a} stay required
     assert f("It is {i}fine{/i}", "Всё хорошо") == "Всё хорошо"  # formatting tags are dropped, the line still reads
     assert f("%(n)s apples", "яблок: %(n)s") == "яблок: %(n)s"
 
@@ -323,3 +328,140 @@ def test_menu_say_block_has_nointeract_with_the_flag_and_by_digest_without_it(ma
     ctx2, _ = _project(make_ctx, tmp_path / "b", SCRIPT, TR)
     run_stage("pack", ctx2)
     assert _rpy(ctx2).count('s "Выбирай." nointeract\n') == 1
+
+
+# ----------------------------------------------------------------------------
+# the voice statement of a block: as the script wrote it (config.voice_filename_format builds the path itself)
+# ----------------------------------------------------------------------------
+
+VFF_SCRIPT = """define config.voice_filename_format = "voice/{filename}.ogg"
+define e = Character("Eileen")
+label start:
+    voice "e_0001"
+    e "Hello there."
+    voice "e_0002"
+    e "Second line."
+"""
+VFF_TR = {"Hello there.": "Привет.", "Second line.": "Вторая строка."}
+
+
+def _vff(make_ctx, tmp_path: Path):
+    return _project(make_ctx, tmp_path, VFF_SCRIPT, VFF_TR)
+
+
+def test_voice_statement_is_written_as_the_script_wrote_it(make_ctx, tmp_path: Path) -> None:
+    ctx, res = _vff(make_ctx, tmp_path)
+    assert all(l.model_extra.get("voice_stmt") for l in res.lines if l.has_voice)
+    run_stage("pack", ctx)
+    text = _rpy(ctx)
+    assert '    voice "e_0001"\n    e "Привет."' in text and "voice/e_0001" not in text.replace("# ", "")
+
+
+def test_old_import_without_voice_stmt_under_a_voice_filename_format_is_left_out(make_ctx, tmp_path: Path) -> None:
+    from vndub.manifest.io import LineRecord, read_jsonl
+
+    ctx, res = _vff(make_ctx, tmp_path)
+    old = []
+    for l in read_jsonl(ctx.paths.lines, LineRecord):
+        d = l.model_dump()
+        d.pop("voice_stmt", None)
+        old.append(LineRecord(**d))
+    write_jsonl(ctx.paths.lines, old)
+    run_stage("pack", ctx)
+    assert not (_out(ctx) / "tl" / "russian" / "vndub_dialogue.rpy").exists() or 'e "Привет."' not in _rpy(ctx)
+    assert _manifest(ctx)["text"] is None or any(s["reason"] == "own voice statement" for s in _manifest(ctx)["text"]["skipped"])
+    # the same old records in a game without the format keep the resolved path
+    ctx2, _ = _project(make_ctx, tmp_path / "b")
+    old2 = []
+    for l in read_jsonl(ctx2.paths.lines, LineRecord):
+        d = l.model_dump()
+        d.pop("voice_stmt", None)
+        old2.append(LineRecord(**d))
+    write_jsonl(ctx2.paths.lines, old2)
+    run_stage("pack", ctx2)
+    assert 'voice "voice/s_0001.ogg"\n    s "С возвращением, дорогая."' in _rpy(ctx2)
+
+
+def test_voice_outside_group_gets_no_voice_line(make_ctx, tmp_path: Path) -> None:
+    from vndub.manifest.io import LineRecord, read_jsonl
+
+    ctx, res = _project(make_ctx, tmp_path)
+    write_jsonl(ctx.paths.lines, [l.model_copy(update={"flags": [*l.flags, "voice_outside_group"]}) if l.text_src == "Welcome back, darling." else l for l in read_jsonl(ctx.paths.lines, LineRecord)])
+    run_stage("pack", ctx)
+    text = _rpy(ctx)
+    assert '    # s "Welcome back, darling."\n    s "С возвращением, дорогая."\n' in text
+
+
+# ----------------------------------------------------------------------------
+# translations the game already has: unpacked / decompiled by extract, or compiled and unreadable
+# ----------------------------------------------------------------------------
+
+
+def test_translations_decompiled_by_extract_count_as_the_games_own(make_ctx, tmp_path: Path) -> None:
+    ctx, res = _project(make_ctx, tmp_path)
+    ids = _ids(res)
+    d = ctx.paths.raw / "renpy" / "decompiled" / "tl" / "russian"
+    d.mkdir(parents=True)
+    (d / "script.rpy").write_text(f'translate russian {ids["Fine."]}:\n\n    s "Ладно."\n\ntranslate russian strings:\n\n    old "Stay"\n    new "Остаёмся"\n', encoding="utf-8")
+    run_stage("pack", ctx)
+    text = _rpy(ctx)
+    assert ids["Fine."] not in text and 'old "Stay"' not in text and 'old "Leave"' in text
+
+
+def test_unreadable_compiled_translation_gets_a_language_name_of_our_own(make_ctx, tmp_path: Path, caplog) -> None:
+    ctx, _ = _project(make_ctx, tmp_path)
+    tl = tmp_path / "g" / "game" / "tl" / "russian"
+    tl.mkdir(parents=True)
+    (tl / "script.rpyc").write_bytes(b"RENPY RPC2")
+    run_stage("pack", ctx)
+    assert (_out(ctx) / "tl" / "russian_vndub" / "vndub_dialogue.rpy").exists() and not (_out(ctx) / "tl" / "russian").exists()
+    assert 'define config.language = "russian_vndub"' in (_out(ctx) / "vndub_language.rpy").read_text(encoding="utf-8")
+    assert _manifest(ctx)["text"]["language"] == "russian_vndub"
+    # the same compiled file with a decompiled twin is readable: the normal name
+    twin = ctx.paths.raw / "renpy" / "decompiled" / "tl" / "russian"
+    twin.mkdir(parents=True)
+    (twin / "script.rpy").write_text("# nothing\n", encoding="utf-8")
+    run_stage("pack", ctx)
+    assert (_out(ctx) / "tl" / "russian" / "vndub_dialogue.rpy").exists() and not (_out(ctx) / "tl" / "russian_vndub").exists()
+
+
+def test_a_line_edited_in_review_shows_the_edited_text_without_stress_marks(make_ctx, tmp_path: Path) -> None:
+    from vndub.review.app import write_override
+
+    ctx, res = _project(make_ctx, tmp_path)
+    lid = next(l.line_id for l in res.lines if l.text_src == "Fine.")
+    write_override(ctx.paths, lid, "set_text", {"text": "Хорош+о, 2+2 и мо́ре."})
+    run_stage("pack", ctx)
+    text = _rpy(ctx)
+    assert 's "Хорошо, 2+2 и море."' in text and 's "Хорошо."' not in text
+    write_override(ctx.paths, lid, "set_text", {"text": ""})  # the latest one is empty: synth ignores it, so does the patch
+    run_stage("pack", ctx)
+    assert 's "Хорошо."' in _rpy(ctx)
+
+
+def test_character_names_go_into_the_strings_block(make_ctx, tmp_path: Path) -> None:
+    from vndub.manifest.io import save_characters
+
+    ctx, res = _project(make_ctx, tmp_path)
+    chars = dict(res.characters)
+    sid = next(l.speaker_id for l in res.lines if l.text_src == "Fine.")
+    c = chars[sid]
+    c.names["src"] = "Sakuya"
+    c.names["tgt"] = "Сакуя"
+    save_characters(ctx.paths.characters, chars)
+    run_stage("pack", ctx)
+    text = _rpy(ctx)
+    assert 'old "Sakuya"\n    new "Сакуя"\n' in text and text.count('old "Sakuya"') == 1
+    assert _manifest(ctx)["text"]["names"] == 1
+    # the glossary's name wins over characters.yaml
+    gl = tmp_path / "glossary.yaml"
+    gl.write_text(f"characters:\n  {sid}:\n    src: Sakuya\n    tgt: Сакурa\n".replace("Сакурa", "Сакура"), encoding="utf-8")
+    ctx.cfg.translate.glossary = str(gl)
+    run_stage("pack", ctx)
+    assert 'new "Сакура"' in _rpy(ctx) and 'new "Сакуя"' not in _rpy(ctx)
+    # a name the game already translates is not written again
+    d = tmp_path / "g" / "game" / "tl" / "russian"
+    d.mkdir(parents=True)
+    (d / "n.rpy").write_text('translate russian strings:\n\n    old "Sakuya"\n    new "Сакуя2"\n', encoding="utf-8")
+    run_stage("pack", ctx)
+    assert 'old "Sakuya"' not in _rpy(ctx)

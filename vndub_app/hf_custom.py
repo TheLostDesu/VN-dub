@@ -80,6 +80,15 @@ def _bad_url(text: str, why: str = "") -> AppError:
     return AppError("hf_bad_url", params={"url": text[:200]}, details=why or "not a Hugging Face model link", status=422)
 
 
+def _mirror_host() -> str:
+    """Host of the mirror set in Settings (``hf_endpoint``), ``""`` when none: a link copied from the mirror's page works too."""
+    try:
+        ep = (getattr(appdirs.load_settings(), "hf_endpoint", "") or "").strip()
+        return (urlsplit(ep).hostname or "").lower() if ep else ""
+    except Exception:
+        return ""
+
+
 def parse_hf_url(text: str) -> ParsedUrl:
     """``https://huggingface.co/<owner>/<repo>[/tree|blob|resolve/<rev>[/<path>]]``, ``hf.co/...``, no scheme, ``owner/repo``."""
     raw = (text or "").strip().strip("\"'<>").strip()
@@ -101,7 +110,7 @@ def parse_hf_url(text: str) -> ParsedUrl:
     if "@" in parts.netloc or (port not in (None, 80, 443)):
         raise _bad_url(raw, "credentials or a port in the URL")
     host = (parts.hostname or "").lower()
-    if host not in HF_HOSTS:
+    if host not in HF_HOSTS and host != _mirror_host():
         raise _bad_url(raw, f"host {host!r} is not huggingface.co")
     segs = [unquote(s) for s in parts.path.split("/") if s]
     if len(segs) < 2 or segs[0].lower() in RESERVED_OWNERS:
@@ -197,7 +206,7 @@ def hub_app_error(e: BaseException, repo: str, *, filename: str = "", target_dir
         return AppError("hf_not_found", params={"repo": repo, "page_url": page}, action="none", details=f"{name}: {e}", status=404)
     if isinstance(e, PermissionError):
         return AppError("permission_denied", params={"path": target_dir or str(appdirs.effective_models_dir())}, action="open_data_dir", details=f"{name}: {e}")
-    if isinstance(e, OSError) and getattr(e, "errno", None) == 28:  # ENOSPC
+    if downloads.is_disk_full(e):  # ENOSPC / Windows 112
         d = target_dir or str(appdirs.effective_models_dir())
         return AppError("disk_full", params={"need_gb": 0, "free_gb": round(downloads.free_space_gb(Path(d)), 1), "path": d}, action="open_data_dir", details=f"{name}: {e}")
     network = isinstance(e, (OSError, ConnectionError, TimeoutError)) or any(t in name for t in ("Http", "Connect", "Timeout", "Hub", "Offline", "Request", "Network"))
@@ -579,10 +588,8 @@ def delete_custom(cid: str) -> dict[str, Any]:
             raise AppError("permission_denied", params={"path": str(d)}, action="open_data_dir", details=f"{type(e).__name__}: {e}") from e
     with _LOCK:
         _write_entries([e for e in read_entries() if e.get("id") != cid])
-    s = appdirs.load_settings()
-    if getattr(s, "translation_llm", "") == cid:
-        s.translation_llm = ""
-        appdirs.save_settings(s)
+    if getattr(appdirs.load_settings(), "translation_llm", "") == cid:
+        appdirs.update_settings(lambda s: setattr(s, "translation_llm", "") if s.translation_llm == cid else None)
         _regenerate_project_config()
     return {"ok": True}
 

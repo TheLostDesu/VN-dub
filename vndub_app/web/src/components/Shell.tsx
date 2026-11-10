@@ -4,7 +4,7 @@ import { api } from "../api/endpoints";
 import { toErrorInfo } from "../api/client";
 import { STEP_IDS, type ErrorInfo, type StepId } from "../api/types";
 import { useI18n } from "../i18n";
-import { useActiveJob, ingestJob } from "../state/progress";
+import { useActiveJob, useConnected, ingestJob } from "../state/progress";
 import { useProject } from "../state/project";
 import { furthestStep, pathForJobKind, STEP_NUMBER, stepForJobKind, stepPath, useWizard } from "../state/wizard";
 import { stageLabel } from "../util/format";
@@ -129,6 +129,18 @@ export function Stepper({ current }: { current: StepId }) {
         })}
       </ol>
     </nav>
+  );
+}
+
+/** Sticky bar when the program's service has not answered for a few seconds: what is on screen is then out of date. */
+export function ConnectionBanner() {
+  const t = useI18n().t;
+  const connected = useConnected();
+  if (connected) return null;
+  return (
+    <div className="connection-banner" role="alert" data-testid="connection-banner">
+      <strong>{t("connection.lost.title")}</strong> {t("connection.lost.text")}
+    </div>
   );
 }
 

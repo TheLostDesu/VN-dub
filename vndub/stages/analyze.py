@@ -373,9 +373,10 @@ def ref_candidates(
             continue
         d = float(p.get("duration_s") or 0)
         snr = p.get("snr_db")
-        if snr is None or snr < min_snr or not (min_sec <= d <= max_sec) or not l.src_wav:
+        # None = no noise floor to measure against (a tightly trimmed clip): unknown, admitted and ranked at the threshold
+        if (snr is not None and snr < min_snr) or not (min_sec <= d <= max_sec) or not l.src_wav:
             continue
-        by_class.setdefault(vote_label(p, w_e2v, w_anime), []).append((float(snr), l.src_wav))
+        by_class.setdefault(vote_label(p, w_e2v, w_anime), []).append((float(min_snr if snr is None else snr), l.src_wav))
     out: list[str] = []
     for cls in sorted(by_class, key=lambda c: -len(by_class[c])):
         for _, path in sorted(by_class[cls], key=lambda x: -x[0])[:per_emotion]:

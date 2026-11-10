@@ -21,6 +21,8 @@
     # @req-from <name> <file>           install <file> from that checkout
     # @nodeps <requirement>             install with --no-deps
   envs\<env>+<extra>.txt are optional extras (failures are reported, not fatal, unless -Strict).
+  Every env built gets <env>\vndub_env.json (adapters\common\envrecord.py): requirement hash, app version, git HEADs,
+  installed torch kind, failed extras. Import-level check without weights: <env>\Scripts\python.exe -m adapters.<env>.main --probe
 #>
 param(
     [string[]]$Env = @("main"),
@@ -40,6 +42,10 @@ if (-not $EnvsDir) { $EnvsDir = Join-Path $Root ".venvs" }
 $VenvsRoot = $EnvsDir
 # build-time pins for sdist-only packages (see envs/build.constraints.txt)
 $BuildConstraints = Join-Path $ReqDir "build.constraints.txt"
+# the build record <env>\vndub_env.json (hash of the requirement files, app version, git HEADs, installed torch kind):
+# written by this stdlib-only helper with the env's own python, read back by the app (vndub_app/installer.py env_states)
+$RecordPy = Join-Path $Root "adapters\common\envrecord.py"
+if (-not (Test-Path $RecordPy)) { $RecordPy = Join-Path $Root "backend\adapters\common\envrecord.py" }  # packaged app layout
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     throw "uv not found on PATH (install: pip install uv, or https://docs.astral.sh/uv/)"
@@ -95,6 +101,16 @@ function Install-ReqFile([string]$EnvName, [string]$Py, [string]$File, [string]$
                 if ($g.recursive) { Invoke-Checked "git clone $($g.url)" { git clone --depth 1 --branch $g.ref --recurse-submodules $g.url $dst } }
                 else { Invoke-Checked "git clone $($g.url)" { git clone --depth 1 --branch $g.ref $g.url $dst } }
             }
+        } elseif ($g.ref -match "^[0-9a-f]{40}$") {
+            # an existing checkout used to be kept as it was: a new pinned commit in envs\*.txt never reached a rebuilt env
+            $headFile = Join-Path $dst ".git\HEAD"
+            $head = if (Test-Path $headFile) { (Get-Content -Raw $headFile).Trim() } else { "" }
+            if ($head -ne $g.ref) {
+                Write-Host "   $($g.name): $head -> $($g.ref)"
+                Invoke-Checked "git fetch $($g.url)" { git -C $dst fetch origin $g.ref }
+                Invoke-Checked "git checkout $($g.ref)" { git -C $dst checkout --force $g.ref }
+                if ($g.recursive) { Invoke-Checked "git submodules" { git -C $dst submodule update --init --recursive } }
+            }
         }
     }
     $uvArgs = @("pip", "install", "--python", $Py, "-r", $File, "--build-constraint", $BuildConstraints)
@@ -122,6 +138,8 @@ foreach ($e in $Env) {
     }
     $venv = Join-Path $VenvsRoot $e
     if ($Recreate -and (Test-Path $venv)) { Remove-Item -Recurse -Force $venv }
+    # no record while the build runs: a failed or cancelled build leaves an env the app reports as incomplete
+    foreach ($f in @("vndub_env.json", "vndub_probe.json")) { Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $venv $f) }
     $py = Join-Path $venv "Scripts\python.exe"
     Write-Host "== env $e ($(if ($Cpu) { 'CPU' } else { 'CUDA' }))" -ForegroundColor Cyan
     if (-not (Test-Path (Join-Path $venv "pyvenv.cfg"))) {
@@ -135,7 +153,17 @@ foreach ($e in $Env) {
     if ($d.torch) {
         $index = if ($Cpu) { "https://download.pytorch.org/whl/cpu" } else { "https://download.pytorch.org/whl/$($d.cuda)" }
         $pkgs = $d.torch -split "\s+"
-        Invoke-Checked "torch install" { & uv pip install --python $py --index-url $index @pkgs }
+        # torch==2.8.0 is satisfied by an installed 2.8.0+cpu (PEP 440 ignores the local tag): asking for CUDA over a
+        # CPU build changed nothing. When the installed kind differs from the requested one, reinstall the torch packages.
+        $want = if ($Cpu) { "cpu" } else { "cuda" }
+        $have = ""
+        try { $have = "$(& $py $RecordPy torch-kind $venv | Select-Object -Last 1)".Trim() } catch { $have = "" }
+        $reinstall = @()
+        if ($have -and $have -ne "none" -and $have -ne $want) {
+            Write-Host "   torch is a $have build, $want requested: reinstalling $($d.torch)"
+            foreach ($p in $pkgs) { $reinstall += @("--reinstall-package", ($p -split "[=<>!~]")[0]) }
+        }
+        Invoke-Checked "torch install" { & uv pip install --python $py --index-url $index @reinstall @pkgs }
         $constraints = Join-Path $venv "torch-constraints.txt"
         Set-Content -Encoding ASCII -Path $constraints -Value $pkgs
     }
@@ -154,8 +182,8 @@ foreach ($e in $Env) {
             }
         }
     }
-    $info = @{ env = $e; cpu = [bool]$Cpu; torch = $d.torch; created = (Get-Date).ToString("s"); extras_failed = $extrasFailed }
-    $info | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $venv "vndub_env.json")
+    $cpuFlag = if ($Cpu) { "1" } else { "0" }
+    Invoke-Checked "build record" { & $py $RecordPy write --venv $venv --env $e --req-dir $ReqDir --cpu $cpuFlag "--torch=$($d.torch)" "--extras-failed=$($extrasFailed -join ',')" }  # name=value: PowerShell 5.1 drops an empty "" argument
     $mins = [math]::Round(((Get-Date) - $t0).TotalMinutes, 1)
     $summary += "$e : ok in $mins min" + $(if ($extrasFailed.Count) { " (extras failed: $($extrasFailed -join ', '))" } else { "" })
 }

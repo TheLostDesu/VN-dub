@@ -20,7 +20,7 @@ function rowParams(row: DoctorRow): Record<string, unknown> {
 }
 
 // what the fixes of this screen start; the tracker re-attaches to them after a visit to another screen
-const FIX_JOBS = ["ffmpeg_download", "vcredist_install"];
+const FIX_JOBS = ["ffmpeg_download", "vcredist_install", "envs_install", "envs_check"];
 
 const MIN_VRAM_GB = 7.5; // a "8 GB" card reports about 8.0; anything below 7.5 is a smaller card
 

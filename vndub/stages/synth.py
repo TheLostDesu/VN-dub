@@ -131,6 +131,7 @@ class Job:
     peak_vram: float | None = None
     cache_key: str = ""
     tts_key: str = ""  # route B: key of the TTS request alone (the VC plan is not part of it)
+    ref_hashes: list[str] = field(default_factory=list)  # content hashes of the reference clips (the sidecar keeps them: a new design reuses the file names)
 
     @property
     def cid(self) -> str:
@@ -256,7 +257,10 @@ def run(ctx: Any) -> dict[str, Any]:
     cache = gu.stage_cache(ctx, NAME, VERSION, "synth", "project")  # the project folders are not part of a candidate's key
     # nor is synth.laughter (or synth.sounds, same reasoning): its effect (the spelled text, the laugh phrase of the style) is part of every candidate's key already,
     # and a key that moved with the section would regenerate every candidate of a project that has no laughter at all
-    cache.rekey(_synth_hash(cfg))
+    cache.rekey(_synth_hash(cfg))  # the 1.1.0 key: still honoured (and migrated) while the config is the one the takes were made with
+    # every input a take depends on (text, style, references, backend options, seed, VC plan, tuning) is part of its own key,
+    # so the synth section is not: enabling a second backend or a fifth take used to regenerate every take of the project
+    cache.rekey(_candidate_hash(cfg))
     laughter_table = _laughter_table(ctx) if sc.laughter.enabled else None
     laughter_lines: set[str] = set()
     laughter_modes: Counter[str] = Counter()
@@ -268,6 +272,8 @@ def run(ctx: Any) -> dict[str, Any]:
     jobs: list[Job] = []
     orig_jobs: list[tuple[LineRecord, int]] = []
     interjection_lex = _interjections(ctx)
+    user_raw = [str(o.payload["text"]) for o in (_latest_override(overrides, l.line_id, ("set_text",)) for l in lines) if o is not None and o.payload.get("text")]
+    user_prep = _prepare_user_texts(ctx, user_raw, tgt) if user_raw else {}
 
     for line in lines:
         tr = trs.get(line.line_id)
@@ -310,9 +316,18 @@ def run(ctx: Any) -> dict[str, Any]:
             ctx.log.warning("%s: %d sustain continuation line(s) without a usable translation", line.line_id, len(cont_ids) - len(cont))
 
         user_text = set_text is not None and bool(set_text.payload.get("text"))
-        lsound = None if (sounds_table is None or user_text) else line_sound(tr, tr.text_tts or tr.text_tgt, tgt)
+        # a text the user wrote in Review gets translate's preparation (numbers, stress, laughs, sounds); one with the user's own
+        # "+" / acute stress marks keeps them (no stresser, laughs as written)
+        uprep = user_prep.get(str(set_text.payload["text"])) if user_text else None
+        user_marked = bool(uprep and uprep[3])
+        if sounds_table is None:
+            lsound = None
+        elif user_text:
+            lsound = line_sound(None, uprep[2], tgt)
+        else:
+            lsound = line_sound(tr, tr.text_tts or tr.text_tgt, tgt)
         sound_only = bool(lsound and lsound["only"] and not cont)
-        policy = sc.sounds.only if sound_only else "spell"
+        policy = sc.sounds.only if sound_only and not user_text else "spell"  # the user asked for these words: they are spoken
         if policy == "silent":
             silent_sound_lines.append(line.line_id)
             _purge_stale(ctx, line.line_id, tkey, set(), drop_all=True)
@@ -323,8 +338,7 @@ def run(ctx: Any) -> dict[str, Any]:
 
         def texts(plus: bool) -> tuple[str, str]:
             if user_text:
-                t = str(set_text.payload["text"])
-                return t, gu.strip_stress(t)
+                return (uprep[1] if plus else uprep[0]), uprep[2]
             return join_texts([tr, *cont], use_short, plus)
 
         high = spec.intensity >= sc.high_arousal
@@ -349,6 +363,7 @@ def run(ctx: Any) -> dict[str, Any]:
         if interj and sc.keep_original_for_interjections and line.src_wav and not list(ctx.paths.synth_dir(line.line_id).glob("orig_orig_*.wav")):
             orig_jobs.append((line, rnd))
 
+        first_job = len(jobs)
         for route in routes:
             if route in ("B", "P") and not si["performer_refs"]:
                 skipped_routes[f"{sid}:{route}"] = "no performer (run voicebank, or choose a design)"
@@ -377,12 +392,12 @@ def run(ctx: Any) -> dict[str, Any]:
                 stress = _stress_format(bspec, bopts)
                 text, plain = texts(stress in STRESSED)
                 spec_b, laugh = spec, None
-                if laughter_table is not None and not user_text:
+                if laughter_table is not None and not user_marked:
                     text, spec_b, laugh = _laughter_for(lg.unstress_laughs(text), tgt, bname, caps, laughter_table, spec, tuning)
                 sound = None
-                if sounds_table is not None and not user_text:
+                if sounds_table is not None:
                     text, plain, spec_b, sound = _sounds_for(_unstress_sounds(text), plain, tgt, bname, sounds_table, spec_b, lsound)
-                if stress == "acute" and tgt == "ru" and not user_text:
+                if stress == "acute" and tgt == "ru":
                     text = ru.to_acute_format(text)
                 rendered = render(spec_b, caps, bopts, cross_lingual=(route == "A"), laughter_inline=bool(laugh) and laugh["mode"].startswith(("inline", "tag")),
                                   sound_inline=bool(sound) and sound["mode"].startswith(("inline", "tag")))
@@ -466,11 +481,26 @@ def run(ctx: Any) -> dict[str, Any]:
                     if tkey:  # default tuning keeps the pre-tuning key
                         parts.append({"tuning": tkey, "plan": plan})
                     job.cache_key = cache.key(*parts, files=ref_paths)
+                    job.ref_hashes = [cache.hasher(p) for p in ref_paths]  # (memoized: cache.key just hashed them)
                     if route == "B":
                         job.tts_key = cache.key("tts", {k2: v2 for k2, v2 in item.items() if k2 not in ("id", "out")}, bname, options, files=ref_paths)
                     planned.add(out)
                     jobs.append(job)
-        _purge_stale(ctx, line.line_id, tkey, planned)
+        # what a take of this line must still say and sound like: earlier takes of another text, voice or route are gone
+        plains = {j.text_plain for j in jobs[first_job:]}
+        if not user_text:  # the other text variant too (a regen round may have used the short one)
+            for short in (False, True):
+                if short and not tr.text_tts_short:
+                    continue
+                p = join_texts([tr, *cont], short, False)[1]
+                if sounds_table is not None:
+                    p = _sounds_for(p, p, tgt, "", sounds_table, spec, lsound)[1]
+                plains.add(p)
+        now = {"plains": {_text_sig(p) for p in plains}, "routes": set(routes), "refs": {}}
+        for j in jobs[first_job:]:
+            names = frozenset(Path(p).name for p in (j.item.get("timbre_ref"), j.item.get("emotion_ref")) if p)
+            now["refs"].setdefault(j.route, set()).add((frozenset(j.ref_hashes), names))
+        _purge_stale(ctx, line.line_id, tkey, planned, now=now)
 
     # ---- execute ------------------------------------------------------------
     todo = [j for j in jobs if not cache.fresh(j.cid, j.cache_key, [j.out])]
@@ -513,54 +543,30 @@ def run(ctx: Any) -> dict[str, Any]:
             groups.setdefault((j.backend, j.options.get("lora", "")), []).append(j)
             if j.route == "B":
                 cache.drop(f"{j.cid}:tts")  # the pre-VC wav is about to be rewritten: an old entry must not vouch for a half-written file
+    def tts_judge(part: list[Job], res: list[dict[str, Any]], el: float, peak: float | None) -> None:
+        by = {r.get("id"): r for r in res}
+        for j in part:
+            r = by.get(j.item["id"], {})
+            if r.get("error"):
+                j.error = str(r["error"])
+                j.keep = gu.is_machine_error(j.error)  # the machine, not the item: keep whatever is on disk
+            elif not Path(j.item["out"]).exists():
+                j.error = "backend returned no audio"
+            j.elapsed, j.peak_vram = el, peak
+
+    def tts_commit(part: list[Job]) -> None:
+        for j in part:
+            if j.route == "B":
+                if not j.error:
+                    cache.put(f"{j.cid}:tts", j.tts_key)  # the pre-VC wav is complete: a kill during VC does not redo it
+            else:
+                _finish(ctx, cache, j)
+        # progress last: it is where the app's cancel is raised, so every take of the chunk is on disk and in the cache by then
+        for j in part:
+            progress(j.line_id)
+
     for (bname, lora), js in groups.items():
-        try:
-            backend = ctx.models.acquire(requested.get(bname, bname), js[0].options or None)
-        except BackendUnavailable as e:
-            block(bname, js, e.reason or str(e))
-            continue
-        vram_failed: list[Job] = []
-        for i in range(0, len(js), 16):
-            part = js[i : i + 16]
-            t0 = time.perf_counter()
-            try:
-                res = gu.run_batched(backend, "synthesize", [j.item for j in part], chunk=16)
-            except BackendUnavailable as e:  # the adapter lost its backend mid-run
-                block(bname, js[i:], e.reason or str(e))
-                break
-            el = (time.perf_counter() - t0) / max(1, len(part))
-            peak = None
-            try:
-                peak = backend.peak_vram()
-            except Exception:
-                pass
-            by = {r.get("id"): r for r in res}
-            for j in part:
-                r = by.get(j.item["id"], {})
-                target = Path(j.item["out"])
-                if r.get("error"):
-                    j.error = str(r["error"])
-                    if gu.is_vram_error(j.error):  # the machine, not the item: keep whatever is on disk
-                        j.keep = True
-                        vram_failed.append(j)
-                elif not target.exists():
-                    j.error = "backend returned no audio"
-                j.elapsed, j.peak_vram = el, peak
-                if j.route == "B":
-                    if not j.error:
-                        cache.put(f"{j.cid}:tts", j.tts_key)  # the pre-VC wav is complete: a kill during VC does not redo it
-                else:
-                    _finish(ctx, cache, j)
-            # progress last: it is where the app's cancel is raised, so every take of the chunk is on disk and in the cache by then
-            for j in part:
-                progress(j.line_id)
-        if vram_failed:
-            reason = f"out of memory on {len(vram_failed)} of {len(js)} item(s): {vram_failed[0].error[:160]}"
-            if len(vram_failed) == len(js):
-                block(bname, vram_failed, reason)
-            else:  # a long line that does not fit: loud, but the backend works
-                for route in sorted({j.route for j in vram_failed}):
-                    gu.record_unavailable(ctx, NAME, f"route {route} backend {bname}", reason)
+        _run_backend(ctx, bname, requested.get(bname, bname), js[0].options or None, js, "synthesize", lambda part: [j.item for j in part], tts_judge, tts_commit, block)
 
     # ---- VC for route B -------------------------------------------------------
     vc_groups: dict[str, list[Job]] = {}
@@ -577,48 +583,35 @@ def run(ctx: Any) -> dict[str, Any]:
             _finish(ctx, cache, j)
             continue
         vc_groups.setdefault(j.vc.get("request") or j.vc["backend"], []).append(j)
+
+    def vc_items(part: list[Job]) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": j.cid, "src": str(j.prevc), "out": str(j.out), "target_ref": j.vc.get("target_ref"),
+                "model": j.vc.get("model"), "index": j.vc.get("index"), "f0_transpose": j.vc.get("f0_transpose", 0), "params": j.vc.get("params", {}),
+            }
+            for j in part
+        ]
+
+    def vc_judge(part: list[Job], res: list[dict[str, Any]], el: float, peak: float | None) -> None:
+        by = {r.get("id"): r for r in res}
+        for j in part:
+            r = by.get(j.cid, {})
+            if r.get("error"):
+                j.error = f"vc: {r['error']}"
+                j.keep = gu.is_machine_error(j.error)
+            elif not j.out.exists():
+                j.error = "vc returned no audio"
+            j.elapsed += el
+
+    def vc_commit(part: list[Job]) -> None:
+        for j in part:
+            _finish(ctx, cache, j)
+        for j in part:  # (after the whole chunk is recorded: the cancel check lives in progress)
+            progress(j.line_id)
+
     for vname, js in vc_groups.items():
-        try:
-            vb = ctx.models.acquire(vname)
-        except BackendUnavailable as e:
-            block(vname, js, e.reason or str(e))
-            continue
-        vram_failed = []
-        for i in range(0, len(js), 16):  # chunks of 16: progress between them
-            part = js[i : i + 16]
-            items = []
-            for j in part:
-                v = j.vc
-                items.append({
-                    "id": j.cid, "src": str(j.prevc), "out": str(j.out), "target_ref": v.get("target_ref"),
-                    "model": v.get("model"), "index": v.get("index"), "f0_transpose": v.get("f0_transpose", 0), "params": v.get("params", {}),
-                })
-            t0 = time.perf_counter()
-            try:
-                res = {r.get("id"): r for r in gu.run_batched(vb, "convert", items, chunk=16)}
-            except BackendUnavailable as e:
-                block(vname, js[i:], e.reason or str(e))
-                break
-            el = (time.perf_counter() - t0) / max(1, len(items))
-            for j in part:
-                r = res.get(j.cid, {})
-                if r.get("error"):
-                    j.error = f"vc: {r['error']}"
-                    if gu.is_vram_error(j.error):
-                        j.keep = True
-                        vram_failed.append(j)
-                elif not j.out.exists():
-                    j.error = "vc returned no audio"
-                j.elapsed += el
-                _finish(ctx, cache, j)
-            for j in part:  # (after the whole chunk is recorded: the cancel check lives in progress)
-                progress(j.line_id)
-        if vram_failed:
-            reason = f"out of memory on {len(vram_failed)} of {len(js)} item(s): {vram_failed[0].error[:160]}"
-            if len(vram_failed) == len(js):
-                block(vname, vram_failed, reason)
-            else:
-                gu.record_unavailable(ctx, NAME, f"route B backend {vname}", reason)
+        _run_backend(ctx, vname, vname, None, js, "convert", vc_items, vc_judge, vc_commit, block)
 
     # ---- original audio candidates (interjections) ------------------------------
     for line, r in orig_jobs:
@@ -673,6 +666,85 @@ def run(ctx: Any) -> dict[str, Any]:
     return summary
 
 
+CHUNK = 16  # items per adapter call: progress (and the app's cancel check) between chunks
+
+
+def _broken(part: list[Job], since: list[Job]) -> str | None:
+    """Why a backend looks broken rather than its items (``None``: it does not). ``part`` is the chunk that just ran, ``since``
+    every item run since the backend was (re)loaded. A whole chunk failing with one error, or more than half of the items
+    failing, across at least two lines: a broken CUDA context, a dependency that fails on first use. One line whose text the
+    model cannot say fails on its own and is not a reason."""
+    bad = [j for j in part if j.error]
+    if len(part) >= 2 and len(bad) == len(part) and len({j.error[:200] for j in bad}) == 1 and len({j.line_id for j in bad}) >= 2:
+        return f"every item of a chunk failed: {bad[0].error[:200]}"
+    failed = [j for j in since if j.error]
+    if len(since) >= 2 * CHUNK and 2 * len(failed) > len(since) and len({j.line_id for j in failed}) >= 2:
+        return f"{len(failed)} of {len(since)} item(s) failed, e.g. {failed[0].error[:200]}"
+    return None
+
+
+def _run_backend(
+    ctx: Any, label: str, request: str, options: dict[str, Any] | None, js: list[Job], op: str, items_of: Any, judge: Any, commit: Any, block: Any,
+) -> None:
+    """Run ``js`` through backend ``request`` in chunks: ``judge(part, results, elapsed, peak)`` sets the jobs' errors,
+    ``commit(part)`` records them. A backend that cannot be loaded, that disappears, or that fails item after item after one
+    restart of its adapter is ``block``-ed: the stage then stops with a StageError that names it, instead of ending "done"
+    with no takes. Out-of-memory / CUDA errors on a few items are reported, the backend goes on."""
+    try:
+        backend = gu.acquire(ctx, request, options)
+    except BackendUnavailable as e:
+        block(label, js, e.reason or str(e))
+        return
+    restarted = False
+    since: list[Job] = []
+    machine: list[Job] = []
+    i = 0
+    while i < len(js):
+        part = js[i : i + CHUNK]
+        before = [j.elapsed for j in part]
+        t0 = time.perf_counter()
+        try:
+            res = gu.run_batched(backend, op, items_of(part), chunk=CHUNK)
+        except BackendUnavailable as e:  # the adapter lost its backend mid-run
+            block(label, js[i:], e.reason or str(e))
+            return
+        el = (time.perf_counter() - t0) / max(1, len(part))
+        peak = None
+        try:
+            peak = backend.peak_vram()
+        except Exception:
+            pass
+        judge(part, res, el, peak)
+        why = _broken(part, since + part)
+        if why is not None:
+            for j, e0 in zip(part, before):  # this chunk is either retried or blocked: its attempt is not a verdict on the items
+                j.error, j.keep, j.elapsed = "", False, e0
+            if restarted:
+                block(label, js[i:], f"{why} (also after a restart of the adapter)")
+                return
+            restarted = True
+            ctx.log.warning("synth: backend %s looks broken (%s): restarting its adapter and trying again", label, why)
+            try:
+                ctx.models.release(backend.spec.name)
+                backend = gu.acquire(ctx, request, options)
+            except BackendUnavailable as e:
+                block(label, js[i:], e.reason or str(e))
+                return
+            since = []
+            continue
+        since += part
+        machine += [j for j in part if j.error and j.keep]
+        commit(part)
+        i += CHUNK
+    if machine:
+        reason = f"GPU error (out of memory / CUDA) on {len(machine)} of {len(js)} item(s): {machine[0].error[:160]}"
+        if len(machine) == len(js):
+            block(label, machine, reason)
+        else:  # a long line that does not fit: loud, but the backend works
+            for route in sorted({j.route for j in machine}):
+                gu.record_unavailable(ctx, NAME, f"route {route} backend {label}", reason)
+
+
 class _Progress:
     """``ctx.progress`` over the units of the stage: a candidate is one unit, a route-B candidate that is generated in this run
     two (TTS, then VC). Units that are already done (cached candidates, TTS audio kept from an interrupted run) are part of
@@ -705,6 +777,42 @@ def _synth_hash(cfg: Any) -> str:
     if isinstance(project_d, dict):
         project_d = {k: v for k, v in project_d.items() if k not in gu.PROJECT_PATH_KEYS}
     return hash_obj({"synth": synth_d, "project": project_d})
+
+
+_USER_MARKS = re.compile("\\+[" + ru.VOWELS + "]|́")
+
+
+def _prepare_user_texts(ctx: Any, raws: list[str], tgt: str) -> dict[str, tuple[str, str, str, bool]]:
+    """Review ``set_text`` texts as translate prepares a translated line: raw -> ``(text for a plain backend, '+' text,
+    CER reference, user-marked)``. Russian: numbers / abbreviations spelled out and the stresser's marks (its cache normally
+    has them; else it loads on the CPU); a text with the user's own '+' / acute marks keeps exactly those. They used to reach
+    the TTS as typed: "16" read by an LLM TTS, no stress, a laugh read letter by letter."""
+    raws = list(dict.fromkeys(raws))
+    if tgt != "ru":
+        return {t: (gu.strip_stress(t), t, gu.strip_stress(t), bool(_USER_MARKS.search(t))) for t in raws}
+    out: dict[str, tuple[str, str, str, bool]] = {}
+    todo = [t for t in raws if not _USER_MARKS.search(t)]
+    stresser = None
+    if todo:
+        from vndub.stages.translate import make_stresser
+
+        stresser, _, reason = make_stresser(ctx, [ru.normalize_for_tts(t) for t in todo])
+        if stresser is None:
+            ctx.log.warning("%d text(s) written in review stay without stress marks: %s", len(todo), reason)
+    yo = ctx.cfg.translate.stress.yo
+    for t in raws:
+        if t in todo:
+            plain_tts, plain = ru.prepare_tts_text(t, stresser, "plain", yo)
+            out[t] = (plain_tts, ru.prepare_tts_text(t, stresser, "plus", yo)[0], plain, False)
+        else:
+            plus = ru.to_plus_format(ru.normalize_for_tts(ru.to_plus_format(t)))
+            out[t] = (ru.strip_stress(plus), plus, ru.strip_stress(plus), True)
+    return out
+
+
+def _candidate_hash(cfg: Any) -> str:
+    """The config part of a candidate's key: ``project`` without its folders (see :func:`_synth_hash` for the 1.1.0 key)."""
+    return gu.stable_section_hash(cfg, "project")
 
 
 def _laughter_table(ctx: Any) -> dict[str, Any] | None:
@@ -898,20 +1006,52 @@ def _base_style(passport: dict[str, Any], stats: dict[str, Any], notes: str, cfg
     return build_style(passport, stats, notes, cfg.analyze.e2v_weight, cfg.analyze.anime_weight, cfg.analyze.caption)
 
 
-def _purge_stale(ctx: Any, line_id: str, tkey: dict[str, Any] | None, planned: set[Path], drop_all: bool = False) -> None:
+def _purge_stale(
+    ctx: Any, line_id: str, tkey: dict[str, Any] | None, planned: set[Path], drop_all: bool = False, now: dict[str, Any] | None = None,
+) -> None:
     """Delete candidates rendered under another tuning that this run does not regenerate in place
     (e.g. extra regen-round candidates): they would compete with the tuned ones in score.
 
     A recorded sample (``sample_*``) that this run does not plan is stale too (the line is spoken again), and with ``drop_all``
-    (a sound line that is left silent, or replaced by a sample) so is every synthesized take."""
+    (a sound line that is left silent, or replaced by a sample) so is every synthesized take.
+
+    ``now`` (what this run can produce for the line): a take of an earlier round that says another text (the translation was
+    edited, a review ``set_text``), uses another reference voice (a new performer design reuses the file names, so the content
+    hashes are compared when the sidecar has them) or a route the line no longer takes is stale as well. Score measures every
+    take against its own text, so such a take used to pass and win: the game spoke the old text."""
     for wav, side in gu.candidate_files(ctx, line_id):
         if side is None or side.route == "orig" or wav in planned:
             continue
         old = ((side.params or {}).get("tuning") or {}).get("values")
-        if old == tkey and not drop_all and side.backend != "sample":
+        if old == tkey and not drop_all and side.backend != "sample" and not _superseded(side, now):
             continue
         for p in (wav, wav.with_suffix(".json"), wav.with_name(wav.stem + ".prevc.wav")):
             p.unlink(missing_ok=True)
+
+
+def _text_sig(text: str | None) -> str:
+    """A text as the comparison of :func:`_superseded` sees it: no stress marks, ё = е, no punctuation, no case."""
+    t = ru.deyo(gu.strip_stress(text or "")).casefold()
+    return " ".join(re.sub(r"[^\w\s]|_", " ", t).split())
+
+
+def _superseded(side: Any, now: dict[str, Any] | None) -> bool:
+    """Does an existing take no longer describe the line (another text, reference voice or route than this run produces)?"""
+    if now is None:
+        return False
+    if side.route not in now["routes"]:
+        return True
+    ex = side.model_extra or {}
+    plain = ex.get("text_plain")
+    if plain and now["plains"] and _text_sig(plain) not in now["plains"]:
+        return True
+    sigs = now["refs"].get(side.route)
+    if sigs:
+        hashes = ex.get("ref_hashes")
+        if hashes:
+            return frozenset(hashes) not in {h for h, _ in sigs}
+        return frozenset(Path(p).name for p in side.ref_paths) not in {n for _, n in sigs}
+    return False
 
 
 def _usable(tr: Any) -> bool:
@@ -1046,6 +1186,8 @@ def _finish(ctx: Any, cache: Any, j: Job) -> None:
     }
     if j.route == "B" and j.prevc.exists():
         data["pre_vc_wav"] = ctx.paths.rel(j.prevc)
+    if j.ref_hashes:
+        data["ref_hashes"] = j.ref_hashes
     if j.laughter:
         data["laughter"] = j.laughter
     if j.sound:

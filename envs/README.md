@@ -36,6 +36,28 @@ The desktop app also keeps uv's managed Pythons and its wheel cache next to the 
 passes the concrete interpreter (`-Python <path>`) instead of a version; see `vndub_app/installer.py` and decision 16 in docs/DECISIONS.md.
 From the command line the plain `make_envs` calls above use uv's defaults.
 
+### Build record and health checks
+
+Every env the scripts build gets `<env>/vndub_env.json` (written by `adapters/common/envrecord.py` with the env's own
+interpreter): the sha256 of its requirement files (`<env>.txt`, `<env>+*.txt`, `build.constraints.txt`), the app version,
+the HEAD of every `# @git` checkout, the installed torch kind (from the wheel's `+cpu` / `+cuXXX` tag) and the extras that
+failed. The record is deleted when a build of the env starts, so an interrupted build has none. The app compares it with
+the current files (`vndub_app/installer.py: env_states`): unmet `==` pins ("built by an older version"), a failed extra, a
+CPU torch on a machine with an NVIDIA card. A rebuild over an existing env is incremental (uv moves the pins); a CPU torch
+asked to become CUDA is reinstalled (`--reinstall-package`, since `torch==X` is met by `X+cpu`), and a `# @git` checkout
+pinned to a commit is moved to the new commit.
+
+Import check without weights or a GPU (what each adapter's `load` imports, with its shims; CosyVoice 3 locates every class
+its model config names):
+
+```powershell
+.venvs\funasr\Scripts\python.exe -m adapters.funasr.main --probe          # all adapters of the env, JSON on one line
+.venvs\chatterbox\Scripts\python.exe -m adapters.chatterbox.main --probe chatterbox_ml
+```
+
+The app runs it after every env install and from Diagnostics ("Check environments"), and `packaging/build_app.ps1` runs it
+for every env in `.venvs` before a release (`-SkipEnvProbe "<reason>"` to build without).
+
 ## File format
 
 `envs/<env>.txt` is a pip requirements file with directives in comments:

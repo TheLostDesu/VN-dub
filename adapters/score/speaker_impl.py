@@ -24,6 +24,18 @@ def _save(out: str, vec) -> dict[str, Any]:
 class EcapaEmbedder(ModelImpl):
     selftest_op = "embed"
 
+    probe_imports = ("torch", "speechbrain.inference.speaker")  # what load() imports (ModelImpl.probe)
+
+    @classmethod
+    def probe_setup(cls, params: dict[str, Any]) -> None:
+        ruamel_old_api_compat()
+
+    @classmethod
+    def probe_checks(cls, params: dict[str, Any]) -> dict[str, Any] | None:
+        from adapters.common.yamlcompat import hyperpyyaml_smoke
+
+        return hyperpyyaml_smoke()  # hyperparams.yaml goes through HyperPyYAML (round 11: ruamel 0.19)
+
     def load(self) -> dict[str, Any]:
         import torch
 
@@ -103,6 +115,8 @@ class WavLMSV(ModelImpl):
     (random-weight check with the default WavLM-base config: cosine 0.94 for a 0.5 s clip next to a 1.5 s one)."""
 
     selftest_op = "embed"
+
+    probe_imports = ("torch", "transformers")  # what load() imports (ModelImpl.probe)
 
     def load(self) -> dict[str, Any]:
         import torch

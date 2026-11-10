@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -127,6 +128,23 @@ def _parse_content_range(value: str | None) -> tuple[int | None, int | None]:
     return start, tot
 
 
+BACKOFF_CAP_S = 30.0  # longest pause between two download attempts
+
+
+def is_disk_full(e: BaseException) -> bool:
+    """``ENOSPC`` (POSIX) or ``ERROR_DISK_FULL`` / ``ERROR_HANDLE_DISK_FULL`` (Windows 112 / 39)."""
+    return isinstance(e, OSError) and (getattr(e, "errno", None) == errno.ENOSPC or getattr(e, "winerror", None) in (112, 39))
+
+
+def disk_full_error(path: Path | str, e: BaseException | None = None, what: str = "") -> AppError:
+    p = Path(path)
+    try:
+        free = round(free_space_gb(p), 1)
+    except Exception:
+        free = 0.0
+    return AppError("disk_full", params={"need_gb": 0, "free_gb": free, "path": str(p)}, action="open_data_dir", details=f"{what}: {e}" if what else str(e or ""))
+
+
 def fetch(
     url: str,
     dest: Path,
@@ -173,7 +191,10 @@ def fetch(
         raise _unreachable(url, filename, target_dir, f"unsupported URL scheme {parsed.scheme!r}")
 
     started: dict[str, int] = {}  # offset the first response body started at (an attempt may fail mid-way)
-    for attempt in range(retries + 1):
+    # ``attempt`` counts failures in a row without progress: an attempt that grew the .part file resets it, so a big file
+    # on a link that drops every few minutes keeps going instead of failing after four drops (round 18)
+    attempt = 0
+    while True:
         if checkpoint:
             checkpoint()
         offset = part.stat().st_size if part.exists() else 0
@@ -200,12 +221,19 @@ def fetch(
         except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
             last_exc = e
         except OSError as e:
+            if is_disk_full(e):  # retrying cannot help, and "server unreachable" would send the user the wrong way
+                raise disk_full_error(dest.parent, e, filename) from e
             if isinstance(e, (FileNotFoundError, PermissionError)) and parsed.scheme == "file":
                 raise _unreachable(url, filename, target_dir, e) from e
             last_exc = e
-        if attempt < retries:
-            log.info("download %s: attempt %d failed (%s: %s), retrying", filename, attempt + 1, type(last_exc).__name__, last_exc)
-            sleep(min(8.0, 0.5 * (2**attempt)))
+        grown = (part.stat().st_size if part.exists() else 0) > offset
+        if grown:
+            attempt = 0
+        if attempt >= retries:
+            break
+        log.info("download %s: attempt %d failed (%s: %s), retrying%s", filename, attempt + 1, type(last_exc).__name__, last_exc, " (made progress)" if grown else "")
+        sleep(min(BACKOFF_CAP_S, 0.5 * (2**attempt)))
+        attempt += 1
     if last_exc is not None:
         raise _unreachable(url, filename, target_dir, last_exc) from last_exc
 

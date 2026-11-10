@@ -20,7 +20,7 @@ from vndub.audio import ffmpeg
 from vndub.config import VoiceCodec, save_project_yaml
 from vndub.engines.base import ExtractResult
 from vndub.manifest.io import AudioIndexRecord, read_jsonl, write_jsonl
-from vndub.stages.common import StageContext
+from vndub.stages.common import StageContext, StageError
 
 NAME = "extract"
 VERSION = "1"
@@ -142,6 +142,12 @@ def run(ctx: StageContext) -> dict[str, Any]:
     ordered = [records[ids[r]] for r in rels]
     write_jsonl(ctx.paths.audio_index, ordered)
     ok = [r for r in ordered if not r.error]
+    failed = [r for r in ordered if r.error]
+    missing_tools = sorted({m.group(1) for r in failed if (m := re.search(r"tool '([\w-]+)' not found", r.error))})
+    decode_errors = {"count": len(failed), "samples": [f"{r.relpath}: {r.error}"[:300] for r in failed[:3]], "missing_tools": missing_tools}
+    if files and not ok:
+        # nothing decoded: every line would silently become "unvoiced" (or be left out) and the run would go on as a game without voice
+        raise StageError(f"none of the {len(files)} voice files could be decoded: {failed[0].error[:300]}" + (f" (missing tool: {', '.join(missing_tools)})" if missing_tools else ""))
     # codec summary -> project.yaml when detect could not probe (archived voices)
     if ok:
         cnt = collections.Counter((r.codec, r.sr, r.ch) for r in ok)
@@ -162,6 +168,7 @@ def run(ctx: StageContext) -> dict[str, Any]:
         "decoded_now": len(todo) - errors,
         "cached": len(files) - len(todo),
         "errors": errors,
+        "decode_errors": decode_errors,
         "total_audio_min": round(total_s / 60, 2),
         "warnings": res.warnings[:5],
     }

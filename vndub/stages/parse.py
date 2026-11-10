@@ -31,10 +31,11 @@ from vndub.stages.common import StageContext, StageError, resolve_src_lang
 from vndub.text.lang import detect_language, language_name
 
 NAME = "parse"
-VERSION = "4"  # 4: Ren'Py ids follow the translate blocks exactly (voice / nvl clear statements, unicode names, scripts from archives); 3: ids computed as Ren'Py does. The app tells a project imported with an older version to import again
+VERSION = "5"  # 5: Ren'Py voice kept over show / play / $, voice_stmt, narration characters, init-block characters, {p} as a space, no music as voice; 4: Ren'Py ids follow the translate blocks exactly (voice / nvl clear statements, unicode names, scripts from archives); 3: ids computed as Ren'Py does. The app tells a project imported with an older version to import again
 CONFIG_SECTIONS = ("parse",)
 
-USER_FIELDS = ("gender", "age_hint", "route", "notes", "performer", "rvc", "lora", "refs", "description")
+# gender_source ("user" | "guess", an extra): who set the gender, so a guess stays marked as one after a re-import
+USER_FIELDS = ("gender", "gender_source", "age_hint", "route", "notes", "performer", "rvc", "lora", "refs", "description")
 
 
 def merge_characters(new: dict[str, Character], old: dict[str, Character]) -> dict[str, Character]:
@@ -45,7 +46,7 @@ def merge_characters(new: dict[str, Character], old: dict[str, Character]) -> di
             if prev.names.get("tgt"):
                 c.names["tgt"] = prev.names["tgt"]
             for f in USER_FIELDS:
-                v = getattr(prev, f)
+                v = getattr(prev, f, None)
                 if v not in (None, "", [], {}, "unknown"):
                     setattr(c, f, v)
             if prev.voice_prefix:

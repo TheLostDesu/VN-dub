@@ -511,7 +511,7 @@ def _download_error(spec: BackendSpec, w: WeightSpec, e: BaseException, models_d
         return AppError("hf_gated", params={"page_url": f"https://huggingface.co/{w.repo}" if w.repo else "", "model": spec.name}, action="show_manual", details=f"{name}: {e}", status=403)
     if isinstance(e, PermissionError):
         return AppError("permission_denied", params={"path": str(models_dir)}, action="open_data_dir", details=f"{name}: {e}")
-    if isinstance(e, OSError) and getattr(e, "errno", None) == 28:  # ENOSPC
+    if downloads.is_disk_full(e):  # ENOSPC / Windows 112
         return AppError("disk_full", params={"need_gb": 0, "free_gb": round(downloads.free_space_gb(models_dir), 1), "path": str(models_dir)}, action="open_data_dir", details=f"{name}: {e}")
     network = isinstance(e, (OSError, ConnectionError, TimeoutError)) or any(t in name for t in ("Http", "Connect", "Timeout", "Hub", "Entry", "Repository", "Gated", "Offline", "Request"))
     if network:

@@ -2,7 +2,7 @@ import { Suspense, lazy, useEffect, type ReactNode } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ErrorPanel } from "./components/ErrorPanel";
-import { ActiveJobBar, ResumePrompt, Stepper, TopBar } from "./components/Shell";
+import { ActiveJobBar, ConnectionBanner, ResumePrompt, Stepper, TopBar } from "./components/Shell";
 import { ToastProvider } from "./components/ui";
 import { STEP_IDS, type StepId } from "./api/types";
 import { useI18n } from "./i18n";
@@ -66,6 +66,7 @@ function Page({ children, currentStep }: { children: ReactNode; currentStep: Ste
         {t("app.skip")}
       </a>
       <TopBar />
+      <ConnectionBanner />
       <ActiveJobBar currentStep={currentStep} />
       {currentStep ? <Stepper current={currentStep} /> : null}
       <main id="main" tabIndex={-1} className="main">

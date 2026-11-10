@@ -84,7 +84,7 @@ def test_warnings_callout_and_resume_dialog(server: Any, game_dir: Path, tmp_pat
             box = tid("job-warnings")
             expect(box).to_be_visible()
             expect(box.locator("li")).to_have_count(4)
-            expect(box.locator("li").nth(0)).to_contain_text("qwen35_9b")
+            expect(box.locator("li").nth(0)).to_contain_text("Qwen3.5 9B")  # round 18: the model's display name, not its id
             expect(box.locator("li").nth(1)).to_contain_text("no ASR backend")
             expect(box.locator("li").nth(3)).to_contain_text("модель перевода")  # the settings keys are named in words
             above_log = page.evaluate(

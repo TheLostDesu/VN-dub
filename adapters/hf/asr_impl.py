@@ -11,6 +11,8 @@ class Qwen3ASR(ModelImpl):
     selftest_op = "transcribe"
     selftest_kwargs = {"lang": "ja"}
 
+    probe_imports = ("torch", "qwen_asr")  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         import torch
         from qwen_asr import Qwen3ASRModel

@@ -34,6 +34,8 @@ class Emotion2Vec(ModelImpl):
 
     selftest_op = "emotion"
 
+    probe_imports = ("funasr",)  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         d = weight_dir(self.params, 0)
         self.model = funasr_model(d, self.device)

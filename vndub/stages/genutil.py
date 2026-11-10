@@ -233,6 +233,23 @@ def record_unavailable(ctx: Any, stage: str, group: str, reason: str) -> None:
         ctx.log.warning("could not record %s/%s as unavailable: %s", stage, group, e)
 
 
+def acquire(ctx: Any, name: str, options: dict[str, Any] | None = None) -> Backend:
+    """``ctx.models.acquire`` where a load that fails inside the adapter (out of memory while loading, a load timeout, a crash,
+    a corrupt weight file: a plain :class:`AdapterError`) is a :class:`BackendUnavailable` with its message, like a missing
+    env or missing weights. It used to escape every ``except BackendUnavailable`` and end the stage, even for a metric that
+    only feeds the composite. A cancel (:class:`AdapterAborted`) still propagates."""
+    from vndub.backends.runner import AdapterAborted, AdapterError
+
+    try:
+        return ctx.models.acquire(name, options)
+    except AdapterAborted:
+        raise
+    except AdapterError as e:
+        msg = str(e)
+        hint = "close other programs that use the GPU (a game, a browser with video, another VNDub job) and run it again" if is_machine_error(msg) else "the adapter log in work/logs says why the model did not load"
+        raise BackendUnavailable(name, f"loading failed: {msg[:300]}", hint) from e
+
+
 def acquire_first(
     ctx: Any, names: Iterable[str], options: dict[str, Any] | None = None, *, group: str | None = None, stage: str | None = None,
 ) -> tuple[Backend | None, str | None, str]:
@@ -246,7 +263,7 @@ def acquire_first(
         if not n:
             continue
         try:
-            b = ctx.models.acquire(n, options)
+            b = acquire(ctx, n, options)
             return b, b.spec.name, ""
         except BackendUnavailable as e:
             reasons.append(str(e))
@@ -278,6 +295,17 @@ def is_vram_error(message: str | None) -> bool:
     or the margin is thin)? Such a failure is about the machine, not about the item: nothing may be deleted for it."""
     m = (message or "").lower()
     return any(t in m for t in _VRAM_MARKERS)
+
+
+# a CUDA failure that is not about the item either: the process's CUDA context is broken, every later call fails the same way
+_CUDA_MARKERS = ("cuda error", "device-side assert", "illegal memory access", "cublas_status_execution_failed")
+
+
+def is_machine_error(message: str | None) -> bool:
+    """:func:`is_vram_error`, or a CUDA error that breaks the adapter process (an illegal memory access, a device-side assert):
+    the machine failed, not the item, so a finished wav must not be deleted for it and a restart of the adapter may help."""
+    m = (message or "").lower()
+    return is_vram_error(m) or any(t in m for t in _CUDA_MARKERS)
 
 
 # ----------------------------------------------------------------------------

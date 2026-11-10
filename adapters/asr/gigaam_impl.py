@@ -57,6 +57,8 @@ class GigaAMASR(ModelImpl):
     selftest_op = "transcribe"
     selftest_kwargs = {"lang": "ru"}
 
+    probe_imports = ("torch", "transformers")  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         import torch
         from transformers import AutoModel

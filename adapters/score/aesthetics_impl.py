@@ -10,6 +10,8 @@ from adapters.common.rpc import ModelImpl, WeightsMissingError, weight_dir
 class AudioboxAesthetics(ModelImpl):
     selftest_op = "aesthetics"
 
+    probe_imports = ("audiobox_aesthetics.infer",)  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         from audiobox_aesthetics.infer import AesPredictor
 

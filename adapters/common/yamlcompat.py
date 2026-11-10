@@ -31,3 +31,18 @@ def ruamel_old_api_compat() -> bool:
             cls.max_depth = 0
             patched = True
     return patched
+
+
+def hyperpyyaml_smoke() -> dict[str, str]:
+    """Parse a tiny HyperPyYAML document through the same loader a model config uses (no weights needed).
+
+    Under ruamel.yaml 0.19 without :func:`ruamel_old_api_compat` this raised the round-11 ``max_depth`` error in 0.3 s,
+    where the real load raised it after the weights were found. Raises whatever the parser raises."""
+    from hyperpyyaml import load_hyperpyyaml
+
+    d = load_hyperpyyaml("a: !new:collections.OrderedDict\nb: !name:os.path.join\n")
+    if "a" not in d or "b" not in d:
+        raise RuntimeError("HyperPyYAML returned an incomplete document")
+    import ruamel.yaml
+
+    return {"ruamel_yaml": str(getattr(ruamel.yaml, "__version__", "?"))}

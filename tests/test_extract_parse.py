@@ -103,3 +103,36 @@ def test_parse_requires_extract(make_ctx, fixtures_dir: Path) -> None:
     run_stage("detect", ctx)
     with pytest.raises(StageError, match="extract"):
         run_stage("parse", ctx)
+
+
+@requires_ffmpeg
+def test_extract_reports_decode_errors_and_stops_when_nothing_decodes(make_ctx, fixtures_dir: Path, monkeypatch) -> None:
+    import pytest
+
+    from vndub.audio import ffmpeg
+    from vndub.stages.common import StageError
+
+    ctx = make_ctx(fixtures_dir / "renpy_mini")
+    run_stage("detect", ctx)
+    real = ffmpeg.decode
+    bad = {"n": 0}
+
+    def flaky(tools, src, dst, sr=None, mono=True):
+        if "_01" in src.name or bad["n"] < 2:
+            bad["n"] += 1
+            raise ffmpeg.AudioToolError("ffmpeg failed (1): Invalid data found")
+        return real(tools, src, dst, sr=sr, mono=mono)
+
+    monkeypatch.setattr(ffmpeg, "decode", flaky)
+    s = run_stage("extract", ctx)
+    de = s["decode_errors"]
+    assert s["errors"] == de["count"] >= 1 and 1 <= len(de["samples"]) <= 3 and de["missing_tools"] == []
+
+    def dead(*a, **k):
+        raise ffmpeg.AudioToolError("tool 'vgmstream_cli' not found; set it in configs/tools.yaml")
+
+    monkeypatch.setattr(ffmpeg, "decode", dead)
+    ctx2 = make_ctx(fixtures_dir / "renpy_mini")
+    ctx2.force = True
+    with pytest.raises(StageError, match="none of the .*missing tool: vgmstream_cli"):
+        run_stage("extract", ctx2)

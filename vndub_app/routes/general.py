@@ -18,11 +18,28 @@ router = APIRouter(prefix="/api")
 
 MEDIA_TYPES = {".wav": "audio/wav", ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".flac": "audio/flac", ".opus": "audio/ogg", ".m4a": "audio/mp4", ".weba": "audio/webm"}
 
-SETTINGS_KEYS = {"ui_lang", "gpu_budget_gb", "license_policy", "models_dir", "envs_dir", "player_volume", "shutdown_when_done", "profile", "translation_llm", "debug_log"}
+SETTINGS_KEYS = {"ui_lang", "gpu_budget_gb", "license_policy", "models_dir", "envs_dir", "player_volume", "shutdown_when_done", "profile", "translation_llm", "debug_log", "hf_endpoint"}
 
 
 def _bad(field: str, value: Any = None) -> AppError:
     return AppError("bad_request", params={"field": field, "value": value}, status=422)
+
+
+def _check_hf_endpoint(value: Any) -> str:
+    """``""`` (huggingface.co) or an http(s) URL of a mirror such as ``https://hf-mirror.com`` (no trailing slash kept)."""
+    from urllib.parse import urlparse
+
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise _bad("hf_endpoint", value)
+    raw = value.strip().rstrip("/")
+    if not raw:
+        return ""
+    u = urlparse(raw)
+    if u.scheme not in ("http", "https") or not u.hostname or any(c.isspace() for c in raw):
+        raise _bad("hf_endpoint", value)
+    return raw
 
 
 # ----------------------------------------------------------------------------
@@ -168,12 +185,13 @@ def put_settings(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     unknown = set(body) - SETTINGS_KEYS - {"data_dir", "last_project"}
     if unknown:
         raise _bad("settings", sorted(unknown))
-    s = appdirs.load_settings()
-    before = s.model_dump(mode="json")
+    # validate first (folder probes, the busy check), then load-modify-save under the settings lock: a slider drag sends
+    # several PUTs at once and each must change only its own fields (round 18)
+    vals: dict[str, Any] = {}
     if "ui_lang" in body:
         if body["ui_lang"] not in ("ru", "en"):
             raise _bad("ui_lang", body["ui_lang"])
-        s.ui_lang = body["ui_lang"]
+        vals["ui_lang"] = body["ui_lang"]
     if "gpu_budget_gb" in body:
         try:
             v = float(body["gpu_budget_gb"])
@@ -181,35 +199,47 @@ def put_settings(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
             raise _bad("gpu_budget_gb", body["gpu_budget_gb"]) from None
         if not 1.0 <= v <= 96.0:
             raise _bad("gpu_budget_gb", v)
-        s.gpu_budget_gb = v
+        vals["gpu_budget_gb"] = v
     if "license_policy" in body:
         if body["license_policy"] not in ("research", "commercial"):
             raise _bad("license_policy", body["license_policy"])
-        s.license_policy = body["license_policy"]
+        vals["license_policy"] = body["license_policy"]
     if "models_dir" in body:
-        s.models_dir = _check_folder("models_dir", body["models_dir"])
+        vals["models_dir"] = _check_folder("models_dir", body["models_dir"])
     if "envs_dir" in body:  # 409 while a job runs: it may be using the environments (or installing them)
-        s.envs_dir = _check_folder("envs_dir", body["envs_dir"], busy_check=True)
+        vals["envs_dir"] = _check_folder("envs_dir", body["envs_dir"], busy_check=True)
+    volume: dict[str, float] = {}
     if "player_volume" in body:
         if not isinstance(body["player_volume"], dict):
             raise _bad("player_volume")
-        merged = dict(s.player_volume)
-        for k, v in body["player_volume"].items():
-            merged[str(k)] = max(0.0, min(1.0, float(v)))
-        s.player_volume = merged
+        try:
+            volume = {str(k): max(0.0, min(1.0, float(v))) for k, v in body["player_volume"].items()}
+        except (TypeError, ValueError):
+            raise _bad("player_volume") from None
     if "shutdown_when_done" in body:
-        s.shutdown_when_done = bool(body["shutdown_when_done"])
+        vals["shutdown_when_done"] = bool(body["shutdown_when_done"])
     if "profile" in body:
         if body["profile"] not in appdirs.PROFILES:
             raise _bad("profile", body["profile"])
-        s.profile = body["profile"]
+        vals["profile"] = body["profile"]
     if "translation_llm" in body:
-        s.translation_llm = _check_translation_llm(body["translation_llm"])
+        vals["translation_llm"] = _check_translation_llm(body["translation_llm"])
     if "debug_log" in body:
         if not isinstance(body["debug_log"], bool):
             raise _bad("debug_log", body["debug_log"])
-        s.debug_log = body["debug_log"]
-    appdirs.save_settings(s)
+        vals["debug_log"] = body["debug_log"]
+    if "hf_endpoint" in body:
+        vals["hf_endpoint"] = _check_hf_endpoint(body["hf_endpoint"])
+    before: dict[str, Any] = {}
+
+    def _apply(cur: appdirs.Settings) -> None:
+        before.update(cur.model_dump(mode="json"))
+        for k, v in vals.items():
+            setattr(cur, k, v)
+        if volume:
+            cur.player_volume = {**cur.player_volume, **volume}
+
+    s = appdirs.update_settings(_apply)
     if "debug_log" in body:  # the file handlers follow at once, no restart
         from vndub_app import server
 

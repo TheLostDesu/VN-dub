@@ -15,6 +15,8 @@ REQ_DIR="$ROOT/envs"
 VENVS_ROOT="${ENVS_DIR:-${VNDUB_ENVS_DIR:-$ROOT/.venvs}}"
 PYTHON="${PYTHON:-3.11}"
 BUILD_CONS="$REQ_DIR/build.constraints.txt"  # build-time pins for sdist-only packages
+RECORD_PY="$ROOT/adapters/common/envrecord.py"  # writes <env>/vndub_env.json (see make_envs.ps1)
+[ -f "$RECORD_PY" ] || RECORD_PY="$ROOT/backend/adapters/common/envrecord.py"  # packaged app layout
 command -v uv >/dev/null || { echo "uv not found on PATH" >&2; exit 1; }
 
 envs=("$@")
@@ -33,6 +35,11 @@ install_file() {  # env py file constraints
   while read -r name url ref rec; do
     [ -z "${name:-}" ] && continue
     local dst="$src/$name"
+    if [ -d "$dst" ] && [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && [ "$(cat "$dst/.git/HEAD" 2>/dev/null)" != "$ref" ]; then
+      # a new pinned commit must reach an env that already has the checkout
+      git -C "$dst" fetch origin "$ref" && git -C "$dst" checkout --force "$ref"
+      [ "${rec:-}" = "--recursive" ] && git -C "$dst" submodule update --init --recursive
+    fi
     if [ ! -d "$dst" ]; then
       mkdir -p "$src"
       if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
@@ -62,6 +69,7 @@ for env in "${envs[@]}"; do
   if ! grep -qE '^\s*[^#[:space:]]|^\s*#\s*@' "$req"; then echo "$env: nothing to install"; continue; fi
   venv="$VENVS_ROOT/$env"
   [ "${RECREATE:-0}" = "1" ] && rm -rf "$venv"
+  rm -f "$venv/vndub_env.json" "$venv/vndub_probe.json"  # no record while the build runs (a failed build is incomplete)
   echo "== env $env ($([ "${CPU:-0}" = "1" ] && echo CPU || echo CUDA))"
   if [ ! -f "$venv/pyvenv.cfg" ]; then rm -rf "$venv"; uv venv "$venv" --python "$PYTHON"; fi
   py="$(venv_python "$venv")"
@@ -70,8 +78,14 @@ for env in "${envs[@]}"; do
   cons=""
   if [ -n "$torch" ]; then
     index="https://download.pytorch.org/whl/$([ "${CPU:-0}" = "1" ] && echo cpu || echo "$cuda")"
+    want="$([ "${CPU:-0}" = "1" ] && echo cpu || echo cuda)"
+    have="$("$py" "$RECORD_PY" torch-kind "$venv" 2>/dev/null || echo none)"
+    reinstall=()
+    if [ "$have" != "none" ] && [ "$have" != "$want" ]; then  # ==X ignores the +cpu tag: force the kind asked for
+      for p in $torch; do reinstall+=(--reinstall-package "${p%%[=<>!~]*}"); done
+    fi
     # shellcheck disable=SC2086
-    uv pip install --python "$py" --index-url "$index" $torch
+    uv pip install --python "$py" --index-url "$index" "${reinstall[@]}" $torch
     cons="$venv/torch-constraints.txt"; printf '%s\n' $torch > "$cons"
   fi
   install_file "$env" "$py" "$req" "$cons"
@@ -86,6 +100,7 @@ for env in "${envs[@]}"; do
       fi
     done
   fi
-  printf '{"env": "%s", "cpu": %s, "torch": "%s", "extras_failed": "%s"}\n' "$env" "$([ "${CPU:-0}" = "1" ] && echo true || echo false)" "$torch" "${failed[*]:-}" > "$venv/vndub_env.json"
+  ef="${failed[*]:-}"
+  "$py" "$RECORD_PY" write --venv "$venv" --env "$env" --req-dir "$REQ_DIR" --cpu "${CPU:-0}" --torch "$torch" --extras-failed "${ef// /,}"
   echo "$env: ok"
 done

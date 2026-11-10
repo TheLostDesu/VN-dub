@@ -32,6 +32,8 @@ def parse_tags(raw: str) -> dict[str, Any]:
 class SenseVoice(ModelImpl):
     selftest_op = "events"
 
+    probe_imports = ("funasr", "funasr.utils.postprocess_utils")  # what load() imports (ModelImpl.probe)
+
     def load(self) -> dict[str, Any]:
         d = weight_dir(self.params, 0)
         self.model = funasr_model(d, self.device)

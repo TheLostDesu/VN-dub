@@ -31,9 +31,7 @@ def preview_run(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, 
         raise AppError("import_required", action="choose_game_dir", status=400)
     job = pipeline.submit("preview", h.slug, {"mode": mode, "n": n, "line_ids": ids})  # may refuse (409): nothing is remembered then
     with session.STATE_LOCK:
-        st = appdirs.read_app_state(h)
-        st["preview"] = {**(st.get("preview") or {}), "mode": mode, "n": n, "line_ids": ids}
-        appdirs.write_app_state(h, st)
+        appdirs.update_app_state(h, lambda st: st.__setitem__("preview", {**(st.get("preview") or {}), "mode": mode, "n": n, "line_ids": ids}))
     return job.info()
 
 
@@ -74,10 +72,8 @@ def run_full(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any
     h = session.current_handle()
     shutdown = bool(body.get("shutdown_when_done"))
     job = pipeline.submit("full", h.slug, {"shutdown_when_done": shutdown})  # may refuse (409): the setting is not touched then
-    s = appdirs.load_settings()
-    if s.shutdown_when_done != shutdown:
-        s.shutdown_when_done = shutdown
-        appdirs.save_settings(s)
+    if appdirs.load_settings().shutdown_when_done != shutdown:
+        appdirs.update_settings(lambda s: setattr(s, "shutdown_when_done", shutdown))
     return job.info()
 
 

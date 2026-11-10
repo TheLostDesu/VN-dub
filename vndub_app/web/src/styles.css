@@ -2463,3 +2463,32 @@ tr.is-flash > * {
 .coverage-counts {
   margin: var(--space-3) 0;
 }
+.connection-banner {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  padding: 0.5rem 1.25rem;
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-bottom: 1px solid var(--border);
+}
+.is-stale {
+  opacity: 0.55;
+}
+.job-cause {
+  margin: 0.25rem 0 0.5rem;
+  font-size: 0.95em;
+}
+.job-cause code {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.glossary .chip {
+  margin-top: 0.25rem;
+}
+.hint .chip {
+  margin-top: 0;
+}
+.review-unapplied {
+  margin: 0.5rem 0;
+}

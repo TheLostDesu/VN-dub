@@ -296,31 +296,27 @@ def test_apply_removes_a_stale_compiled_twin_of_a_new_rpy(renpy: tuple[Any, Path
     assert (g / "vndub_auto_voice.rpy").read_bytes() == RPY and not (g / "vndub_auto_voice.rpyc").exists()
     assert (g / "script.rpyc").read_bytes() == b"RENPY RPC2 game script"
 
-    # the .rpy exists now: a twin Ren'Py compiled from it is current, an install over it (replacing the .rpy) leaves it alone
+    # a second install first undoes the first (its .rpy and the twin Ren'Py compiled from it go), then writes the script fresh: no twin until Ren'Py runs again
     (g / "vndub_auto_voice.rpyc").write_bytes(b"RENPY RPC2 current")
     second = run(c, "/api/install/apply", h.slug, backup=True)
     assert second["state"] == "done", second.get("error")
-    assert (g / "vndub_auto_voice.rpyc").read_bytes() == b"RENPY RPC2 current"
-    # undoing the second install puts the first back (the .rpy is restored, not added): the twin stays for Ren'Py to recompile
+    assert (g / "vndub_auto_voice.rpy").read_bytes() == RPY and not (g / "vndub_auto_voice.rpyc").exists()
+    # undoing it removes the script and its twin; the game's own compiled scripts stay
     assert run(c, "/api/install/rollback", h.slug, backup_id=second["result"]["backup_id"])["state"] == "done"
-    assert (g / "vndub_auto_voice.rpy").read_bytes() == RPY and (g / "vndub_auto_voice.rpyc").exists()
-    # undoing the first removes the script and its twin
-    assert run(c, "/api/install/rollback", h.slug, backup_id=first["result"]["backup_id"])["state"] == "done"
     assert not (g / "vndub_auto_voice.rpy").exists() and not (g / "vndub_auto_voice.rpyc").exists() and (g / "script.rpyc").exists()
 
 
-def test_apply_twice_keeps_two_backups_and_rolls_back_in_order(renpy: tuple[Any, Path, Path]) -> None:
+def test_apply_twice_keeps_one_active_backup_and_rolls_back_to_the_original(renpy: tuple[Any, Path, Path]) -> None:
+    """One active install per game: the second install undoes the first, so its backup holds the true originals."""
     h, game, patch = renpy
     c = client_for(patch_install)
     first = run(c, "/api/install/apply", h.slug, backup=True)["result"]["backup_id"]
     (patch / "game" / "voice" / "sak_0001.ogg").write_bytes(b"OggS second version")
     second = run(c, "/api/install/apply", h.slug, backup=True)["result"]["backup_id"]
     assert first != second
-    assert [b["id"] for b in c.get(f"/api/install/plan?slug={h.slug}").json()["backups"]] == [second, first]  # newest first
+    assert [b["id"] for b in c.get(f"/api/install/plan?slug={h.slug}").json()["backups"]] == [second]  # the first is rolled back
     assert (game / "game/voice/sak_0001.ogg").read_bytes() == b"OggS second version"
     assert run(c, "/api/install/rollback", h.slug, backup_id=second)["state"] == "done"
-    assert (game / "game/voice/sak_0001.ogg").read_bytes() == NEW_A  # back to the first install
-    assert run(c, "/api/install/rollback", h.slug, backup_id=first)["state"] == "done"
     assert tree_snapshot(game) == dict(GAME)
 
 

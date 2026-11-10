@@ -182,6 +182,7 @@ class Settings(BaseModel):
     shutdown_when_done: bool = False
     translation_llm: str = ""                   # "" = the profile's default (gemma4_12b); else a registry llm backend name
     debug_log: bool = False                     # DEBUG lines in logs/app.log (WebSocket clients, every HTTP request); INFO otherwise
+    hf_endpoint: str = ""                       # "" = huggingface.co; else a mirror URL, exported as HF_ENDPOINT
 
 
 def settings_file() -> Path:
@@ -189,14 +190,16 @@ def settings_file() -> Path:
 
 
 def load_settings() -> Settings:
-    f = settings_file()
-    data: dict[str, Any] = {}
-    if f.exists():
-        try:
-            data = json.loads(f.read_text(encoding="utf-8")) or {}
-        except (ValueError, OSError):
-            data = {}
-    s = Settings.model_validate(data)
+    # read_json: a read inside another thread's os.replace window is retried, a corrupt file is kept aside (round 18:
+    # a volume-slider drag used to reset models_dir to "" when a PermissionError read came back as the defaults)
+    data = read_json(settings_file(), {}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    try:
+        s = Settings.model_validate(data)
+    except Exception:  # a hand-edited value of the wrong type: keep the file aside, start from the defaults
+        _keep_corrupt(settings_file(), "invalid settings")
+        s = Settings()
     env = os.environ.get("VNDUB_APP_PROFILE")
     if env:
         s.profile = env
@@ -204,8 +207,52 @@ def load_settings() -> Settings:
 
 
 def save_settings(s: Settings) -> Settings:
-    write_json_atomic(settings_file(), s.model_dump(mode="json"))
+    with _file_lock(settings_file()):
+        write_json_atomic(settings_file(), s.model_dump(mode="json"))
     return s
+
+
+def update_settings(fn: Any) -> Settings:
+    """Load, change (``fn(settings)`` mutates it or returns a new one) and save under one lock: concurrent PUTs from a
+    slider drag must not overwrite each other's fields with a stale copy."""
+    with _file_lock(settings_file()):
+        s = load_settings()
+        r = fn(s)
+        if isinstance(r, Settings):
+            s = r
+        write_json_atomic(settings_file(), s.model_dump(mode="json"))
+    apply_hf_endpoint(s)
+    return s
+
+
+def apply_hf_endpoint(s: Settings | None = None) -> str:
+    """Export ``Settings.hf_endpoint`` as ``HF_ENDPOINT`` (child processes inherit it). ``huggingface_hub`` captures the
+    variable into ``constants.ENDPOINT`` (and ``HUGGINGFACE_CO_URL_TEMPLATE``) at import, so an already imported module is
+    patched too. An endpoint set from outside the app (the variable present at startup, not ours) is left alone."""
+    global _EXPORTED_HF
+    s = s or load_settings()
+    want = (getattr(s, "hf_endpoint", "") or "").strip().rstrip("/")
+    cur = os.environ.get("HF_ENDPOINT")
+    if cur and cur != _EXPORTED_HF and not want:
+        return cur  # an outside value and no app setting: keep it
+    if want:
+        os.environ["HF_ENDPOINT"] = want
+        _EXPORTED_HF = want
+    elif cur and cur == _EXPORTED_HF:
+        os.environ.pop("HF_ENDPOINT", None)
+        _EXPORTED_HF = None
+    eff = want or "https://huggingface.co"
+    mod = sys.modules.get("huggingface_hub.constants")
+    if mod is not None:
+        try:
+            mod.ENDPOINT = eff
+            mod.HUGGINGFACE_CO_URL_TEMPLATE = eff + "/{repo_id}/resolve/{revision}/{filename}"
+        except Exception:
+            pass
+    return eff
+
+
+_EXPORTED_HF: str | None = None
 
 
 def effective_models_dir(s: Settings | None = None) -> Path:
@@ -378,14 +425,30 @@ def read_app_state(h: ProjectHandle) -> dict[str, Any]:
     base = default_app_state()
     for k, v in base.items():
         st.setdefault(k, v)
+    if isinstance(st.get("review"), dict):  # the Install screen reads review.touched (the unapplied edits)
+        st["review"].setdefault("touched", [])
     return st
 
 
 def write_app_state(h: ProjectHandle, state: dict[str, Any]) -> dict[str, Any]:
     state = dict(state)
     state["updated"] = now_iso()
-    write_json_atomic(h.state_file, state)
+    with _file_lock(h.state_file):
+        write_json_atomic(h.state_file, state)
     return state
+
+
+def update_app_state(h: ProjectHandle, fn: Any) -> dict[str, Any]:
+    """Read, change (``fn(state)`` mutates it or returns a new dict) and write ``app_state.json`` under one lock per file,
+    so a job thread recording a step and a request saving a choice do not drop each other's change."""
+    state_file = getattr(h, "state_file", None)  # a stand-in handle of a test may have none
+    with _file_lock(state_file if state_file is not None else Path(f"<state:{id(h)}>")):
+        st = read_app_state(h)
+        r = fn(st)
+        if isinstance(r, dict):
+            st = r
+        st = write_app_state(h, st)  # the same RLock again: re-entrant
+    return st if isinstance(st, dict) else read_app_state(h)
 
 
 # ----------------------------------------------------------------------------
@@ -523,10 +586,57 @@ def write_project_config(h: ProjectHandle, settings: Settings | None = None) -> 
 # ----------------------------------------------------------------------------
 
 
-def read_json(path: Path, default: Any = None) -> Any:
+_FILE_LOCKS: dict[str, threading.RLock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _file_lock(path: Path) -> threading.RLock:
+    key = os.path.normcase(os.path.abspath(str(path)))
+    with _FILE_LOCKS_GUARD:
+        lk = _FILE_LOCKS.get(key)
+        if lk is None:
+            lk = _FILE_LOCKS[key] = threading.RLock()
+        return lk
+
+
+def _keep_corrupt(path: Path, why: str) -> Path | None:
+    """Copy an unreadable JSON file to ``<name>.corrupt-<timestamp>`` (the next save would overwrite it) and log it."""
+    import logging
+    import shutil
+
+    path = Path(path)
+    dst = path.with_name(f"{path.name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        if not dst.exists():
+            shutil.copy2(path, dst)
+    except OSError:
+        dst = None
+    logging.getLogger("vndub_app").warning("%s: %s, kept a copy as %s and continued with the defaults", path, why, dst)
+    return dst
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    """The parsed file; ``default`` only for a missing file. A ``PermissionError`` (Windows: the file is inside another
+    thread's ``os.replace``) is retried like ``replace_atomic``; a corrupt file is copied aside and ``default`` returned."""
+    path = Path(path)
+    raw: str | None = None
+    for attempt in range(REPLACE_TRIES):
+        try:
+            raw = path.read_text(encoding="utf-8")
+            break
+        except FileNotFoundError:
+            return default
+        except PermissionError:
+            if attempt == REPLACE_TRIES - 1:
+                raise
+            time.sleep(REPLACE_PAUSE_S)
+        except OSError:
+            return default  # a directory in its place, a broken share: nothing usable to keep aside
+    try:
+        return json.loads(raw)
+    except ValueError:
+        if raw is not None and raw.strip():
+            _keep_corrupt(path, "not valid JSON")
         return default
 
 

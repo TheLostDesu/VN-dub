@@ -141,3 +141,19 @@ present (`vndub models pull ruaccent`). F5-TTS_RUSSIAN is the only backend that 
 
 **Starting over** — delete `work/` (or one stage's cache file `work/cache/<stage>.json`, or use
 `--force` on that stage). `work/index.sqlite` can always be deleted.
+
+**A model environment is broken or out of date** (round 18) — the app's Diagnostics lists every built environment: an
+interrupted install, package versions that differ from the pins in `envs/*.txt`, a failed optional part (CosyVoice 3,
+UTMOSv2), CPU-only torch next to an NVIDIA card. "Check environments" imports every backend without loading weights (a few
+minutes, nothing is downloaded); "Reinstall environments" rebuilds exactly the flagged ones. From the command line:
+`<env>\Scripts\python.exe adapters\<family>\main.py --probe` prints one JSON line and exits 1 on a failure. A preview,
+a full run and a translation refuse to start (`env_broken`) while an environment they need is known to be broken.
+
+**Hugging Face is slow or blocked** — Settings has a mirror address (for example `https://hf-mirror.com`); it is exported
+as `HF_ENDPOINT` to the app and to every environment, and Diagnostics checks the mirror on its own row. A download that
+keeps dropping continues as long as each attempt adds bytes to its `.part` file.
+
+**Checking a Ren'Py patch without playing the game** — with a Ren'Py SDK: `renpy.exe <game folder> lint` after installing
+the patch reports a duplicate translation, an orphan translation block (the dialogue ids do not match the game's Ren'Py
+version: see `parse.engine_opts.renpy.tlid_only_considers_say`) or an unplayable voice file. `tests/test_renpy_sdk_r18.py`
+does it for the SDK's sample game when `VNDUB_RENPY_SDK` points at the SDK folder.

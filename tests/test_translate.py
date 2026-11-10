@@ -238,7 +238,7 @@ def test_system_prompt_glossary_filtering():
     assert "先輩 -> семпай" in sp and "先生" not in sp
     assert "放課後 -> после уроков" in sp and "魔法" not in sp
     assert "ゆい -> Юи" in sp and "社長" not in sp and "gender f" in sp
-    assert "to teacher 'вы'" in sp and "Russian" in sp
+    assert "'вы' to teacher" in sp and "Russian" in sp
 
 
 def test_plus_variant_when_backend_needs_it(make_ctx, tmp_path):
@@ -309,6 +309,8 @@ class _ChatBackend:
         return None
 
     def chat(self, messages, temperature=0.3, **kw):
+        if '"genders"' in messages[0]["content"]:  # the round-18 gender pass (once per project, cached): not what these tests count
+            return '{"genders": []}'
         kind = "summary" if messages[0]["content"].startswith("Summarize") else "translate"
         self.requests.append(kind)
         return self.script(self, kind, messages)
@@ -509,12 +511,14 @@ def test_cancel_during_the_scene_summary_caches_no_summary(make_ctx, tmp_path, m
             raise ConnectionResetError("server killed")
         return _answer(backend, kind, messages)
 
-    ctx, cuda, made = _gpu_ctx(make_ctx, tmp_path, monkeypatch, script=script)
+    # batch_lines 2: a scene that fits one batch gets no summary call at all (round 18)
+    ctx, cuda, made = _gpu_ctx(make_ctx, tmp_path, monkeypatch, script=script, **{"translate.batch_lines": 2})
     holder["state"] = _install_cancel(ctx)
     with pytest.raises(_Cancelled):
         run_stage("translate", ctx)
     assert made[0].requests == ["summary"]  # nothing was translated after the cancel
-    assert _cache_values(ctx) == {}  # in particular no derived summary for the scene
+    # in particular no derived summary for the scene (the gender pass's answer, made before, is kept)
+    assert {k: v for k, v in _cache_values(ctx).items() if k != "genders"} == {}
     ctx.models.close()
 
 
@@ -548,9 +552,10 @@ def test_derived_summary_is_used_for_the_batch_but_never_stored(make_ctx, tmp_pa
 
 
 def test_a_summary_the_model_wrote_is_stored(make_ctx, tmp_path, monkeypatch):
-    ctx, cuda, made = _gpu_ctx(make_ctx, tmp_path, monkeypatch)
+    ctx, cuda, made = _gpu_ctx(make_ctx, tmp_path, monkeypatch, **{"translate.batch_lines": 2})
     run_stage("translate", ctx)
-    assert {k for k in _cache_values(ctx) if k.startswith("summary:")} == {"summary:s01", "summary:s02"}
+    # s02 is one line, one batch: no summary is asked for it (round 18)
+    assert {k for k in _cache_values(ctx) if k.startswith("summary:")} == {"summary:s01"}
     ctx.models.close()
 
 
