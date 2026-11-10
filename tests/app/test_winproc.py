@@ -309,8 +309,18 @@ def test_the_reaper_waits_for_its_parent_then_terminates_the_orphans_and_writes_
     assert len(log.read_text(encoding="utf-8").splitlines()) == 1  # one line, no noise
 
 
+def _elevated() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 @windows_only
 def test_the_reaper_exits_on_its_own_when_the_parent_cannot_be_opened(tmp_path: Path) -> None:
+    if _elevated():
+        # an administrator CAN open the System process, and the reaper would then wait for it forever (a CI runner is one)
+        pytest.skip("needs a process this user may not open: an elevated run can open pid 4")
     log = tmp_path / "reaper.log"
     t0 = time.monotonic()
     assert winproc.reaper_main(["--reaper", "--parent", "4", "--roots", str(tmp_path), "--log", str(log)]) == 0  # pid 4 (System): access denied

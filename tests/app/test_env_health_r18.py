@@ -53,6 +53,8 @@ def fake_env(name: str, packages: dict[str, str], *, record: dict[str, Any] | No
     py.parent.mkdir(parents=True, exist_ok=True)
     py.write_bytes(b"")
     (env / "pyvenv.cfg").write_text("home = x\n", encoding="utf-8")
+    for old in sp.glob("*.dist-info"):  # a second call replaces the packages: two versions of one package have no defined winner
+        old.rmdir()
     for n, v in packages.items():
         (sp / f"{n}-{v}.dist-info").mkdir(exist_ok=True)
     if record is True:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,15 @@ def setup_env(mp: pytest.MonkeyPatch, root: Path) -> Path:
     mp.setenv("XDG_CONFIG_HOME", str(root / "xdg_config"))
     mp.setenv("XDG_DATA_HOME", str(root / "xdg_data"))
     mp.delenv("VNDUB_MODELS_DIR", raising=False)
+    # The app exports VNDUB_ENVS_DIR into os.environ on its own: without this the next test inherits the environments folder
+    # of this one as if a shell had set it. set + del makes monkeypatch restore "absent" (or the outside value) afterwards.
+    outside = os.environ.get("VNDUB_ENVS_DIR")
+    mp.setenv("VNDUB_ENVS_DIR", outside or "-")
+    if not outside:
+        mp.delenv("VNDUB_ENVS_DIR")
+    from vndub_app import installer
+
+    installer.reset_environment_memory()
     return data
 
 

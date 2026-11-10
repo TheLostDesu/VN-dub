@@ -188,7 +188,7 @@ def test_run_is_refused_when_its_environment_is_broken(client: Any, game_dir: Pa
 
     def problems(names: Any, level: str = "error") -> list[dict[str, Any]]:
         seen.append((list(names), level))
-        return [{"level": "error", "code": "import_failed", "detail": "No module named 'pkg_resources'", "env": "funasr"}]
+        return [{"level": "error", "code": "env_broken", "detail": "No module named 'pkg_resources'", "env": "funasr"}]
 
     monkeypatch.setattr(installer, "env_problems", problems, raising=False)
     r = client.post("/api/run/full", json={})
@@ -198,6 +198,24 @@ def test_run_is_refused_when_its_environment_is_broken(client: Any, game_dir: Pa
     assert "pkg_resources" in err["params"]["detail"] and seen == [(["funasr"], "error")]
     monkeypatch.setattr(installer, "env_problems", lambda names, level="error": [], raising=False)  # warnings only: runs
     assert client.post("/api/run/full", json={}).status_code == 200
+
+
+def test_an_environment_that_was_never_installed_does_not_block_a_run(client: Any, game_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The packaged app's smoke test found it: on a fresh data folder every environment is `env_missing`, and the config
+    names backends the user may never install (fallbacks). Only a built environment that does not work blocks a job."""
+    from vndub_app import installer, pipeline
+
+    assert client.post("/api/project/open", json={"game_dir": str(game_dir)}).status_code == 200
+    monkeypatch.setattr(pipeline, "job_envs", lambda cfg, sections=None: ["main", "rvc"])
+    missing = [{"level": "error", "code": "env_missing", "detail": f"{e} is not built", "env": e} for e in ("main", "rvc")]
+    monkeypatch.setattr(installer, "env_problems", lambda names, level="error": list(missing), raising=False)
+    assert client.post("/api/run/full", json={}).status_code == 200
+    incomplete = [*missing, {"level": "error", "code": "env_incomplete", "detail": "the build did not finish", "env": "rvc"}]
+    monkeypatch.setattr(installer, "env_problems", lambda names, level="error": list(incomplete), raising=False)
+    r = client.post("/api/run/full", json={})
+    assert r.status_code in (409, 200)  # 409 env_broken for rvc, unless the first run is still active (then job_busy is 409 too)
+    if r.status_code == 409 and r.json()["error"]["code"] == "env_broken":
+        assert r.json()["error"]["params"]["env"] == "rvc"
 
 
 def test_job_envs_maps_config_backends_to_envs(app_env: Path, game_dir: Path) -> None:

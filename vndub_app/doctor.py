@@ -45,6 +45,7 @@ Defender row is a manual card: the app never changes security settings, it only 
 from __future__ import annotations
 
 import logging
+import ntpath
 import os
 import re
 import shutil
@@ -603,6 +604,24 @@ def row_huggingface(hf: dict[str, Any]) -> dict[str, Any]:
     return _row("huggingface", "green" if hf.get("ok") else "yellow", bool(hf.get("ok")), {**p, **({"reason": "mirror"} if host != HF_HOST else {})} if hf.get("ok") else p)
 
 
+def drive_key(path: Path | str) -> str:
+    """What the disk row groups folders by: the drive letter (or UNC share) of a Windows path, read the same way on every
+    platform; elsewhere the device of the nearest existing parent (two folders of one mount share it), else the root."""
+    s = str(path)
+    drive = ntpath.splitdrive(s)[0]
+    if drive:
+        return drive.upper()
+    if os.name != "nt":
+        p = Path(s)
+        try:
+            while not p.exists() and p.parent != p:
+                p = p.parent
+            return f"dev{os.stat(p).st_dev}"
+        except OSError:
+            pass
+    return (Path(s).anchor or s).upper()
+
+
 def disk_by_drive(folders: dict[str, Path], models: dict[str, Any], envs: dict[str, Any], free_gb: Callable[[Path], float]) -> list[dict[str, Any]]:
     """``[{drive, free_gb, need_gb, path}]``: what each drive of the data / models / environments folders still has to take."""
     present = set(envs.get("present", []))
@@ -616,7 +635,7 @@ def disk_by_drive(folders: dict[str, Path], models: dict[str, Any], envs: dict[s
         path = folders.get(role)
         if path is None:
             continue
-        key = (os.path.splitdrive(str(path))[0] or Path(path).anchor or str(path)).upper()
+        key = drive_key(path)
         d = drives.setdefault(key, {"drive": key, "need_gb": 0.0, "path": Path(path)})
         d["need_gb"] += need[role]
     for d in drives.values():
@@ -695,7 +714,7 @@ def run_doctor(probes: Probes | None = None, *, refresh: bool = False) -> dict[s
         f_dirs = pool.submit(_safe, probes.folders, {}, "folders")
         gpu, net, tools, envs, models, free = (f.result() for f in (f_gpu, f_net, f_tools, f_envs, f_models, f_disk))
         vc, vc_bundled, git, procs, hf, mem, dirs = (f.result() for f in (f_vc, f_vcb, f_git, f_procs, f_hf, f_mem, f_dirs))
-    drive = os.path.splitdrive(str(data_dir))[0] or str(data_dir)
+    drive = ntpath.splitdrive(str(data_dir))[0] or str(data_dir)
     disk = row_disk(float(free), disk_need_gb(models, envs), drive)
     folders = {**(dirs or {}), "data": Path(data_dir)}
     drives = _safe(lambda: disk_by_drive(folders, models, envs, probes.disk_free_gb), [], "disk_by_drive")

@@ -119,6 +119,7 @@ def test_child_env_bundled_git_comes_before_the_uv_folder(o_env: Path, tmp_path:
     assert path[:2] == [str(app / "git" / "cmd"), str(uv.parent)] and installer._child_env({"X_EXTRA": "1"})["X_EXTRA"] == "1"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="the bundled MinGit is a part of the Windows app")
 def test_a_plain_git_resolves_to_the_bundled_one_from_the_child_path(o_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """What make_envs.ps1 and uv do: look `git` up on the PATH they were started with."""
     real_which = shutil.which
@@ -226,6 +227,7 @@ def test_vcredist_job_without_the_file_is_file_not_found(o_env: Path, tmp_path: 
     assert done["state"] == "failed" and done["error"]["code"] == "file_not_found"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="installer exit codes above 255 (3010, 1223) exist on Windows only")
 def test_run_waiting_returns_the_exit_code_of_a_real_process() -> None:
     class Ctx:
         cancelled = False

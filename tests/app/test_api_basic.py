@@ -248,6 +248,7 @@ def test_pick_dialogs_are_unsupported_without_a_window(client: Any) -> None:
 
 
 def test_pick_dialogs_use_the_window(client: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("webview", reason="pywebview is installed on Windows only")
     from vndub_app import system
 
     calls: list[Any] = []

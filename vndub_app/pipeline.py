@@ -134,6 +134,9 @@ def job_envs(cfg: Any, sections: tuple[str, ...] | None = None) -> list[str]:
     return envs
 
 
+BLOCKING_ENV_CODES = frozenset({"env_broken", "env_incomplete"})  # built, but known not to work
+
+
 def check_envs(slug: str, kind: str) -> None:
     """Refuse a preview / full run / translation up front (``env_broken``, action ``open_doctor``) when an environment it
     needs is known to be broken (``installer.env_problems``, error level only), instead of failing after minutes of weight
@@ -147,6 +150,11 @@ def check_envs(slug: str, kind: str) -> None:
         cfg = session.read_ctx(appdirs.project_handle(slug)).cfg
         envs = job_envs(cfg, ENV_CHECK_SECTIONS.get(kind))
         problems = list(problems_fn(envs, "error")) if envs else []
+        # Only an environment that is there and does not work blocks a job. One that was never installed is the ordinary
+        # state of every backend the user does not use (the config names fallbacks too): the registry skips it and the
+        # run goes on with what is installed, as before. Blocking on it stopped every job on a fresh install (found by
+        # the smoke test of the packaged app, whose data folder has no environments at all).
+        problems = [q for q in problems if q.get("code") in BLOCKING_ENV_CODES]
     except Exception as e:
         log.warning("environment check before %s skipped: %s", kind, e)
         return

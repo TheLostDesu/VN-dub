@@ -4,6 +4,7 @@ preview_import and the cue-table helpers."""
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -298,7 +299,8 @@ def test_stages_order_and_cli_registration():
     r = CliRunner().invoke(app, ["--help"])
     assert r.exit_code == 0 and "text-emotion" in r.output
     r = CliRunner().invoke(app, ["text-emotion", "--help"])
-    assert r.exit_code == 0 and "--only" in r.output and "--force" in r.output and "--project" in r.output
+    out = re.sub(r"\x1b\[[0-9;]*m", "", r.output)  # typer forces colours on GitHub Actions: escape codes split the option names
+    assert r.exit_code == 0 and "--only" in out and "--force" in out and "--project" in out
 
 
 def test_stage_writes_text_passports_and_leaves_audio_passports(make_ctx, tmp_path):
