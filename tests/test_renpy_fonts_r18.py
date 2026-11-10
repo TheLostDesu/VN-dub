@@ -80,7 +80,9 @@ def test_real_dejavu_has_cyrillic() -> None:
 
 
 def test_a_real_font_without_cyrillic() -> None:
-    cands = [p for n in ("AGENCYR.TTF", "ALGER.TTF", "BASKVILL.TTF", "webdings.ttf") if (p := WINFONTS / n).exists()]
+    # Office fonts with a plain Unicode cmap. A symbol font (webdings) has a symbol cmap the reader does not judge: it
+    # answers None (unknown) for it, which is the safe answer and not this test's subject.
+    cands = [p for n in ("AGENCYR.TTF", "ALGER.TTF", "BASKVILL.TTF") if (p := WINFONTS / n).exists()]
     if not cands:
         pytest.skip("no Latin-only font in C:/Windows/Fonts")
     assert any(rf.has_cyrillic(p) is False for p in cands)

@@ -332,7 +332,10 @@ def test_signature_check_accepts_microsoft_and_rejects_everything_else(tmp_path:
         + "foreach ($f in $args) { if (Test-Path $f) { $p = Get-SignatureProblem $f; Write-Output ('[' + (Split-Path -Leaf $f) + '] ' + $(if ($p) { $p } else { 'OK' })) } }\n",
         encoding="utf-8",
     )
-    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), *map(str, files)], capture_output=True, text=True, timeout=120)
+    # Windows PowerShell started from a process that carries PowerShell 7's PSModulePath (a CI runner) cannot load its own
+    # Microsoft.PowerShell.Security module: let it use its default module path
+    env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), *map(str, files)], capture_output=True, text=True, timeout=120, env=env)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "[plain.exe] signature status is " in r.stdout  # not Valid: refused
     if windows_signed.is_file():

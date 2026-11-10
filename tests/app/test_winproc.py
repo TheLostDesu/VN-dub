@@ -366,6 +366,8 @@ def test_main_hands_the_reaper_over_before_it_parses_or_locks_anything(monkeypat
 
 @windows_only
 def test_the_module_entry_point_runs_the_reaper_without_importing_the_shell(tmp_path: Path) -> None:
+    if _elevated():
+        pytest.skip("needs a process this user may not open: an elevated run can open pid 4 and the reaper waits for it")
     log = tmp_path / "reaper.log"
     code = (
         "import runpy, sys\n"
@@ -439,6 +441,9 @@ def test_kill_descendants_takes_the_tree_leaves_first_and_spares_the_reaper_and_
     """In a throw-away process: sleeping children (the 'reaper', one named like WebView2) and a grandchild below another one."""
     wv = tmp_path / "msedgewebview2.exe"
     shutil.copy(sys.executable, wv)  # a launcher that runs the same python under another file name
+    cfg = Path(sys.executable).parent.parent / "pyvenv.cfg"
+    if cfg.is_file():  # CPython's own venv launcher finds its interpreter through pyvenv.cfg: without it the copy exits at once
+        shutil.copy(cfg, tmp_path / "pyvenv.cfg")
     code = (
         f"import subprocess, sys, time; sys.path.insert(0, r'{REPO}')\n"
         "from vndub_app import winproc\n"
