@@ -2,16 +2,15 @@
 
 ## Contributors
 
-<a href="https://github.com/TheLostDesu/VN-dub/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=TheLostDesu/VN-dub" alt="Contributors" />
-</a>
+<a href="https://github.com/TheLostDesu"><img src="https://images.weserv.nl/?url=github.com/TheLostDesu.png&w=128&h=128&fit=cover&mask=circle" width="64" alt="TheLostDesu" /></a>
+<a href="https://github.com/AZLik"><img src="https://images.weserv.nl/?url=github.com/AZLik.png&w=128&h=128&fit=cover&mask=circle" width="64" alt="AZLik" /></a>
+<a href="https://github.com/claude"><img src="https://images.weserv.nl/?url=github.com/claude.png&w=128&h=128&fit=cover&mask=circle" width="64" alt="Claude" /></a>
 
 | | Contributor | Contribution |
 |---|---|---|
-| <img src="https://github.com/TheLostDesu.png?size=64" width="64" alt="TheLostDesu"> | [**TheLostDesu**](https://github.com/TheLostDesu) | idea, research lead, architecture, AI-agent direction * |
-| <img src="https://github.com/AZLik.png?size=64" width="64" alt="AZLik"> | [**AZLik**](https://github.com/AZLik) | lead tester: real GPU, real games |
-
-<i>* The code and the tests were written by AI coding agents (Claude Code) under that direction.</i>
+| <img src="https://github.com/TheLostDesu.png?size=64" width="64" alt="TheLostDesu"> | [**TheLostDesu**](https://github.com/TheLostDesu) | idea, research, architecture, AI-agent direction |
+| <img src="https://github.com/AZLik.png?size=64" width="64" alt="AZLik"> | [**AZLik**](https://github.com/AZLik) | tester: real GPU, real games |
+| <img src="https://github.com/claude.png?size=64" width="64" alt="Claude"> | [**Claude**](https://github.com/claude) | code and tests (Claude Code) |
 
 ## What this is
 
